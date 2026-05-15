@@ -348,9 +348,9 @@ const paramCount = computed(() => props.params.size)
                   <div
                     class="hub-tree-path"
                     :class="{ flash: flashed.has(node.FULL_PATH) }"
-                    :title="node.DESCRIPTION || node.FULL_PATH"
+                    :title="node.FULL_PATH"
                   >
-                    {{ node.FULL_PATH.split('/').pop() }}
+                    {{ node.DESCRIPTION || node.FULL_PATH.split('/').pop() }}
                   </div>
                   <ParameterControl
                     :node="node"

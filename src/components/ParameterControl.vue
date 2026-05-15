@@ -58,6 +58,31 @@ const isTrigger = computed(() => typeStr.value === 'N' || typeStr.value === 'I')
 const range = computed(() => props.node.RANGE?.[0] || {})
 const hasRange = computed(() => range.value.MIN != null && range.value.MAX != null)
 
+// Enum / menu: standard OSCQuery uses RANGE[i].VALS as a list of allowed
+// values. When present we render a <select> regardless of TYPE (works for
+// "s" with label values like TouchDesigner, and for "i" with index values).
+const enumValues = computed(() => {
+  const v = props.node.RANGE?.[0]?.VALS
+  return Array.isArray(v) && v.length > 0 ? v : null
+})
+const currentEnumValue = computed(() => {
+  const v = props.node.VALUE?.[0]
+  // For "i" type, the value is an index into VALS; for "s" type it's the label.
+  if (primaryType.value === 'i' && typeof v === 'number') {
+    return enumValues.value?.[v] ?? ''
+  }
+  return v ?? ''
+})
+function onEnumChange(e) {
+  const label = e.target.value
+  if (primaryType.value === 'i') {
+    const idx = enumValues.value.indexOf(label)
+    commit([idx >= 0 ? idx : 0])
+  } else {
+    commit([label])
+  }
+}
+
 function commit(newValue) {
   emit('set', { path: props.node.FULL_PATH, value: newValue })
 }
@@ -158,6 +183,17 @@ function formatNumber(v, ch) {
         :disabled="!writable"
         @change="onNumberInput"
       />
+    </template>
+
+    <!-- Enum / menu (RANGE.VALS present) → dropdown -->
+    <template v-else-if="enumValues">
+      <select
+        :value="currentEnumValue"
+        :disabled="!writable"
+        @change="onEnumChange"
+      >
+        <option v-for="v in enumValues" :key="v" :value="v">{{ v }}</option>
+      </select>
     </template>
 
     <!-- String -->
