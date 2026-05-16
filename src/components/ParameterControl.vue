@@ -121,6 +121,84 @@ function onTrigger() {
 function formatNumber(v, ch) {
   return Number(v ?? 0).toFixed(ch === 'i' ? 0 : 3)
 }
+
+// Step the value by ±1 (or ±range for float), clamped to RANGE if defined.
+// Used by the custom int spinner buttons on the left of the numbox.
+function bumpNumber(delta) {
+  if (!writable.value) return
+  const cur = Number(props.node.VALUE?.[0] ?? 0)
+  const min = props.node.RANGE?.[0]?.MIN
+  const max = props.node.RANGE?.[0]?.MAX
+  const hasMinMax = typeof min === 'number' && typeof max === 'number'
+  let newValue = primaryType.value === 'i'
+    ? Math.round(cur) + delta
+    : cur + delta
+  if (hasMinMax) newValue = Math.max(min, Math.min(max, newValue))
+  commit([newValue])
+}
+
+// Vertical-drag knob behaviour for the numbox:
+//   - mousedown without movement → input keeps default behaviour (focus + type)
+//   - mousedown + vertical drag > threshold → input is blurred and value
+//     follows the drag (up = increase, down = decrease)
+//   - Shift = 10× faster, Alt = 10× finer
+const DRAG_THRESHOLD = 4 // pixels before drag kicks in (lets click-to-type work)
+
+function startNumberDrag(e) {
+  if (!writable.value) return
+  if (e.button !== 0) return
+
+  const inputEl = e.currentTarget
+  const startY = e.clientY
+  const startX = e.clientX
+  const startValue = Number(props.node.VALUE?.[0] ?? 0)
+  const ch = primaryType.value
+
+  const min = props.node.RANGE?.[0]?.MIN
+  const max = props.node.RANGE?.[0]?.MAX
+  const hasMinMax = typeof min === 'number' && typeof max === 'number'
+
+  // Base step per pixel. For ints we want roughly 1 unit every few pixels;
+  // for floats with a known range we span ~200px to cover the full range.
+  let baseStep
+  if (ch === 'i') {
+    baseStep = 1 / 3
+  } else if (hasMinMax) {
+    baseStep = (max - min) / 200
+  } else {
+    baseStep = 0.01
+  }
+
+  let dragging = false
+
+  function onMove(ev) {
+    const dy = startY - ev.clientY  // up = positive
+    const dx = ev.clientX - startX
+    if (!dragging) {
+      if (Math.abs(dy) < DRAG_THRESHOLD && Math.abs(dx) < DRAG_THRESHOLD) return
+      dragging = true
+      inputEl.blur()
+      document.body.style.cursor = 'ns-resize'
+      inputEl.classList.add('dragging')
+    }
+    ev.preventDefault()
+    const multiplier = ev.shiftKey ? 10 : (ev.altKey ? 0.1 : 1)
+    let newValue = startValue + dy * baseStep * multiplier
+    if (ch === 'i') newValue = Math.round(newValue)
+    if (hasMinMax) newValue = Math.max(min, Math.min(max, newValue))
+    commit([newValue])
+  }
+
+  function onUp() {
+    window.removeEventListener('mousemove', onMove)
+    window.removeEventListener('mouseup', onUp)
+    document.body.style.cursor = ''
+    inputEl.classList.remove('dragging')
+  }
+
+  window.addEventListener('mousemove', onMove)
+  window.addEventListener('mouseup', onUp)
+}
 </script>
 
 <template>
@@ -144,18 +222,18 @@ function formatNumber(v, ch) {
       ></div>
     </template>
 
-    <!-- Float / int with range → slider + numeric -->
-    <template v-else-if="(primaryType === 'f' || primaryType === 'i') && hasRange">
-      <input
-        type="range"
-        :min="range.MIN"
-        :max="range.MAX"
-        :step="primaryType === 'i' ? 1 : (range.MAX - range.MIN) / 1000"
-        :value="node.VALUE?.[0] ?? 0"
+    <!-- Enum / menu (RANGE.VALS present) → dropdown.
+         Placed BEFORE the numeric branch so that an int parameter carrying
+         a VALS list (= menu/enum) is rendered as a dropdown rather than as
+         a plain number input. -->
+    <template v-else-if="enumValues">
+      <select
+        :value="currentEnumValue"
         :disabled="!writable"
-        @input="onNumberInput"
-      />
-      <span class="num">{{ formatNumber(node.VALUE?.[0], primaryType) }}</span>
+        @change="onEnumChange"
+      >
+        <option v-for="v in enumValues" :key="v" :value="v">{{ v }}</option>
+      </select>
     </template>
 
     <!-- Multi-component numeric (fff, ff, ii, ...) → one input per component -->
@@ -174,26 +252,42 @@ function formatNumber(v, ch) {
       </div>
     </template>
 
-    <!-- Single float / int, no range → numeric input -->
+    <!-- Single float / int → numbox. Vertical mouse drag changes the value;
+         click to type. Shift = 10× faster, Alt = 10× finer. Int values get
+         a pair of custom ▲/▼ buttons on the left for ±1 stepping. -->
     <template v-else-if="primaryType === 'f' || primaryType === 'i'">
-      <input
-        type="number"
-        :step="primaryType === 'i' ? 1 : 'any'"
-        :value="node.VALUE?.[0] ?? 0"
-        :disabled="!writable"
-        @change="onNumberInput"
-      />
-    </template>
-
-    <!-- Enum / menu (RANGE.VALS present) → dropdown -->
-    <template v-else-if="enumValues">
-      <select
-        :value="currentEnumValue"
-        :disabled="!writable"
-        @change="onEnumChange"
-      >
-        <option v-for="v in enumValues" :key="v" :value="v">{{ v }}</option>
-      </select>
+      <div class="num-wrap">
+        <div v-if="primaryType === 'i'" class="num-spinner">
+          <button
+            class="spin-btn"
+            type="button"
+            :disabled="!writable"
+            @click="bumpNumber(+1)"
+            tabindex="-1"
+            aria-label="increment"
+          >▲</button>
+          <button
+            class="spin-btn"
+            type="button"
+            :disabled="!writable"
+            @click="bumpNumber(-1)"
+            tabindex="-1"
+            aria-label="decrement"
+          >▼</button>
+        </div>
+        <input
+          class="num-input"
+          type="number"
+          :min="hasRange ? range.MIN : undefined"
+          :max="hasRange ? range.MAX : undefined"
+          :step="primaryType === 'i' ? 1 : 'any'"
+          :value="primaryType === 'i' ? Math.round(node.VALUE?.[0] ?? 0) : (node.VALUE?.[0] ?? 0)"
+          :disabled="!writable"
+          :title="hasRange ? `drag · type · ${range.MIN}…${range.MAX}` : 'drag · type'"
+          @change="onNumberInput"
+          @mousedown="startNumberDrag"
+        />
+      </div>
     </template>
 
     <!-- String -->
@@ -231,6 +325,79 @@ function formatNumber(v, ch) {
 .multi-inputs input {
   flex: 1;
   min-width: 0;
+}
+/* numbox + (optional) custom spinner on the left */
+.num-wrap {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 0;
+  flex: 0 0 auto;
+}
+.num-input {
+  width: 96px;
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  text-align: right;
+  padding: 2px 6px;
+  cursor: ns-resize;
+}
+.num-input:focus {
+  cursor: text;
+}
+.num-input.dragging {
+  cursor: ns-resize;
+  user-select: none;
+}
+/* Always hide the native browser spinner — we render our own on the left. */
+.num-input {
+  appearance: textfield;            /* Firefox */
+  -moz-appearance: textfield;
+}
+.num-input::-webkit-outer-spin-button,
+.num-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* Custom spinner (only rendered for int) — stacked ▲/▼ on the left side. */
+.num-spinner {
+  display: flex;
+  flex-direction: column;
+  width: 16px;
+  flex: 0 0 auto;
+  margin-right: 2px;
+}
+.spin-btn {
+  flex: 1 1 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border, #444);
+  color: var(--fg, #ccc);
+  font-size: 8px;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+  user-select: none;
+}
+.spin-btn:hover:not(:disabled) {
+  background: var(--accent, #555);
+}
+.spin-btn:active:not(:disabled) {
+  background: var(--accent-strong, #777);
+}
+.spin-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.spin-btn:first-child {
+  border-radius: 3px 3px 0 0;
+  border-bottom-width: 0;
+}
+.spin-btn:last-child {
+  border-radius: 0 0 3px 3px;
 }
 .trigger-btn {
   background: transparent;
