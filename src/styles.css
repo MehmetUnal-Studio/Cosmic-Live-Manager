@@ -846,6 +846,32 @@ details.row-section summary {
 .hub-logo-text span { color: var(--hub-accent); }
 .hub-topbar-spacer { flex: 1; }
 
+/* "Rediscover" button — tears down + recreates the helper's Bonjour browser.
+   Styled to sit next to the .ws-badge, picks up the same surface/border vars. */
+.hub-rediscover-btn {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.3rem 0.7rem; margin-right: 0.6rem;
+  background: var(--hub-surface); border: 1px solid var(--hub-border);
+  border-radius: 20px; color: var(--hub-ink-mid);
+  font: inherit; font-size: 0.72rem; letter-spacing: 0.05em;
+  cursor: pointer; user-select: none;
+  transition: color 0.2s, border-color 0.2s, background 0.2s;
+}
+.hub-rediscover-btn:hover {
+  color: var(--hub-text, #ddd);
+  border-color: var(--hub-border-2);
+  background: rgba(255,255,255,0.04);
+}
+.hub-rediscover-btn:active { transform: translateY(1px); }
+.hub-rediscover-icon { display: inline-block; font-size: 0.95rem; line-height: 1; }
+.hub-rediscover-btn.spinning .hub-rediscover-icon {
+  animation: hub-rediscover-spin 0.6s linear;
+}
+@keyframes hub-rediscover-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
 .ws-badge {
   display: flex; align-items: center; gap: 0.5rem;
   padding: 0.3rem 0.75rem;

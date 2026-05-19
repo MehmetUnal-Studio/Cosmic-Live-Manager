@@ -59,6 +59,12 @@ export function useHub() {
   function reloadManifests() {
     send({ type: 'RELOAD_MANIFESTS' })
   }
+  // Tear down + recreate the helper's Bonjour browser. Use when a device has
+  // renamed itself or changed port and isn't showing up in the discovery list
+  // any more. Equivalent to restarting `npm run dev` for the discovery layer.
+  function rediscover() {
+    send({ type: 'REDISCOVER' })
+  }
   function addDiscovered(host, port, name) {
     send({ type: 'ADD_DISCOVERED', host, port, name: (name || '').trim() || undefined })
   }
@@ -229,6 +235,7 @@ export function useHub() {
     reconnectDevice,
     removeDevice,
     reloadManifests,
+    rediscover,
     addDiscovered,
     setDeviceParam,
     announceDevice

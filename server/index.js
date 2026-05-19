@@ -572,36 +572,73 @@ function broadcastDiscovered() {
   broadcastHub({ type: 'DISCOVERED_DEVICES', devices: Array.from(discoveredDevices.values()) })
 }
 
-const browser = bonjour.find({ type: 'oscjson' })
-browser.on('up', (service) => {
-  services.set(service.fqdn, service)
-  console.log('[discovery] up   ', service.name, service.addresses)
-  broadcastDiscovery()
+// We keep the browser in a `let` (not `const`) so it can be torn down and
+// recreated on demand — see `rediscoverNetwork()` below. The Bonjour browser
+// holds an in-memory cache of "alive" services that gets stale when devices
+// rename or change ports without sending a clean mDNS goodbye. Rebuilding the
+// browser forces a fresh round of network queries and rebuilds the cache.
+let browser = null
 
-  // Mirror into the hub's "discovered" list, skipping ourselves and manifest-known devices.
-  const ipv4 = (service.addresses || []).find((a) => /^\d+\.\d+\.\d+\.\d+$/.test(a))
-  const host = ipv4 || service.host
-  const port = service.port
-  if (port === PORT) return
-  if (isAlreadyKnown(host, port)) return
-  discoveredDevices.set(`${host}:${port}`, {
-    name: service.name,
-    host,
-    port,
-    firstSeen: Date.now()
+function attachBrowserHandlers(b) {
+  b.on('up', (service) => {
+    services.set(service.fqdn, service)
+    console.log('[discovery] up   ', service.name, service.addresses)
+    broadcastDiscovery()
+
+    // Mirror into the hub's "discovered" list, skipping ourselves and manifest-known devices.
+    const ipv4 = (service.addresses || []).find((a) => /^\d+\.\d+\.\d+\.\d+$/.test(a))
+    const host = ipv4 || service.host
+    const port = service.port
+    if (port === PORT) return
+    if (isAlreadyKnown(host, port)) return
+    discoveredDevices.set(`${host}:${port}`, {
+      name: service.name,
+      host,
+      port,
+      firstSeen: Date.now()
+    })
+    broadcastDiscovered()
   })
-  broadcastDiscovered()
-})
-browser.on('down', (service) => {
-  services.delete(service.fqdn)
-  console.log('[discovery] down ', service.name)
-  broadcastDiscovery()
+  b.on('down', (service) => {
+    services.delete(service.fqdn)
+    console.log('[discovery] down ', service.name)
+    broadcastDiscovery()
 
-  const ipv4 = (service.addresses || []).find((a) => /^\d+\.\d+\.\d+\.\d+$/.test(a))
-  const host = ipv4 || service.host
-  const key = `${host}:${service.port}`
-  if (discoveredDevices.delete(key)) broadcastDiscovered()
-})
+    const ipv4 = (service.addresses || []).find((a) => /^\d+\.\d+\.\d+\.\d+$/.test(a))
+    const host = ipv4 || service.host
+    const key = `${host}:${service.port}`
+    if (discoveredDevices.delete(key)) broadcastDiscovered()
+  })
+}
+
+function startBrowser() {
+  browser = bonjour.find({ type: 'oscjson' })
+  attachBrowserHandlers(browser)
+}
+
+/**
+ * Tear down the Bonjour browser, wipe the helper's in-memory caches of
+ * discovered services, and start a fresh browser. This is the equivalent
+ * of restarting `npm run dev` for the discovery layer — it does NOT flush
+ * macOS's mDNSResponder cache (which would need sudo), but in practice the
+ * vast majority of "I changed the device name/port and the web doesn't see
+ * it" issues live in OUR Map<fqdn, ServiceInfo> rather than in the OS.
+ */
+function rediscoverNetwork() {
+  try {
+    if (browser && typeof browser.stop === 'function') browser.stop()
+  } catch (err) {
+    console.log('[discovery] browser.stop() error:', err.message)
+  }
+  services.clear()
+  discoveredDevices.clear()
+  broadcastDiscovery()
+  broadcastDiscovered()
+  console.log('[discovery] rediscover requested — caches cleared, restarting browser')
+  startBrowser()
+}
+
+startBrowser()
 
 function publishBonjour() {
   bonjour.publish({ name: HUB_NAME, type: 'oscjson', protocol: 'tcp', port: PORT })
@@ -900,6 +937,11 @@ wssHub.on('connection', (ws, req) => {
 
     if (msg.type === 'RELOAD_MANIFESTS') {
       loadManifests()
+      return
+    }
+
+    if (msg.type === 'REDISCOVER') {
+      rediscoverNetwork()
       return
     }
 

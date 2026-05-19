@@ -19,10 +19,21 @@ const {
   updateDevice,
   reconnectDevice,
   removeDevice,
+  rediscover,
   addDiscovered,
   setDeviceParam,
   announceDevice
 } = useHub()
+
+// Brief visual feedback on the Rediscover button (so the user knows the click
+// was actually sent — the discovery list usually rebuilds in <1s but on a busy
+// network might take a moment).
+const rediscovering = ref(false)
+function onRediscoverClick() {
+  rediscover()
+  rediscovering.value = true
+  setTimeout(() => { rediscovering.value = false }, 600)
+}
 
 const { services } = useDiscovery()
 const {
@@ -245,6 +256,16 @@ watch(devices, (list) => {
         <div class="hub-logo-text">Cosmic <span>Live Manager</span></div>
       </div>
       <div class="hub-topbar-spacer"></div>
+      <button
+        class="hub-rediscover-btn"
+        :class="{ spinning: rediscovering }"
+        type="button"
+        title="Rebuild the helper's network discovery cache (equivalent of restarting npm run dev). Use when a device has renamed/changed port and isn't showing up."
+        @click="onRediscoverClick"
+      >
+        <span class="hub-rediscover-icon">⟳</span>
+        Rediscover
+      </button>
       <div class="ws-badge" :class="{ connected }">
         <span class="dot"></span>
         <span>{{ connected ? 'Connected' : 'Reconnecting…' }}</span>

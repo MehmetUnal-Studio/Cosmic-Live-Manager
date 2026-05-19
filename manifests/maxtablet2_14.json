@@ -1,9 +1,0 @@
-{
-  "id": 14,
-  "name": "MaxTablet2",
-  "type": "oscquery-device",
-  "host": "127.0.0.1",
-  "oscQueryPort": 8001,
-  "enabled": true,
-  "description": "Discovered via Bonjour"
-}
