@@ -1008,6 +1008,30 @@ details.row-section summary {
 .device-card.connecting::before { background: linear-gradient(90deg, transparent, var(--hub-yellow), transparent); opacity: 1; }
 .device-card.lost::before       { background: linear-gradient(90deg, transparent, var(--hub-red), transparent); opacity: 1; }
 
+/* Top-right "×" remove button. Sits above the card content via z-index so it
+   stays clickable when the card body has other absolutely-positioned bits.
+   Hidden until you hover the card to keep the default look clean. */
+.device-remove {
+  position: absolute; top: 6px; right: 8px; z-index: 5;
+  width: 22px; height: 22px; padding: 0; line-height: 1;
+  background: transparent; color: var(--hub-text-dim, #999);
+  border: 1px solid transparent; border-radius: 50%;
+  font-size: 16px; font-weight: 400;
+  cursor: pointer; user-select: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  opacity: 0; transition: opacity 0.15s, color 0.15s, background 0.15s, border-color 0.15s;
+}
+.device-card:hover .device-remove,
+.device-remove:focus-visible { opacity: 1; }
+.device-remove:hover {
+  color: var(--hub-red, #ef4444);
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.35);
+}
+.device-remove:focus-visible {
+  outline: 2px solid rgba(239, 68, 68, 0.6); outline-offset: 1px;
+}
+
 .device-header {
   display: flex; align-items: flex-start; justify-content: space-between;
   margin-bottom: 0.75rem;
@@ -1340,6 +1364,79 @@ details.row-section summary {
 }
 .hub-tree .param-control .multi-inputs input {
   flex: 1; min-width: 0;
+}
+
+/* ─── Scenes bar (global snapshots) ────────────────────────────────────── */
+.scene-bar {
+  margin-bottom: 1.5rem;
+  padding: 0.875rem 1rem;
+  border: 1px solid var(--hub-border);
+  border-radius: var(--hub-radius);
+  background:
+    linear-gradient(135deg, rgba(236, 72, 153, 0.05), rgba(99, 102, 241, 0.04));
+}
+.hub-dash .scene-chip {
+  /* Inherits from .preset-chip — these are hub-theme additions. */
+  background: rgba(236, 72, 153, 0.10);
+  border-color: rgba(236, 72, 153, 0.35);
+  color: var(--hub-pink);
+  padding-right: 6px;
+}
+.hub-dash .scene-chip:hover {
+  background: rgba(236, 72, 153, 0.20);
+  border-color: var(--hub-pink);
+  box-shadow: 0 0 12px rgba(236, 72, 153, 0.25);
+}
+.hub-dash .scene-chip:active {
+  background: var(--hub-pink); color: #fff;
+}
+.hub-dash .scene-chip .scene-count {
+  font-family: var(--hub-mono); font-size: 0.58rem;
+  color: var(--hub-ink-dim);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 0 0.45em; border-radius: 999px;
+  margin-left: 2px;
+}
+.hub-dash .scene-chip .scene-overwrite { font-size: 0.78rem; }
+.hub-dash .scene-chip:hover .scene-overwrite { opacity: 0.7; }
+.hub-dash .scene-chip .scene-overwrite:hover {
+  opacity: 1; color: var(--hub-yellow);
+  background: rgba(245, 158, 11, 0.18);
+}
+.scene-rename-input {
+  display: inline-flex;
+  background: var(--hub-bg-3);
+  border: 1px solid var(--hub-accent);
+  color: var(--hub-ink);
+  font-family: var(--hub-mono); font-size: 0.7rem;
+  padding: 4px 10px; border-radius: 999px;
+  outline: none; min-width: 120px;
+}
+
+.scene-save-form {
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: 8px; margin-top: 10px;
+  padding-top: 10px; border-top: 1px dashed var(--hub-border);
+}
+.scene-save-input {
+  flex: 1; min-width: 180px;
+  background: var(--hub-bg-3);
+  border: 1px solid var(--hub-border);
+  border-radius: 4px;
+  color: var(--hub-ink);
+  padding: 6px 10px;
+  font-family: var(--hub-sans); font-size: 0.78rem;
+}
+.scene-save-input:focus {
+  outline: none; border-color: var(--hub-accent);
+  background: rgba(99, 102, 241, 0.08);
+}
+.scene-save-form .hub-btn { flex: 0 0 auto; padding: 0.4rem 1.1rem; }
+.scene-save-hint {
+  flex: 1 1 100%;
+  font-size: 0.62rem;
+  color: var(--hub-ink-dim);
 }
 
 /* ─── Presets section inside DeviceCard (hub theme overrides) ─────────── */

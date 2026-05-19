@@ -17,7 +17,16 @@ const props = defineProps({
   // Result of the last announce attempt, shown as a hint under the button
   announceResult: { type: Object, default: null }
 })
-const emit = defineEmits(['update', 'reconnect', 'set-param', 'announce'])
+const emit = defineEmits(['update', 'reconnect', 'set-param', 'announce', 'remove'])
+
+function onRemove() {
+  // Block accidental clicks — manifest deletion is permanent on disk.
+  const ok = window.confirm(
+    `Remove device "${props.device.name}"?\n\nThis deletes its manifest file. ` +
+    `You can always re-add it later from Discovered on Network.`
+  )
+  if (ok) emit('remove')
+}
 
 // ─── Card-level expand: keep all the heavy bits hidden until the user opens
 //     the card. Once open, "Parameters" and "Announce" can be toggled freely.
@@ -163,33 +172,45 @@ function loadAnnounce() {
     const raw = localStorage.getItem(storageKey.value)
     if (raw) return JSON.parse(raw)
   } catch { /* ignore */ }
-  return { targetFqdn: '', peerId: '', udpPortOverride: 0 }
+  return { targetFqdn: '', peerId: '', udpPortOverride: 0, lastAnnouncedFqdn: '' }
 }
 function persistAnnounce() {
   try {
     localStorage.setItem(storageKey.value, JSON.stringify({
       targetFqdn: targetFqdn.value,
       peerId: peerId.value,
-      udpPortOverride: Number(udpOverride.value) || 0
+      udpPortOverride: Number(udpOverride.value) || 0,
+      lastAnnouncedFqdn: lastAnnouncedFqdn.value
     }))
   } catch { /* quota / disabled */ }
 }
 
 const _initial = loadAnnounce()
-const targetFqdn  = ref(_initial.targetFqdn)
-const peerId      = ref(_initial.peerId || sanitizePeerId(props.device.name))
-const udpOverride = ref(_initial.udpPortOverride || 0)
+const targetFqdn         = ref(_initial.targetFqdn)
+const peerId             = ref(_initial.peerId || sanitizePeerId(props.device.name))
+const udpOverride        = ref(_initial.udpPortOverride || 0)
+// Remembered fqdn of the last target that was successfully pushed. When that
+// service reappears on the LAN (or is already present at dashboard start) we
+// auto-fire the announce again. Cleared by clearing the target dropdown.
+const lastAnnouncedFqdn  = ref(_initial.lastAnnouncedFqdn || '')
 
 // Reload when the device id changes (e.g. manifest reload renumbers IDs)
 watch(() => props.device.id, () => {
   const fresh = loadAnnounce()
-  targetFqdn.value = fresh.targetFqdn
-  peerId.value = fresh.peerId || sanitizePeerId(props.device.name)
-  udpOverride.value = fresh.udpPortOverride || 0
+  targetFqdn.value        = fresh.targetFqdn
+  peerId.value            = fresh.peerId || sanitizePeerId(props.device.name)
+  udpOverride.value       = fresh.udpPortOverride || 0
+  lastAnnouncedFqdn.value = fresh.lastAnnouncedFqdn || ''
 })
 
 // Persist on every change
-watch([targetFqdn, peerId, udpOverride], persistAnnounce)
+watch([targetFqdn, peerId, udpOverride, lastAnnouncedFqdn], persistAnnounce)
+
+// Emptying the target dropdown disables the auto-re-announce too — otherwise
+// the user would have no way to stop the automatic push.
+watch(targetFqdn, (v) => {
+  if (!v && lastAnnouncedFqdn.value) lastAnnouncedFqdn.value = ''
+})
 
 // Target list = every discovered service except this device itself.
 const targetCandidates = computed(() => {
@@ -210,7 +231,8 @@ const announceSummary = computed(() => {
   if (!targetFqdn.value) return 'no target'
   const t = selectedTarget.value
   const tname = t ? t.name : '(target gone)'
-  return `${peerId.value || props.device.name} → ${tname}`
+  const auto = lastAnnouncedFqdn.value === targetFqdn.value ? ' · auto' : ''
+  return `${peerId.value || props.device.name} → ${tname}${auto}`
 })
 function onPush() {
   if (!canPush.value) return
@@ -220,6 +242,53 @@ function onPush() {
     udpPortOverride: Number(udpOverride.value) || 0
   })
 }
+
+// When the parent reports a successful announce for this device, remember
+// the target fqdn so we can auto-fire next time it reconnects.
+watch(() => props.announceResult, (r) => {
+  if (r && r.ok && targetFqdn.value) {
+    lastAnnouncedFqdn.value = targetFqdn.value
+  }
+})
+
+// Auto-re-announce: when the last-known target shows up on the LAN (either
+// because it just appeared, or because the dashboard just opened with it
+// already discovered) AND this managed device is currently connected, fire
+// the announce automatically. We track previous availability so we only
+// trigger on transitions, never on every services-list refresh.
+const lastAnnouncedTarget = computed(() => {
+  if (!lastAnnouncedFqdn.value) return null
+  return targetCandidates.value.find((s) => s.fqdn === lastAnnouncedFqdn.value) || null
+})
+
+let prevAutoAvailable = false
+let autoFireTimer = null
+
+function fireAutoAnnounce() {
+  const target = lastAnnouncedTarget.value
+  if (!target) return
+  if (props.device.status !== 'connected') return
+  emit('announce', {
+    target,
+    peerId: sanitizePeerId(peerId.value || props.device.name),
+    udpPortOverride: Number(udpOverride.value) || 0
+  })
+}
+
+watch(
+  [() => lastAnnouncedTarget.value, () => props.device.status],
+  ([target, status]) => {
+    const available = !!target && status === 'connected'
+    if (available && !prevAutoAvailable) {
+      // Small debounce so Bonjour `up` followed by HOST_INFO settling doesn't
+      // race the announce.
+      clearTimeout(autoFireTimer)
+      autoFireTimer = setTimeout(fireAutoAnnounce, 250)
+    }
+    prevAutoAvailable = available
+  },
+  { immediate: true }
+)
 
 // ─── Status visuals ─────────────────────────────────────────────────────
 const statusClass = computed(() => {
@@ -239,6 +308,15 @@ const paramCount = computed(() => props.params.size)
 
 <template>
   <div class="device-card" :class="statusClass">
+    <button
+      class="device-remove"
+      type="button"
+      title="Remove this device"
+      aria-label="Remove device"
+      @click.stop="onRemove"
+      @pointerdown.stop
+    >×</button>
+
     <div class="device-header">
       <div style="min-width:0;flex:1">
         <div class="device-name-row">

@@ -2,28 +2,50 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useHub } from '../composables/useHub.js'
 import { useDiscovery } from '../composables/useDiscovery.js'
+import { useScenes } from '../composables/useScenes.js'
 import DeviceCard from './DeviceCard.vue'
 import DiscoveredCard from './DiscoveredCard.vue'
+import SceneBar from './SceneBar.vue'
 
 const {
   connected,
   devices,
   discovered,
   msgsThisSecond,
-  abletonTotal,
-  hubInfo,
   deviceParams,
   deviceMsgCounts,
   saveHints,
   announceResults,
   updateDevice,
   reconnectDevice,
+  removeDevice,
   addDiscovered,
   setDeviceParam,
   announceDevice
 } = useHub()
 
 const { services } = useDiscovery()
+const {
+  scenes,
+  add: addScene,
+  rename: renameScene,
+  remove: removeScene,
+  overwrite: overwriteScene,
+  reorder: reorderScene,
+  fire: fireScene
+} = useScenes()
+
+// Save a scene from the current namespace state. We pass deviceParams (the
+// reactive Map) directly — useScenes reads .VALUE / .ACCESS off each node.
+function onSceneSave(name) {
+  addScene(name, deviceParams.value)
+}
+function onSceneFire(scene) {
+  fireScene(scene, setDeviceParam)
+}
+function onSceneOverwrite(id) {
+  overwriteScene(id, deviceParams.value)
+}
 
 // ─── Custom ordering ────────────────────────────────────────────────────
 // Persisted in localStorage as an array of device.id values. Devices not
@@ -67,7 +89,6 @@ const statParams = computed(() => {
   for (const m of deviceParams.value.values()) n += m.size
   return n
 })
-const abletonForward = computed(() => hubInfo.value?.abletonForward)
 
 // ─── Drag-and-drop with long-press ──────────────────────────────────────
 // UX:
@@ -255,21 +276,22 @@ watch(devices, (list) => {
         </div>
       </div>
 
-      <!-- Ableton banner -->
-      <div v-if="abletonForward" class="ableton-banner">
-        <div class="ableton-banner-left">
-          <div class="ableton-banner-icon">♪</div>
-          <div class="ableton-banner-text">
-            <strong>Ableton Forwarder Active</strong> —
-            messages routed as <code>device&lt;id&gt; /&lt;path&gt; &lt;value&gt;</code>
-            to <code>{{ abletonForward.host }}:{{ abletonForward.port }}</code>
-          </div>
-        </div>
-        <div>
-          <div class="ableton-count">{{ abletonTotal }}</div>
-          <div class="ableton-count-label">Total Messages</div>
+      <!-- Scenes (global snapshot recall) -->
+      <div class="section-header">
+        <div class="section-title">Scenes</div>
+        <div class="section-hint">
+          Snapshot current state of every device · click a chip to recall · ⟳ overwrite · ✎ rename · × delete
         </div>
       </div>
+      <SceneBar
+        :scenes="scenes"
+        @save="onSceneSave"
+        @fire="onSceneFire"
+        @overwrite="onSceneOverwrite"
+        @rename="(id, name) => renameScene(id, name)"
+        @remove="(id) => removeScene(id)"
+        @reorder="({ from, to }) => reorderScene(from, to)"
+      />
 
       <!-- Manifest devices -->
       <div class="section-header">
@@ -305,6 +327,7 @@ watch(devices, (list) => {
             @reconnect="reconnectDevice(dev.id)"
             @set-param="(payload) => setDeviceParam(dev.id, payload.path, payload.value)"
             @announce="(payload) => announceDevice(dev.id, payload.target, payload.peerId, payload.udpPortOverride)"
+            @remove="removeDevice(dev.id)"
           />
         </div>
       </div>

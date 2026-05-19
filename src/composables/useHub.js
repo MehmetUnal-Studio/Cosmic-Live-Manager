@@ -52,6 +52,10 @@ export function useHub() {
     send({ type: 'RECONNECT_DEVICE', deviceId })
     setHint(deviceId, 'Reconnecting…', '')
   }
+  function removeDevice(deviceId) {
+    send({ type: 'REMOVE_DEVICE', deviceId })
+    // No optimistic hint: the helper's DEVICES_RELOADED will drop the card.
+  }
   function reloadManifests() {
     send({ type: 'RELOAD_MANIFESTS' })
   }
@@ -223,6 +227,7 @@ export function useHub() {
     announceResults,
     updateDevice,
     reconnectDevice,
+    removeDevice,
     reloadManifests,
     addDiscovered,
     setDeviceParam,

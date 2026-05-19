@@ -122,6 +122,21 @@ function formatNumber(v, ch) {
   return Number(v ?? 0).toFixed(ch === 'i' ? 0 : 3)
 }
 
+// Float values from OSC servers often arrive with full 64-bit precision
+// (e.g. 0.1369999051094055). We cap input displays to 3 decimals so the
+// numbox stays readable; integers are shown without decimals. The underlying
+// VALUE stored upstream stays unchanged — this only affects the rendered
+// string. On commit (@change) the input value is parsed back, so editing
+// snaps to ≤ 3-decimal precision, which is well below human-noticeable for
+// live control work.
+function formatDisplay(v, ch) {
+  if (v == null || v === '') return ''
+  const n = Number(v)
+  if (!Number.isFinite(n)) return ''
+  if (ch === 'i') return String(Math.round(n))
+  return n.toFixed(3)
+}
+
 // Step the value by ±1 (or ±range for float), clamped to RANGE if defined.
 // Used by the custom int spinner buttons on the left of the numbox.
 function bumpNumber(delta) {
@@ -244,7 +259,7 @@ function startNumberDrag(e) {
           :key="idx"
           type="number"
           :step="ch === 'i' ? 1 : 'any'"
-          :value="node.VALUE?.[idx] ?? 0"
+          :value="formatDisplay(node.VALUE?.[idx], ch)"
           :disabled="!writable"
           :title="['x', 'y', 'z', 'w'][idx] || `[${idx}]`"
           @change="(e) => onMultiComponentInput(idx, e.target.value, ch)"
@@ -281,7 +296,7 @@ function startNumberDrag(e) {
           :min="hasRange ? range.MIN : undefined"
           :max="hasRange ? range.MAX : undefined"
           :step="primaryType === 'i' ? 1 : 'any'"
-          :value="primaryType === 'i' ? Math.round(node.VALUE?.[0] ?? 0) : (node.VALUE?.[0] ?? 0)"
+          :value="formatDisplay(node.VALUE?.[0], primaryType)"
           :disabled="!writable"
           :title="hasRange ? `drag · type · ${range.MIN}…${range.MAX}` : 'drag · type'"
           @change="onNumberInput"

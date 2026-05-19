@@ -24,7 +24,7 @@ import express from 'express'
 import http from 'node:http'
 import os from 'node:os'
 import dgram from 'node:dgram'
-import { readdirSync, readFileSync, writeFileSync, watch } from 'node:fs'
+import { readdirSync, readFileSync, writeFileSync, unlinkSync, watch } from 'node:fs'
 import { join } from 'node:path'
 import { WebSocketServer, WebSocket } from 'ws'
 import { Bonjour } from 'bonjour-service'
@@ -899,6 +899,36 @@ wssHub.on('connection', (ws, req) => {
     }
 
     if (msg.type === 'RELOAD_MANIFESTS') {
+      loadManifests()
+      return
+    }
+
+    if (msg.type === 'REMOVE_DEVICE' && typeof msg.deviceId === 'number') {
+      const filename = manifestFilenames.get(msg.deviceId)
+      const dev = devices.get(msg.deviceId)
+      if (!dev || !filename) {
+        ws.send(JSON.stringify({
+          type: 'ERROR',
+          message: `Unknown device id ${msg.deviceId}`
+        }))
+        return
+      }
+      try {
+        // Suppress the watcher reload so we don't race with our own delete:
+        // we'll call loadManifests() explicitly after the unlink.
+        suppressWatcher = true
+        unlinkSync(join(MANIFESTS_DIR, filename))
+        console.log(`  [hub] removed device: ${dev.name} (id ${msg.deviceId})  [${filename}]`)
+      } catch (err) {
+        console.log(`  [hub] remove failed for id ${msg.deviceId}: ${err.message}`)
+        ws.send(JSON.stringify({
+          type: 'ERROR',
+          message: `Could not delete manifest: ${err.message}`
+        }))
+        suppressWatcher = false
+        return
+      }
+      suppressWatcher = false
       loadManifests()
       return
     }
