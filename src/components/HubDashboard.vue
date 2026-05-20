@@ -314,6 +314,24 @@ watch(devices, (list) => {
         @reorder="({ from, to }) => reorderScene(from, to)"
       />
 
+      <!-- Discovered devices (moved above Manifest Devices for visibility — new
+           devices on the LAN are surfaced right under the Scenes bar instead
+           of being buried at the bottom of the page). -->
+      <template v-if="discovered.length > 0">
+        <div class="section-header">
+          <div class="section-title">Discovered on Network</div>
+          <div class="section-hint">Devices not yet in your manifests · click Add to register</div>
+        </div>
+        <div class="discovered-grid">
+          <DiscoveredCard
+            v-for="d in discovered"
+            :key="`${d.host}:${d.port}`"
+            :device="d"
+            @add="(payload) => addDiscovered(payload.host, payload.port, payload.name)"
+          />
+        </div>
+      </template>
+
       <!-- Manifest devices -->
       <div class="section-header">
         <div class="section-title">Manifest Devices</div>
@@ -353,21 +371,6 @@ watch(devices, (list) => {
         </div>
       </div>
 
-      <!-- Discovered devices -->
-      <template v-if="discovered.length > 0">
-        <div class="section-header">
-          <div class="section-title">Discovered on Network</div>
-          <div class="section-hint">Devices not yet in your manifests · click Add to register</div>
-        </div>
-        <div class="discovered-grid">
-          <DiscoveredCard
-            v-for="d in discovered"
-            :key="`${d.host}:${d.port}`"
-            :device="d"
-            @add="(payload) => addDiscovered(payload.host, payload.port, payload.name)"
-          />
-        </div>
-      </template>
     </main>
   </div>
 </template>

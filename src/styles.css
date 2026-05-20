@@ -1178,8 +1178,11 @@ details.row-section summary {
   width: 100%; background: var(--hub-surface); border: 1px solid var(--hub-border);
   border-radius: var(--hub-radius-sm); color: var(--hub-ink-dim);
   padding: 0.45rem 0.75rem; cursor: pointer;
-  font-family: var(--hub-sans); font-size: 0.7rem; font-weight: 500;
-  letter-spacing: 0.05em; transition: all 0.15s;
+  /* font-size + weight + letter-spacing kept in lockstep with the Presets,
+     Announce (LINK) and Recordings section toggles so all four titles in a
+     DeviceCard read as a uniform family. */
+  font-family: var(--hub-sans); font-size: 0.72rem; font-weight: 500;
+  letter-spacing: 0.04em; transition: all 0.15s;
   display: flex; justify-content: space-between; align-items: center;
 }
 .params-toggle-btn:hover { border-color: var(--hub-border-2); color: var(--hub-ink); }
@@ -1483,11 +1486,26 @@ details.row-section summary {
 }
 .hub-presets-section summary::-webkit-details-marker { display: none; }
 .hub-presets-section summary::before {
-  content: '▶'; font-size: 9px; color: var(--hub-ink-dim);
+  content: '▶'; font-size: 13px; color: var(--hub-ink-dim);
   transition: transform 0.15s;
   display: inline-block;
 }
 .hub-presets-section[open] summary::before { transform: rotate(90deg); }
+
+/* Shared chevron for non-<details> toggles (Parameters, Announce). Sits
+   inside a button that gets `.open` toggled by Vue. Same look + size as
+   the <summary>::before above, so all four section toggles in a DeviceCard
+   (Presets, Parameters, Announce, Recordings) read as a uniform family. */
+.hub-chevron {
+  display: inline-block;
+  font-size: 13px;
+  color: var(--hub-ink-dim);
+  transition: transform 0.15s, color 0.15s;
+}
+.params-toggle-btn.open .hub-chevron,
+.hub-announce-toggle.open .hub-chevron { transform: rotate(90deg); }
+.params-toggle-btn.open .hub-chevron { color: var(--hub-cyan); }
+.hub-announce-toggle.open .hub-chevron { color: var(--hub-pink); }
 .hub-presets-count {
   background: var(--hub-surface);
   color: var(--hub-cyan);
@@ -1663,7 +1681,9 @@ details.row-section summary {
   display: flex; justify-content: space-between; align-items: center;
   background: transparent; border: none; cursor: pointer;
   padding: 0.5rem 0.75rem;
-  font-family: var(--hub-sans); font-size: 0.7rem;
+  /* Aligned with .hub-presets-section summary / .params-toggle-btn /
+     .rec-section summary — same family. */
+  font-family: var(--hub-sans); font-size: 0.72rem; font-weight: 500;
   color: var(--hub-ink-mid);
   letter-spacing: 0.04em;
 }

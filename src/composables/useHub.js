@@ -1,4 +1,4 @@
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { ref } from 'vue'
 
 // Hub state — connects to the helper's /ws/hub channel.
 //
@@ -7,8 +7,22 @@ import { ref, onMounted, onBeforeUnmount } from 'vue'
 // DISCOVERED_DEVICES, DEVICE_MSG_COUNTS, ANNOUNCE_RESULT … to every
 // connected dashboard. This composable exposes those streams plus the
 // outbound commands (SET_DEVICE_PARAM, ANNOUNCE_DEVICE, …) to the UI.
+//
+// Singleton: the WebSocket and reactive state are shared across every
+// component that calls useHub(). First call opens the connection and
+// registers the unload teardown; subsequent calls just return the same
+// object. Without this, each DeviceCard etc. would open its own /ws/hub
+// (4× cards = 4× connections, 4× streams of duplicated PATH_CHANGED events).
+
+let _hub = null
 
 export function useHub() {
+  if (_hub) return _hub
+  _hub = createHub()
+  return _hub
+}
+
+function createHub() {
   const connected = ref(false)
   const devices = ref([])
   const discovered = ref([])
@@ -117,6 +131,17 @@ export function useHub() {
     return { deviceId: dev.id, relPath }
   }
 
+  // Subscribers that want to be notified of every PATH_CHANGED. Used by the
+  // recording feature so each DeviceCard can capture its own stream of value
+  // updates without having to deep-watch the reactive Map (cheaper + exact
+  // event timing). Listener signature: (deviceId, relPath, value, paramType).
+  const pathChangeListeners = new Set()
+  function onPathChange(listener) {
+    pathChangeListeners.add(listener)
+    // Return an unsubscribe handle for ergonomic onMounted/onBeforeUnmount use.
+    return () => pathChangeListeners.delete(listener)
+  }
+
   // Apply a single PATH_CHANGED to the per-device node map.
   function applyValue(absPath, value, paramType) {
     const resolved = pathToDeviceRel(absPath)
@@ -132,6 +157,15 @@ export function useHub() {
     )
     m.set(deviceId, inner)
     deviceParams.value = m
+
+    // Fan out to recording / observer subscribers. Errors in one listener
+    // must not break the others, so we catch per-listener.
+    for (const fn of pathChangeListeners) {
+      try { fn(deviceId, relPath, value, paramType) } catch (err) {
+        // Best-effort: log and keep going
+        console.warn('[useHub] pathChange listener threw:', err)
+      }
+    }
   }
 
   // Walk an initial OSCQuery tree (from INITIAL_STATE.namespace) to seed
@@ -212,12 +246,17 @@ export function useHub() {
     }
   }
 
-  onMounted(open)
-  onBeforeUnmount(() => {
-    clearTimeout(retry)
-    clearInterval(rateTimer)
-    if (ws) try { ws.close() } catch {}
-  })
+  // Singleton lifecycle: open the WS immediately on first useHub() call (no
+  // component lifecycle to lean on — the singleton lives as long as the page
+  // does), and tear down on page unload.
+  open()
+  if (typeof window !== 'undefined') {
+    window.addEventListener('beforeunload', () => {
+      clearTimeout(retry)
+      clearInterval(rateTimer)
+      if (ws) try { ws.close() } catch {}
+    })
+  }
 
   return {
     connected,
@@ -238,6 +277,7 @@ export function useHub() {
     rediscover,
     addDiscovered,
     setDeviceParam,
-    announceDevice
+    announceDevice,
+    onPathChange
   }
 }

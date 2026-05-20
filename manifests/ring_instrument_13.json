@@ -1,0 +1,9 @@
+{
+  "id": 13,
+  "name": "Ring-Instrument",
+  "type": "oscquery-device",
+  "host": "192.168.2.48",
+  "oscQueryPort": 9011,
+  "enabled": true,
+  "description": "Discovered via Bonjour"
+}

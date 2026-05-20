@@ -2,8 +2,11 @@
 import { computed, ref, toRef, watch } from 'vue'
 import ParameterControl from './ParameterControl.vue'
 import PresetSection from './PresetSection.vue'
+import RecordingPanel from './RecordingPanel.vue'
 import { sanitizePeerId } from '../composables/usePeer.js'
 import { useHubPresets } from '../composables/useHubPresets.js'
+import { useRecording } from '../composables/useRecording.js'
+import { useHub } from '../composables/useHub.js'
 
 const props = defineProps({
   device: { type: Object, required: true },
@@ -141,6 +144,19 @@ const {
   update: updatePresetFn,
   reorder: reorderPreset
 } = useHubPresets(deviceIdRef)
+
+// ─── Recording / playback panel ───────────────────────────────────────
+// Mounts inside the device card so each device has its own buffer + UI.
+// We pull `onPathChange` (for capturing) and `setDeviceParam` (for playback
+// dispatch) from useHub. The deviceName getter is intentionally a closure
+// so renames are reflected at save time without re-subscribing.
+const { onPathChange, setDeviceParam } = useHub()
+const recording = useRecording(
+  props.device.id,
+  onPathChange,
+  setDeviceParam,
+  () => props.device.name
+)
 
 // PresetSection wants a flat object { [path]: node }. We have a Map; convert
 // once here. Lightweight enough to compute on every params change.
@@ -398,8 +414,8 @@ const paramCount = computed(() => props.params.size)
           :class="{ open: expanded }"
           @click="expanded = !expanded"
         >
-          <span style="display:flex;align-items:center;gap:0.4rem">
-            <span class="arrow">{{ expanded ? '▴' : '▾' }}</span>
+          <span style="display:flex;align-items:center;gap:0.5rem">
+            <span class="hub-chevron">▶</span>
             Parameters
           </span>
           <span class="params-count-badge">{{ paramCount }}</span>
@@ -445,16 +461,16 @@ const paramCount = computed(() => props.params.size)
         </div>
       </div>
 
-      <!-- ─── Announce ─── -->
+      <!-- ─── LINK (peer announce) ─── -->
       <div class="hub-announce">
         <button
           class="hub-announce-toggle"
           :class="{ open: announceOpen }"
           @click="announceOpen = !announceOpen"
         >
-          <span style="display:flex;align-items:center;gap:0.4rem">
-            <span class="arrow">{{ announceOpen ? '▴' : '▾' }}</span>
-            Announce
+          <span style="display:flex;align-items:center;gap:0.5rem">
+            <span class="hub-chevron">▶</span>
+            LINK
           </span>
           <span class="announce-summary">{{ announceSummary }}</span>
         </button>
@@ -511,6 +527,9 @@ const paramCount = computed(() => props.params.size)
           </div>
         </div>
       </div>
+
+      <!-- ─── Recordings (record / playback per device) ─── -->
+      <RecordingPanel :rec="recording" />
 
     </div>
   </div>

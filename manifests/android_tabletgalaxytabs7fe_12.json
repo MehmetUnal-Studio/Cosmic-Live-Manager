@@ -4,6 +4,6 @@
   "type": "oscquery-device",
   "host": "192.168.2.34",
   "oscQueryPort": 9010,
-  "enabled": true,
+  "enabled": false,
   "description": "Discovered via Bonjour"
 }
