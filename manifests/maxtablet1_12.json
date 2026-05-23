@@ -1,9 +1,9 @@
 {
-  "id": 13,
-  "name": "Ring-Instrument",
+  "id": 12,
+  "name": "MaxTablet1",
   "type": "oscquery-device",
-  "host": "192.168.2.48",
-  "oscQueryPort": 9011,
+  "host": "127.0.0.1",
+  "oscQueryPort": 8000,
   "enabled": true,
   "description": "Discovered via Bonjour"
 }
