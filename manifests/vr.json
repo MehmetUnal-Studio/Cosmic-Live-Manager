@@ -1,9 +1,0 @@
-{
-  "id": 6,
-  "name": "VR",
-  "type": "vr-headset",
-  "host": "192.168.1.106",
-  "oscQueryPort": 9010,
-  "enabled": false,
-  "description": "VR instrument 1"
-}

@@ -122,7 +122,26 @@ function loadManifests() {
       try {
         const content = readFileSync(join(MANIFESTS_DIR, file), 'utf-8')
         const manifest = JSON.parse(content)
-        manifest.status = manifest.enabled ? 'configured' : 'disabled'
+
+        // Status / runtime fields: preserve from the previous load if the
+        // device still points at the same host:port AND its OSCQuery client
+        // is alive. Without this, every loadManifests() (e.g. triggered by
+        // adding a NEW device, or by the folder watcher) would reset every
+        // existing device back to 'configured' — making the dashboard show
+        // them as disconnected even though their WS is still up.
+        const old = oldDevices.get(manifest.id)
+        const sameTarget =
+          old &&
+          old.host === manifest.host &&
+          Number(old.oscQueryPort) === Number(manifest.oscQueryPort)
+        if (sameTarget && manifest.enabled && oscQueryClients.has(manifest.id)) {
+          manifest.status        = old.status || (manifest.enabled ? 'configured' : 'disabled')
+          manifest.oscPort       = old.oscPort
+          manifest.paramCount    = old.paramCount
+          manifest.lastMessageAt = old.lastMessageAt
+        } else {
+          manifest.status = manifest.enabled ? 'configured' : 'disabled'
+        }
 
         if (devices.has(manifest.id)) {
           console.log(`  [manifest] conflict: id ${manifest.id} already exists, skipping ${file}`)
@@ -997,10 +1016,32 @@ wssHub.on('connection', (ws, req) => {
         description: 'Discovered via Bonjour'
       }
       const filename = `${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${nextId}.json`
-      writeFileSync(join(MANIFESTS_DIR, filename), JSON.stringify(manifest, null, 2) + '\n', 'utf-8')
+      // Suppress the manifest folder watcher so it doesn't race our explicit
+      // loadManifests() below. Without this, the watcher's debounced reload
+      // can fire AFTER reconcileClients has already started the new client,
+      // causing a brief disconnect/reconnect blip.
+      suppressWatcher = true
+      try {
+        writeFileSync(join(MANIFESTS_DIR, filename), JSON.stringify(manifest, null, 2) + '\n', 'utf-8')
+      } finally {
+        // Re-arm after a short grace period so legitimate external edits
+        // are still picked up.
+        setTimeout(() => { suppressWatcher = false }, 300)
+      }
       discoveredDevices.delete(`${msg.host}:${msg.port}`)
       console.log(`  [hub] added device: ${name} (id ${nextId})`)
       loadManifests()
+
+      // Belt & suspenders: reconcileClients (called by loadManifests) should
+      // already have started the connection because the manifest is created
+      // with enabled:true. But in case the new device wasn't picked up for
+      // any reason (race, filename normalization, etc.), force the connect
+      // explicitly here so the user doesn't have to click Reconnect.
+      const newDev = devices.get(nextId)
+      if (newDev && newDev.enabled && !oscQueryClients.has(newDev.id)) {
+        connectToDevice(newDev)
+      }
+
       broadcastDiscovered()
     }
   })

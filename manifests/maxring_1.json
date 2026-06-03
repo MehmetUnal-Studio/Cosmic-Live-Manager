@@ -1,9 +1,9 @@
 {
-  "id": 12,
-  "name": "MaxTablet1",
+  "id": 1,
+  "name": "MaxRing",
   "type": "oscquery-device",
   "host": "127.0.0.1",
-  "oscQueryPort": 8000,
+  "oscQueryPort": 8005,
   "enabled": true,
   "description": "Discovered via Bonjour"
 }

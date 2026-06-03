@@ -1730,6 +1730,29 @@ details.row-section summary {
 .hub-announce-row input[type="number"] {
   max-width: 140px;
 }
+/* "Reset to device name" arrow button, sits next to the Peer ID input.
+   Greyed out when already in sync with the device name. */
+.hub-peerid-reset {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid var(--hub-border);
+  color: var(--hub-ink-dim);
+  width: 26px; height: 26px;
+  border-radius: 4px;
+  font-size: 13px; line-height: 1;
+  cursor: pointer; user-select: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.hub-peerid-reset:hover:not(:disabled) {
+  color: var(--hub-cyan);
+  border-color: rgba(6, 182, 212, 0.4);
+  background: rgba(6, 182, 212, 0.08);
+}
+.hub-peerid-reset:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
 .hub-announce-actions { justify-content: flex-end; gap: 10px; }
 .hub-announce-actions .hub-btn { flex: 0 0 auto; padding: 0.4rem 1.1rem; }
 .announce-result {
