@@ -188,14 +188,17 @@ function loadAnnounce() {
     const raw = localStorage.getItem(storageKey.value)
     if (raw) return JSON.parse(raw)
   } catch { /* ignore */ }
-  return { targetFqdn: '', peerId: '', udpPortOverride: 0 }
+  return { targetFqdn: '', peerId: '' }
 }
 function persistAnnounce() {
   try {
+    // Note: udpPortOverride is INTENTIONALLY not persisted. We want every
+    // fresh page load (and every freshly-added device) to start with the
+    // default UDP port (0 = use device's HOST_INFO.OSC_PORT). It's an
+    // override knob, not a sticky preference.
     localStorage.setItem(storageKey.value, JSON.stringify({
       targetFqdn: targetFqdn.value,
-      peerId: peerId.value,
-      udpPortOverride: Number(udpOverride.value) || 0
+      peerId: peerId.value
     }))
   } catch { /* quota / disabled */ }
 }
@@ -203,18 +206,20 @@ function persistAnnounce() {
 const _initial = loadAnnounce()
 const targetFqdn         = ref(_initial.targetFqdn)
 const peerId             = ref(_initial.peerId || sanitizePeerId(props.device.name))
-const udpOverride        = ref(_initial.udpPortOverride || 0)
+// Always starts at 0 (= "use device default") on every mount / reload.
+const udpOverride        = ref(0)
 
 // Reload when the device id changes (e.g. manifest reload renumbers IDs)
 watch(() => props.device.id, () => {
   const fresh = loadAnnounce()
   targetFqdn.value  = fresh.targetFqdn
   peerId.value      = fresh.peerId || sanitizePeerId(props.device.name)
-  udpOverride.value = fresh.udpPortOverride || 0
+  udpOverride.value = 0
 })
 
-// Persist on every change
-watch([targetFqdn, peerId, udpOverride], persistAnnounce)
+// Persist only the sticky fields. udpOverride is in-session-only — see
+// persistAnnounce comment.
+watch([targetFqdn, peerId], persistAnnounce)
 
 // Target list = every discovered service except this device itself.
 const targetCandidates = computed(() => {
