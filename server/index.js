@@ -1058,11 +1058,17 @@ setInterval(() => {
 }, 500)
 
 // ─── Server startup ───────────────────────────────────────────────────────
-server.listen(PORT, () => {
+// Bind the HTTP/WS server on all interfaces so LAN clients can reach it.
+// (Node's `listen(PORT)` without a host arg already does this, but we pass
+// '0.0.0.0' explicitly for clarity.)
+server.listen(PORT, '0.0.0.0', () => {
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log(`  ${HUB_NAME}`)
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log(`  HTTP + WS:         http://localhost:${PORT}`)
+  for (const ip of lanAddresses()) {
+    console.log(`                     http://${ip.address}:${PORT}  (${ip.name})`)
+  }
   console.log(`  OSC inbound:       UDP port ${OSC_LISTEN_PORT}`)
   if (ABLETON_FORWARD) {
     console.log(`  Ableton forward:   UDP ${ABLETON_HOST}:${ABLETON_PORT}`)
