@@ -46,6 +46,16 @@ export function useRecording(deviceId, onPathChange, setDeviceParam, getCurrentD
   let durationTimer = null
   let unsubscribe = null
 
+  // Verbose logging gate. Enable from the DevTools console:
+  //   localStorage.setItem('clm:debug:recording', '1')
+  // Disable with:
+  //   localStorage.removeItem('clm:debug:recording')
+  // Read once at startRecording() time so toggling persists for the
+  // duration of a single recording session (and not mid-stream).
+  function isDebugRecording() {
+    try { return localStorage.getItem('clm:debug:recording') === '1' } catch { return false }
+  }
+
   function startRecording() {
     if (recording.value) return
     recordBuffer = []
@@ -53,15 +63,27 @@ export function useRecording(deviceId, onPathChange, setDeviceParam, getCurrentD
     recordingDurationMs.value = 0
     recordStart = performance.now()
 
+    const debug = isDebugRecording()
+    if (debug) {
+      // eslint-disable-next-line no-console
+      console.log(`[REC ${deviceId}] start`)
+    }
+
     // Subscribe to every path-changed event filtered to THIS device.
-    unsubscribe = onPathChange((evDeviceId, relPath, value /*, paramType */) => {
+    unsubscribe = onPathChange((evDeviceId, relPath, value, paramType) => {
       if (evDeviceId !== deviceId) return
-      recordBuffer.push({
-        t: Math.round(performance.now() - recordStart),
-        path: relPath,
-        value: value
-      })
+      const t = Math.round(performance.now() - recordStart)
+      recordBuffer.push({ t, path: relPath, value })
       recordingEventCount.value = recordBuffer.length
+      if (debug) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[REC ${deviceId}] +${t}ms ${relPath}`,
+          'value=', value,
+          'type=', paramType,
+          `(${recordBuffer.length})`
+        )
+      }
     })
 
     // Tick the "live duration" counter so the UI shows elapsed time.

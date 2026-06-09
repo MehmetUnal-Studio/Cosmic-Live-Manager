@@ -142,10 +142,29 @@ function createHub() {
     return () => pathChangeListeners.delete(listener)
   }
 
+  // Verbose drop logging. Toggle from the DevTools console:
+  //   localStorage.setItem('clm:debug:applyValue', '1')   // log every drop
+  //   localStorage.removeItem('clm:debug:applyValue')
+  // Useful to spot PATH_CHANGED events that arrive for a device whose name
+  // isn't (yet / any more) in `devices.value` — those are dropped silently
+  // by default and that drop is a common cause of "missing" recordings.
+  function isDebugApply() {
+    try { return localStorage.getItem('clm:debug:applyValue') === '1' } catch { return false }
+  }
+
   // Apply a single PATH_CHANGED to the per-device node map.
   function applyValue(absPath, value, paramType) {
     const resolved = pathToDeviceRel(absPath)
-    if (!resolved) return
+    if (!resolved) {
+      if (isDebugApply()) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[APPLY-DROP] no device for', absPath,
+          'known devices:', devices.value.map((d) => d.name)
+        )
+      }
+      return
+    }
     const { deviceId, relPath } = resolved
     const m = new Map(deviceParams.value)
     if (!m.has(deviceId)) m.set(deviceId, new Map())
