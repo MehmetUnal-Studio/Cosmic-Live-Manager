@@ -79,6 +79,34 @@ function createHub() {
   function rediscover() {
     send({ type: 'REDISCOVER' })
   }
+
+  // Ask the helper to dump the current set of manifests so the user can save
+  // them as a JSON. The helper replies on the same socket with
+  // { type: 'MANIFESTS_EXPORT', manifests: [...] } which we capture once and
+  // trigger a download from.
+  let pendingExportResolver = null
+  function exportManifests() {
+    return new Promise((resolve, reject) => {
+      pendingExportResolver = resolve
+      send({ type: 'EXPORT_MANIFESTS' })
+      // Safety timeout — if the helper doesn't reply we still surface an error.
+      setTimeout(() => {
+        if (pendingExportResolver) {
+          pendingExportResolver = null
+          reject(new Error('Helper did not reply with MANIFESTS_EXPORT in time'))
+        }
+      }, 3000)
+    })
+  }
+
+  // Bulk-replace the manifest set with the contents of an imported JSON.
+  // The helper clears the manifests folder and writes the new ones.
+  function importManifests(manifestsArray) {
+    if (!Array.isArray(manifestsArray)) {
+      throw new Error('importManifests: expected an array')
+    }
+    send({ type: 'IMPORT_MANIFESTS', manifests: manifestsArray })
+  }
   function addDiscovered(host, port, name) {
     send({ type: 'ADD_DISCOVERED', host, port, name: (name || '').trim() || undefined })
   }
@@ -261,6 +289,13 @@ function createHub() {
         subscribers.value = msg.subscribers || []
       } else if (msg.type === 'ANNOUNCE_RESULT') {
         setAnnounceResult(msg.deviceId, { ok: msg.ok, error: msg.error, summary: msg.summary })
+      } else if (msg.type === 'MANIFESTS_EXPORT') {
+        // Resolve the pending exportManifests() Promise so the UI can
+        // trigger the file download with the payload.
+        if (pendingExportResolver) {
+          pendingExportResolver(msg)
+          pendingExportResolver = null
+        }
       }
     }
   }
@@ -297,6 +332,8 @@ function createHub() {
     addDiscovered,
     setDeviceParam,
     announceDevice,
-    onPathChange
+    onPathChange,
+    exportManifests,
+    importManifests
   }
 }

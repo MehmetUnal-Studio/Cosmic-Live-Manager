@@ -1022,7 +1022,20 @@ details.row-section summary {
   box-shadow: 0 0 0 1px rgba(16,185,129,0.1), 0 4px 20px rgba(0,0,0,0.2);
 }
 .device-card.connecting { border-color: rgba(245,158,11,0.35); }
-.device-card.lost       { border-color: rgba(239,68,68,0.35); }
+/* Lost: emphasize hard. A subtle border isn't enough on a glance — make the
+   whole card read "broken" with a strong red border, a tinted background,
+   and a slow pulse so it draws the eye in a busy dashboard. */
+.device-card.lost {
+  border-color: rgba(239,68,68,0.85);
+  border-width: 2px;
+  background: linear-gradient(180deg, rgba(239,68,68,0.10), rgba(239,68,68,0.04));
+  box-shadow: 0 0 0 1px rgba(239,68,68,0.25), 0 4px 20px rgba(239,68,68,0.18);
+  animation: device-lost-pulse 1.6s ease-in-out infinite;
+}
+@keyframes device-lost-pulse {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(239,68,68,0.25), 0 4px 20px rgba(239,68,68,0.18); }
+  50%      { box-shadow: 0 0 0 1px rgba(239,68,68,0.55), 0 6px 28px rgba(239,68,68,0.40); }
+}
 .device-card.disabled   { opacity: 0.5; }
 .device-card.flash      { background: rgba(99,102,241,0.06); }
 
@@ -1135,7 +1148,18 @@ details.row-section summary {
   color: var(--hub-ink-dim); font-family: var(--hub-mono);
 }
 .device-status-text.connected  { color: var(--hub-green); }
-.device-status-text.lost       { color: var(--hub-red); }
+/* Lost status text: bold, full red, bigger, with a tinted pill background so
+   it stands out from "CONFIGURED" / "CONNECTING" at a glance. */
+.device-status-text.lost {
+  color: var(--hub-red);
+  font-weight: 700;
+  font-size: 0.74rem;
+  letter-spacing: 0.12em;
+  background: rgba(239,68,68,0.14);
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid rgba(239,68,68,0.45);
+}
 .device-status-text.connecting { color: var(--hub-yellow); }
 .device-msgs {
   font-family: var(--hub-mono); font-size: 0.68rem; color: var(--hub-accent);

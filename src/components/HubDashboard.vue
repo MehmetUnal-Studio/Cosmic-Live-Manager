@@ -22,7 +22,9 @@ const {
   rediscover,
   addDiscovered,
   setDeviceParam,
-  announceDevice
+  announceDevice,
+  exportManifests,
+  importManifests
 } = useHub()
 
 // Brief visual feedback on the Rediscover button (so the user knows the click
@@ -33,6 +35,55 @@ function onRediscoverClick() {
   rediscover()
   rediscovering.value = true
   setTimeout(() => { rediscovering.value = false }, 600)
+}
+
+// ─── Export / Import manifest preset ─────────────────────────────────────
+// The dashboard starts empty on every helper restart (see server's
+// KEEP_MANIFESTS logic). Export downloads the current set as a JSON file;
+// Import reads a previously saved JSON and replaces the current set on the
+// helper.
+const importInputRef = ref(null)
+
+async function onExportClick() {
+  try {
+    const payload = await exportManifests()
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `clm-manifests-${Date.now()}.json`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  } catch (err) {
+    alert('Export failed: ' + (err.message || err))
+  }
+}
+
+function onImportClick() {
+  if (importInputRef.value) importInputRef.value.click()
+}
+async function onImportFile(e) {
+  const file = e.target.files && e.target.files[0]
+  if (!file) return
+  try {
+    const text = await file.text()
+    const parsed = JSON.parse(text)
+    const manifests = Array.isArray(parsed) ? parsed
+                    : Array.isArray(parsed.manifests) ? parsed.manifests
+                    : null
+    if (!manifests) throw new Error('JSON missing a `manifests` array')
+    if (!window.confirm(`Replace the current ${devices.value.length} device(s) with ${manifests.length} from the file?`)) {
+      e.target.value = ''
+      return
+    }
+    importManifests(manifests)
+  } catch (err) {
+    alert('Import failed: ' + (err.message || err))
+  } finally {
+    e.target.value = ''
+  }
 }
 
 const { services } = useDiscovery()
@@ -90,6 +141,17 @@ const orderedDevices = computed(() => {
   const remaining = Array.from(byId.values()).sort((a, b) => a.id - b.id)
   return [...out, ...remaining]
 })
+
+// Split into two sub-lists for separate rendering: device names that contain
+// "max" (case-insensitive) go in the bottom section, everything else in the
+// top section. The single underlying `orderedDevices` array is preserved so
+// drag-and-drop indexing keeps working across both grids — we just filter
+// what each grid renders.
+function isMaxDevice(d) {
+  return /max/i.test(d?.name || '')
+}
+const generalDevices = computed(() => orderedDevices.value.filter((d) => !isMaxDevice(d)))
+const maxDevices     = computed(() => orderedDevices.value.filter((d) =>  isMaxDevice(d)))
 
 // Stats
 const statTotal  = computed(() => devices.value.length)
@@ -258,6 +320,32 @@ watch(devices, (list) => {
       <div class="hub-topbar-spacer"></div>
       <button
         class="hub-rediscover-btn"
+        type="button"
+        title="Download the current manifest set as a JSON preset. Restore it later via Import."
+        @click="onExportClick"
+        :disabled="devices.length === 0"
+      >
+        <span class="hub-rediscover-icon">⬇</span>
+        Export
+      </button>
+      <input
+        ref="importInputRef"
+        type="file"
+        accept="application/json,.json"
+        style="display:none"
+        @change="onImportFile"
+      />
+      <button
+        class="hub-rediscover-btn"
+        type="button"
+        title="Load a previously exported manifest preset. Replaces the current set."
+        @click="onImportClick"
+      >
+        <span class="hub-rediscover-icon">⬆</span>
+        Import
+      </button>
+      <button
+        class="hub-rediscover-btn"
         :class="{ spinning: rediscovering }"
         type="button"
         title="Rebuild the helper's network discovery cache (equivalent of restarting npm run dev). Use when a device has renamed/changed port and isn't showing up."
@@ -332,7 +420,7 @@ watch(devices, (list) => {
         </div>
       </template>
 
-      <!-- Manifest devices -->
+      <!-- Manifest devices — General (everything whose name doesn't contain "max") -->
       <div class="section-header">
         <div class="section-title">Manifest Devices</div>
         <div class="section-hint">
@@ -340,20 +428,20 @@ watch(devices, (list) => {
         </div>
       </div>
       <div class="devices-grid">
-        <div v-if="orderedDevices.length === 0" class="empty">No manifest files yet.</div>
+        <div v-if="generalDevices.length === 0" class="empty">No general devices.</div>
         <div
-          v-for="(dev, idx) in orderedDevices"
+          v-for="dev in generalDevices"
           :key="dev.id"
-          :data-drag-idx="idx"
+          :data-drag-idx="orderedDevices.indexOf(dev)"
           class="device-card-wrapper"
           :class="{
-            'drag-source': dragIdx === idx,
-            'drag-target': dragOverIdx === idx && dragIdx !== -1,
+            'drag-source': dragIdx === orderedDevices.indexOf(dev),
+            'drag-target': dragOverIdx === orderedDevices.indexOf(dev) && dragIdx !== -1,
           }"
-          :style="dragIdx === idx
+          :style="dragIdx === orderedDevices.indexOf(dev)
             ? { transform: `translate(${dragDX}px, ${dragDY}px) scale(1.025)`, zIndex: 50 }
             : null"
-          @pointerdown="onCardPointerDown($event, idx, $event.currentTarget)"
+          @pointerdown="onCardPointerDown($event, orderedDevices.indexOf(dev), $event.currentTarget)"
         >
           <DeviceCard
             :device="dev"
@@ -370,6 +458,46 @@ watch(devices, (list) => {
           />
         </div>
       </div>
+
+      <!-- Manifest devices — Max (anything whose name contains "Max") -->
+      <template v-if="maxDevices.length > 0">
+        <div class="section-header">
+          <div class="section-title">Max Devices</div>
+          <div class="section-hint">
+            Devices whose name contains "Max" — shown separately for easier triage at a glance
+          </div>
+        </div>
+        <div class="devices-grid">
+          <div
+            v-for="dev in maxDevices"
+            :key="dev.id"
+            :data-drag-idx="orderedDevices.indexOf(dev)"
+            class="device-card-wrapper"
+            :class="{
+              'drag-source': dragIdx === orderedDevices.indexOf(dev),
+              'drag-target': dragOverIdx === orderedDevices.indexOf(dev) && dragIdx !== -1,
+            }"
+            :style="dragIdx === orderedDevices.indexOf(dev)
+              ? { transform: `translate(${dragDX}px, ${dragDY}px) scale(1.025)`, zIndex: 50 }
+              : null"
+            @pointerdown="onCardPointerDown($event, orderedDevices.indexOf(dev), $event.currentTarget)"
+          >
+            <DeviceCard
+              :device="dev"
+              :msg-count="deviceMsgCounts.get(dev.id) || 0"
+              :params="deviceParams.get(dev.id) || new Map()"
+              :hint="saveHints.get(dev.id) || null"
+              :services="services"
+              :announce-result="announceResults.get(dev.id) || null"
+              @update="(u) => updateDevice(dev.id, u)"
+              @reconnect="reconnectDevice(dev.id)"
+              @set-param="(payload) => setDeviceParam(dev.id, payload.path, payload.value)"
+              @announce="(payload) => announceDevice(dev.id, payload.target, payload.peerId, payload.udpPortOverride)"
+              @remove="removeDevice(dev.id)"
+            />
+          </div>
+        </div>
+      </template>
 
     </main>
   </div>

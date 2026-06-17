@@ -473,6 +473,24 @@ udpHubPort.on('ready', () => {
   }
 
   // Boot the rest of the hub once the OSC socket is up.
+  // Empty-on-start: by default we wipe the manifests folder on every helper
+  // startup so each fresh session begins with no devices on the dashboard.
+  // The user can preserve the previous set by Exporting BEFORE restarting
+  // (and re-Importing after). Set KEEP_MANIFESTS=1 to disable this and keep
+  // the legacy auto-load-from-disk behaviour.
+  if (process.env.KEEP_MANIFESTS !== '1') {
+    try {
+      const files = readdirSync(MANIFESTS_DIR).filter((f) => f.endsWith('.json'))
+      suppressWatcher = true
+      for (const f of files) {
+        try { unlinkSync(join(MANIFESTS_DIR, f)) } catch {}
+      }
+      setTimeout(() => { suppressWatcher = false }, 300)
+      if (files.length > 0) {
+        console.log(`  [manifest] cleared ${files.length} stale manifest(s) on startup (set KEEP_MANIFESTS=1 to preserve)`)
+      }
+    } catch { /* dir may not exist yet — loadManifests handles that */ }
+  }
   loadManifests()
   try {
     watch(MANIFESTS_DIR, { persistent: false }, () => {
@@ -961,6 +979,78 @@ wssHub.on('connection', (ws, req) => {
 
     if (msg.type === 'REDISCOVER') {
       rediscoverNetwork()
+      return
+    }
+
+    if (msg.type === 'EXPORT_MANIFESTS') {
+      // Dump the current device list as a JSON manifest set the user can
+      // save and re-import later. We send only the on-disk fields (not the
+      // runtime ones like status / paramCount / lastMessageAt).
+      const payload = Array.from(devices.values()).map((d) => ({
+        id:           d.id,
+        name:         d.name,
+        type:         d.type || 'oscquery-device',
+        host:         d.host,
+        oscQueryPort: d.oscQueryPort,
+        enabled:      d.enabled !== false,
+        description:  d.description || ''
+      }))
+      ws.send(JSON.stringify({
+        type: 'MANIFESTS_EXPORT',
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        manifests: payload
+      }))
+      return
+    }
+
+    if (msg.type === 'IMPORT_MANIFESTS' && Array.isArray(msg.manifests)) {
+      // Replace the current device set with the imported one.
+      // 1. Suppress the file watcher while we churn through the folder.
+      // 2. Delete every existing .json.
+      // 3. Re-id every imported entry (we don't trust the incoming ids — they
+      //    might collide with what we have or what's been used before).
+      // 4. Write each as a manifest file with a sanitized filename.
+      // 5. loadManifests() to bring them online + connect.
+      suppressWatcher = true
+      try {
+        // Disconnect everyone first so reconcileClients doesn't get confused
+        // by the in-flight rename.
+        for (const [id, client] of oscQueryClients.entries()) {
+          try { client.disconnect() } catch {}
+          oscQueryClients.delete(id)
+        }
+        // Wipe disk
+        for (const f of readdirSync(MANIFESTS_DIR).filter((x) => x.endsWith('.json'))) {
+          try { unlinkSync(join(MANIFESTS_DIR, f)) } catch {}
+        }
+        // Write fresh manifests with stable, gap-free ids starting at 1.
+        let nextId = 1
+        for (const m of msg.manifests) {
+          if (!m || !m.name || !m.host || !m.oscQueryPort) continue
+          if (!isValidHost(String(m.host))) continue
+          if (!isValidOscPort(Number(m.oscQueryPort))) continue
+          const id = nextId++
+          const manifest = {
+            id,
+            name:         String(m.name).slice(0, 64),
+            type:         m.type || 'oscquery-device',
+            host:         String(m.host),
+            oscQueryPort: Number(m.oscQueryPort),
+            enabled:      m.enabled !== false,
+            description:  m.description || 'Imported'
+          }
+          const filename = `${manifest.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${id}.json`
+          writeFileSync(join(MANIFESTS_DIR, filename), JSON.stringify(manifest, null, 2) + '\n', 'utf-8')
+        }
+        console.log(`  [hub] imported ${nextId - 1} manifest(s)`)
+      } catch (err) {
+        console.log(`  [hub] import failed: ${err.message}`)
+        ws.send(JSON.stringify({ type: 'ERROR', message: 'Import failed: ' + err.message }))
+      } finally {
+        setTimeout(() => { suppressWatcher = false }, 300)
+      }
+      loadManifests()
       return
     }
 
