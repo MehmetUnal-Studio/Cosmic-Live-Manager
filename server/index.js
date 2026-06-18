@@ -24,7 +24,7 @@ import express from 'express'
 import http from 'node:http'
 import os from 'node:os'
 import dgram from 'node:dgram'
-import { readdirSync, readFileSync, writeFileSync, unlinkSync, watch } from 'node:fs'
+import { readdirSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync, watch } from 'node:fs'
 import { join } from 'node:path'
 import { WebSocketServer, WebSocket } from 'ws'
 import { Bonjour } from 'bonjour-service'
@@ -38,6 +38,23 @@ const ABLETON_HOST       = process.env.ABLETON_HOST || '127.0.0.1'
 const ABLETON_PORT       = Number(process.env.ABLETON_PORT || 10000)   // hub → Ableton M4L udpreceive
 const HUB_NAME           = process.env.HUB_NAME || 'Cosmic Live Manager'
 const MANIFESTS_DIR      = process.env.MANIFESTS_DIR || './manifests'
+
+// Make sure `MANIFESTS_DIR` actually exists on disk. Fresh clones, Windows
+// machines, or a user who manually deleted the folder would otherwise hit
+// ENOENT on the first writeFileSync. mkdirSync with `recursive: true` is a
+// no-op when the dir already exists, so it's safe to call as often as we
+// want.
+function ensureManifestsDir() {
+  try {
+    if (!existsSync(MANIFESTS_DIR)) {
+      mkdirSync(MANIFESTS_DIR, { recursive: true })
+      console.log(`  [manifest] created missing dir: ${MANIFESTS_DIR}`)
+    }
+  } catch (err) {
+    console.log(`  [manifest] could not create dir ${MANIFESTS_DIR}: ${err.message}`)
+  }
+}
+ensureManifestsDir()
 const ABLETON_FORWARD    = process.env.ABLETON_FORWARD !== '0'         // on by default; set to "0" to disable
 
 // ─── Security constants ───────────────────────────────────────────────────
@@ -331,6 +348,7 @@ function saveManifest(deviceId, updates) {
   }
 
   try {
+    ensureManifestsDir()
     suppressWatcher = true
     const filePath = join(MANIFESTS_DIR, filename)
     writeFileSync(filePath, JSON.stringify(updated, null, 2) + '\n', 'utf-8')
@@ -1006,12 +1024,14 @@ wssHub.on('connection', (ws, req) => {
 
     if (msg.type === 'IMPORT_MANIFESTS' && Array.isArray(msg.manifests)) {
       // Replace the current device set with the imported one.
-      // 1. Suppress the file watcher while we churn through the folder.
-      // 2. Delete every existing .json.
-      // 3. Re-id every imported entry (we don't trust the incoming ids — they
+      // 1. Make sure the manifests folder exists (fresh clones may not have it).
+      // 2. Suppress the file watcher while we churn through the folder.
+      // 3. Delete every existing .json.
+      // 4. Re-id every imported entry (we don't trust the incoming ids — they
       //    might collide with what we have or what's been used before).
-      // 4. Write each as a manifest file with a sanitized filename.
-      // 5. loadManifests() to bring them online + connect.
+      // 5. Write each as a manifest file with a sanitized filename.
+      // 6. loadManifests() to bring them online + connect.
+      ensureManifestsDir()
       suppressWatcher = true
       try {
         // Disconnect everyone first so reconcileClients doesn't get confused
@@ -1110,6 +1130,7 @@ wssHub.on('connection', (ws, req) => {
       // loadManifests() below. Without this, the watcher's debounced reload
       // can fire AFTER reconcileClients has already started the new client,
       // causing a brief disconnect/reconnect blip.
+      ensureManifestsDir()
       suppressWatcher = true
       try {
         writeFileSync(join(MANIFESTS_DIR, filename), JSON.stringify(manifest, null, 2) + '\n', 'utf-8')
