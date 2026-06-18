@@ -484,18 +484,14 @@ const udpHubPort = new osc.UDPPort({
   metadata: true
 })
 
-udpHubPort.on('ready', () => {
-  console.log(`[osc-hub] listening for UDP OSC on 0.0.0.0:${OSC_LISTEN_PORT}`)
-  for (const ip of lanAddresses()) {
-    console.log(`[osc-hub] LAN address: ${ip.address}  (interface ${ip.name})`)
-  }
-
-  // Boot the rest of the hub once the OSC socket is up.
+// Boot the rest of the hub (manifest load + watcher). Extracted so it can be
+// called either from the UDP port's 'ready' callback (normal mode) or
+// directly when the UDP listener is disabled.
+function bootHub() {
   // Empty-on-start: by default we wipe the manifests folder on every helper
   // startup so each fresh session begins with no devices on the dashboard.
-  // The user can preserve the previous set by Exporting BEFORE restarting
-  // (and re-Importing after). Set KEEP_MANIFESTS=1 to disable this and keep
-  // the legacy auto-load-from-disk behaviour.
+  // Set KEEP_MANIFESTS=1 to disable this and keep the legacy
+  // auto-load-from-disk behaviour.
   if (process.env.KEEP_MANIFESTS !== '1') {
     try {
       const files = readdirSync(MANIFESTS_DIR).filter((f) => f.endsWith('.json'))
@@ -519,6 +515,14 @@ udpHubPort.on('ready', () => {
   } catch {
     console.log('  [manifest] watcher could not start')
   }
+}
+
+udpHubPort.on('ready', () => {
+  console.log(`[osc-hub] listening for UDP OSC on 0.0.0.0:${OSC_LISTEN_PORT}`)
+  for (const ip of lanAddresses()) {
+    console.log(`[osc-hub] LAN address: ${ip.address}  (interface ${ip.name})`)
+  }
+  bootHub()
 })
 
 udpHubPort.on('error', (err) => {
@@ -570,9 +574,15 @@ udpHubPort.on('message', (oscMsg, _timeTag, info) => {
   }
   namespace.set(oscMsg.address, param)
 
-  const marker = isNew ? '*' : ' '
-  const valStr = args.map((a) => `${a.value}(${a.type})`).join(', ')
-  console.log(`${marker} [${time}] [UDP-direct] ${oscMsg.address.padEnd(28)} → ${valStr}`)
+  // Per-message UDP debug log. Disabled by default because incoming OSC
+  // streams (TouchDesigner, motion-tracking rigs, etc.) can produce
+  // hundreds of messages per second and quickly flood the terminal.
+  // Enable with OSC_VERBOSE=1 env var if you need it for diagnostics.
+  if (process.env.OSC_VERBOSE === '1') {
+    const marker = isNew ? '*' : ' '
+    const valStr = args.map((a) => `${a.value}(${a.type})`).join(', ')
+    console.log(`${marker} [${time}] [UDP-direct] ${oscMsg.address.padEnd(28)} → ${valStr}`)
+  }
 
   broadcastHub({
     type: 'PATH_CHANGED',
@@ -587,7 +597,22 @@ udpHubPort.on('message', (oscMsg, _timeTag, info) => {
   broadcastToOscSubscribers(oscMsg.address, param.value, param.type, from)
 })
 
-udpHubPort.open()
+// Open the UDP listener unless explicitly disabled via env. Set
+// `OSC_LISTEN_DISABLED=1` to skip — useful when:
+//   - the OSC_LISTEN_PORT clashes with another app you want to use that port
+//   - you don't need the /subscribe relay or OSC-direct UDP inbound
+//   - you want a quieter helper that only does OSCQuery WS, no UDP plumbing
+// The OSCQuery hub HTTP/WS, Bonjour, and per-device OSCQuery clients still
+// work unchanged — only the raw UDP inbound socket is skipped.
+if (process.env.OSC_LISTEN_DISABLED === '1') {
+  console.log('[osc-hub] UDP inbound disabled via OSC_LISTEN_DISABLED=1')
+  // The boot logic normally fires inside the UDP 'ready' callback; since
+  // we're not opening that socket, run it directly. Defer one tick so the
+  // rest of this module finishes setting up handlers first.
+  setImmediate(bootHub)
+} else {
+  udpHubPort.open()
+}
 
 // ─── Bonjour: discovery (existing CLM behaviour) + publish (new hub) ─────
 const bonjour = new Bonjour()

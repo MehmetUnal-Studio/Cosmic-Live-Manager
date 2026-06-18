@@ -3,3 +3,9 @@ dist
 .DS_Store
 *.log
 .vite
+
+# Manifests are per-machine runtime state — don't version individual files,
+# but keep the folder around so the helper finds it on every clone (the
+# .gitkeep below is whitelisted).
+manifests/*.json
+!manifests/.gitkeep
