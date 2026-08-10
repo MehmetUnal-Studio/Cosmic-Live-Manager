@@ -921,6 +921,26 @@ details.row-section summary {
   margin-top: 0.35rem; font-weight: 500;
 }
 
+/* Live activity dot — lights up on every PATH_CHANGED for its device.
+   Kept subtle in idle state, glowing green while active. Used in each
+   DeviceCard footer next to the message count. */
+.msg-activity-dot {
+  display: inline-block;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--hub-border-2);
+  box-shadow: none;
+  transition: background 0.12s ease, box-shadow 0.25s ease, transform 0.12s ease;
+  flex: 0 0 auto;
+  /* Fill colour must stay opaque in case the parent uses -webkit-text-fill-color:
+     transparent (e.g. gradient text), which would otherwise blank the dot out. */
+  -webkit-text-fill-color: initial;
+}
+.msg-activity-dot.active {
+  background: var(--hub-green, #10b981);
+  box-shadow: 0 0 6px rgba(16, 185, 129, 0.75);
+  transform: scale(1.1);
+}
+
 /* Ableton banner */
 .ableton-banner {
   display: flex; align-items: center; justify-content: space-between; gap: 1rem;
@@ -1162,6 +1182,7 @@ details.row-section summary {
 }
 .device-status-text.connecting { color: var(--hub-yellow); }
 .device-msgs {
+  display: inline-flex; align-items: center; gap: 0.4rem;
   font-family: var(--hub-mono); font-size: 0.68rem; color: var(--hub-accent);
   background: rgba(99,102,241,0.12); padding: 0.1rem 0.4rem;
   border-radius: 4px;
@@ -1236,6 +1257,91 @@ details.row-section summary {
 .dp-path { font-family: var(--hub-mono); color: var(--hub-ink-mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dp-type { font-family: var(--hub-mono); font-size: 0.6rem; text-align: center; color: var(--hub-ink-dim); background: var(--hub-surface); border: 1px solid var(--hub-border); border-radius: 3px; padding: 0.1rem; }
 .dp-value { font-family: var(--hub-mono); color: var(--hub-cyan); text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Manual add row — inline form to register a device by IP + port when
+   discovery misses it. Sits inside the Manifest Devices section header,
+   aligned to the right so it stays visible above any registered cards. */
+.hub-dash .manifest-header {
+  align-items: flex-start;
+  flex-wrap: wrap;
+  row-gap: 0.6rem;
+}
+.hub-dash .section-title-group {
+  display: flex; flex-direction: column; gap: 0.2rem;
+  min-width: 0;
+}
+.hub-dash .manual-add-row {
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: 0.5rem;
+}
+/* Standalone (block) variant, kept in case it's reused elsewhere. */
+.hub-dash .manual-add-row:not(.inline) {
+  margin-bottom: 2rem;
+  padding: 0.7rem 0.9rem;
+  background: var(--hub-surface);
+  border: 1px dashed var(--hub-border-2);
+  border-radius: var(--hub-radius);
+}
+.hub-dash .manual-add-row.inline {
+  margin-left: auto;
+  padding: 0.35rem 0.5rem;
+  background: rgba(0,0,0,0.15);
+  border: 1px dashed var(--hub-border);
+  border-radius: 10px;
+}
+.hub-dash .manual-add-input {
+  background: rgba(0,0,0,0.25);
+  border: 1px solid var(--hub-border);
+  border-radius: 6px;
+  color: var(--hub-ink);
+  font: inherit; font-size: 0.78rem;
+  padding: 0.35rem 0.6rem;
+  min-width: 0;
+  outline: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+.hub-dash .manual-add-input::placeholder { color: var(--hub-ink-dim); }
+.hub-dash .manual-add-input:focus {
+  border-color: var(--hub-accent);
+  background: rgba(0,0,0,0.35);
+}
+.hub-dash .manual-add-name { flex: 0 1 160px; min-width: 110px; }
+.hub-dash .manual-add-host { flex: 0 1 150px; min-width: 120px; font-family: var(--hub-mono); }
+.hub-dash .manual-add-port {
+  flex: 0 0 78px; font-family: var(--hub-mono);
+  -moz-appearance: textfield;
+}
+/* Compact input sizing when the form is inline in the section header */
+.hub-dash .manual-add-row.inline .manual-add-input {
+  font-size: 0.72rem;
+  padding: 0.28rem 0.5rem;
+}
+.hub-dash .manual-add-row.inline .manual-add-btn {
+  padding: 0.32rem 0.75rem;
+  font-size: 0.7rem;
+}
+.hub-dash .manual-add-port::-webkit-outer-spin-button,
+.hub-dash .manual-add-port::-webkit-inner-spin-button {
+  -webkit-appearance: none; margin: 0;
+}
+.hub-dash .manual-add-btn {
+  padding: 0.4rem 0.9rem;
+  background: linear-gradient(135deg, var(--hub-accent), var(--hub-pink));
+  border: none; border-radius: 6px;
+  color: #fff; font: inherit; font-size: 0.75rem; font-weight: 600;
+  letter-spacing: 0.05em; cursor: pointer;
+  transition: transform 0.1s, opacity 0.15s;
+}
+.hub-dash .manual-add-btn:hover:not(:disabled) { transform: translateY(-1px); }
+.hub-dash .manual-add-btn:active:not(:disabled) { transform: translateY(0); }
+.hub-dash .manual-add-btn:disabled {
+  opacity: 0.45; cursor: not-allowed;
+  background: var(--hub-border-2);
+}
+.hub-dash .manual-add-err {
+  font-size: 0.7rem; color: var(--hub-red, #ef4444);
+  margin-left: 0.3rem;
+}
 
 /* Discovered grid */
 .hub-dash .discovered-grid {

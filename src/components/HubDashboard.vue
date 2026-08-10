@@ -109,6 +109,40 @@ function onSceneOverwrite(id) {
   overwriteScene(id, deviceParams.value)
 }
 
+// ─── Manual device add ──────────────────────────────────────────────────
+// Some devices don't advertise correctly over mDNS (or the OSCQuery server
+// on their side hasn't come up in time), so they never appear in the
+// Discovered list. This form lets the user register one by IP + port
+// directly. The manifest is written to disk by the helper's ADD_DISCOVERED
+// handler, which means it persists across restarts and is picked up by
+// Export/Import just like any other device.
+const manualName = ref('')
+const manualHost = ref('')
+const manualPort = ref('')
+const manualErr  = ref('')
+
+const canManualAdd = computed(() => {
+  const host = String(manualHost.value || '').trim()
+  const port = parseInt(manualPort.value, 10)
+  return host.length > 0 && Number.isFinite(port) && port >= 1 && port <= 65535
+})
+
+function onManualAddClick() {
+  manualErr.value = ''
+  const host = String(manualHost.value || '').trim()
+  const port = parseInt(manualPort.value, 10)
+  const name = String(manualName.value || '').trim()
+  if (!host) { manualErr.value = 'Enter an IP or hostname'; return }
+  if (!Number.isFinite(port) || port < 1 || port > 65535) {
+    manualErr.value = 'Port must be 1–65535'
+    return
+  }
+  addDiscovered(host, port, name || undefined)
+  manualName.value = ''
+  manualHost.value = ''
+  manualPort.value = ''
+}
+
 // ─── Custom ordering ────────────────────────────────────────────────────
 // Persisted in localStorage as an array of device.id values. Devices not
 // listed in the order array (because they're newly discovered, added from
@@ -420,11 +454,50 @@ watch(devices, (list) => {
         </div>
       </template>
 
-      <!-- Manifest devices — General (everything whose name doesn't contain "max") -->
-      <div class="section-header">
-        <div class="section-title">Manifest Devices</div>
-        <div class="section-hint">
-          Click host/port to edit · Press &amp; hold a card to drag and reorder · Open Parameters to inspect &amp; control
+      <!-- Manifest devices — General (everything whose name doesn't contain "max").
+           The manual-add form lives inside this header so it stays visible at
+           the top of the section, above any registered manifest cards. -->
+      <div class="section-header manifest-header">
+        <div class="section-title-group">
+          <div class="section-title">Manifest Devices</div>
+          <div class="section-hint">
+            Click host/port to edit · Press &amp; hold a card to drag and reorder · Open Parameters to inspect &amp; control
+          </div>
+        </div>
+        <div class="manual-add-row inline" title="Register a device manually by IP + port when discovery misses it. Saved to manifests just like the others.">
+          <input
+            v-model="manualName"
+            type="text"
+            class="manual-add-input manual-add-name"
+            placeholder="Name (optional)"
+            maxlength="64"
+            @keydown.enter="canManualAdd && onManualAddClick()"
+          />
+          <input
+            v-model="manualHost"
+            type="text"
+            class="manual-add-input manual-add-host"
+            placeholder="192.168.1.42"
+            @keydown.enter="canManualAdd && onManualAddClick()"
+          />
+          <input
+            v-model="manualPort"
+            type="number"
+            class="manual-add-input manual-add-port"
+            placeholder="Port"
+            min="1"
+            max="65535"
+            @keydown.enter="canManualAdd && onManualAddClick()"
+          />
+          <button
+            type="button"
+            class="manual-add-btn"
+            :disabled="!canManualAdd"
+            @click="onManualAddClick"
+          >
+            + Add
+          </button>
+          <span v-if="manualErr" class="manual-add-err">{{ manualErr }}</span>
         </div>
       </div>
       <div class="devices-grid">

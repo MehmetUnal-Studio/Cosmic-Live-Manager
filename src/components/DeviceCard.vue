@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, toRef, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, toRef, watch } from 'vue'
 import ParameterControl from './ParameterControl.vue'
 import PresetSection from './PresetSection.vue'
 import RecordingPanel from './RecordingPanel.vue'
@@ -157,6 +157,26 @@ const recording = useRecording(
   setDeviceParam,
   () => props.device.name
 )
+
+// ─── Live activity dot ───────────────────────────────────────────────────
+// Lights up whenever a PATH_CHANGED arrives for this specific device. The
+// listener re-fires on a continuous stream, so we latch the flag on with a
+// timer that gets renewed on every event — a steady stream keeps it glowing.
+const msgActive = ref(false)
+let msgActiveTimer = null
+let stopMsgListener = null
+onMounted(() => {
+  stopMsgListener = onPathChange((deviceId) => {
+    if (deviceId !== props.device.id) return
+    msgActive.value = true
+    if (msgActiveTimer) clearTimeout(msgActiveTimer)
+    msgActiveTimer = setTimeout(() => { msgActive.value = false }, 180)
+  })
+})
+onBeforeUnmount(() => {
+  if (msgActiveTimer) clearTimeout(msgActiveTimer)
+  if (stopMsgListener) stopMsgListener()
+})
 
 // PresetSection wants a flat object { [path]: node }. We have a Map; convert
 // once here. Lightweight enough to compute on every params change.
@@ -324,7 +344,14 @@ const paramCount = computed(() => props.params.size)
     <div class="device-footer">
       <div class="device-status-row">
         <span class="device-status-text" :class="statusClass">{{ statusLabel }}</span>
-        <span v-if="msgCount > 0" class="device-msgs">{{ msgCount }}</span>
+        <span v-if="msgCount > 0" class="device-msgs">
+          <span
+            class="msg-activity-dot"
+            :class="{ active: msgActive }"
+            title="Lights up on each incoming OSC message"
+          ></span>
+          {{ msgCount }}
+        </span>
       </div>
 
       <div class="device-actions">
