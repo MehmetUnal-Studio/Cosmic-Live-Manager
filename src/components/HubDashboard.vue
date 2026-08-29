@@ -10,7 +10,8 @@ import ServerControl from './ServerControl.vue'
 import {
   filterLinkTargetServices,
   isAndroidDevice,
-  isCosmicUnityDevice
+  isCosmicUnityOrAbletonDevice,
+  knownDisallowedLinkTargetFqdns
 } from '../utils/linkTargets.js'
 
 const {
@@ -200,13 +201,16 @@ const orderedDevices = computed(() => {
 })
 
 function isCosmicUnity(d) {
-  return isCosmicUnityDevice(d)
+  return isCosmicUnityOrAbletonDevice(d)
 }
 function isAndroid(d) {
   return isAndroidDevice(d)
 }
 function linkTargetServices(device) {
   return filterLinkTargetServices(device, services.value, devices.value)
+}
+function disallowedLinkTargetFqdns(device) {
+  return knownDisallowedLinkTargetFqdns(device, services.value, devices.value)
 }
 const deviceGroups = computed(() => {
   const cosmic = orderedDevices.value.filter(isCosmicUnity)
@@ -216,7 +220,7 @@ const deviceGroups = computed(() => {
     {
       key: 'cosmic',
       title: 'CosmicUnity / Ableton',
-      hint: 'Her port ayrı bir Ableton kanalı ve VST3 instance’ıdır.',
+      hint: 'CosmicUnity VST3 instance’ları ve özel Ableton Max alıcıları.',
       devices: cosmic,
       empty: 'CosmicUnity instance bulunamadı.'
     },
@@ -569,6 +573,7 @@ watch(devices, (list) => {
               :params="deviceParams.get(dev.id) || new Map()"
               :hint="saveHints.get(dev.id) || null"
               :services="linkTargetServices(dev)"
+              :disallowed-target-fqdns="disallowedLinkTargetFqdns(dev)"
               :announce-result="announceResults.get(dev.id) || null"
               @update="(u) => updateDevice(dev.id, u)"
               @reconnect="reconnectDevice(dev.id)"

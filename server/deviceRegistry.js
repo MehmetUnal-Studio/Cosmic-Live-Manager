@@ -1,7 +1,19 @@
 import os from 'node:os'
+import {
+  isMaxRingIdentity,
+  MAX_RING_LINK_ROLE,
+  MAX_RING_RUNTIME_KIND
+} from '../shared/maxRingLink.js'
+import {
+  COSMIC_RING_DEVICE_TYPE,
+  COSMIC_RING_LINK_ROLE,
+  COSMIC_RING_RUNTIME_KIND,
+  isCosmicRingIdentity
+} from '../shared/cosmicRingLink.js'
 
 export const DEVICE_TYPES = Object.freeze({
   COSMIC_UNITY: 'CosmicUnity',
+  COSMIC_RING: COSMIC_RING_DEVICE_TYPE,
   ANDROID: 'Android',
   OSCQUERY: 'OSCQuery'
 })
@@ -105,6 +117,9 @@ function normalizeExplicitType(value) {
   if (token.includes('cosmicunity') || token.includes('cosmic-unity')) {
     return DEVICE_TYPES.COSMIC_UNITY
   }
+  if (token.includes('cosmicring') || token.includes('cosmic-ring')) {
+    return DEVICE_TYPES.COSMIC_RING
+  }
   if (token.includes('android')) return DEVICE_TYPES.ANDROID
   return ''
 }
@@ -123,6 +138,7 @@ export function inferDeviceType(input, localAddresses = getLocalInterfaceAddress
 
   const port = Number(input.port ?? input.oscQueryPort)
   const local = isVerifiedLocalHost(input.host, localAddresses)
+  if (local && /^live[\s_-]*ring$/i.test(name)) return DEVICE_TYPES.COSMIC_RING
   if (/cosmic[\s_-]*unity/i.test(name)) return DEVICE_TYPES.COSMIC_UNITY
   if (local && port >= 5001 && port <= 5016 && !/android/i.test(name)) {
     return DEVICE_TYPES.COSMIC_UNITY
@@ -139,6 +155,45 @@ function legacyRemoteIdentity(input) {
   ) || 'oscquery'
 }
 
+function isVerifiedLocalMaxRing(input, localAddresses) {
+  const host = normalizeHost(input.host ?? input.activeEndpoint?.host)
+  return isVerifiedLocalHost(host, localAddresses) && isMaxRingIdentity(input)
+}
+
+function localMaxRingCanonicalId(port) {
+  return `oscquery:local-maxring:${Number(port)}`
+}
+
+function isVerifiedLocalCosmicRing(input, localAddresses) {
+  const host = normalizeHost(input.host ?? input.activeEndpoint?.host)
+  return isVerifiedLocalHost(host, localAddresses) &&
+    inferDeviceType(input, localAddresses) === DEVICE_TYPES.COSMIC_RING &&
+    isCosmicRingIdentity(input)
+}
+
+function localCosmicRingCanonicalId(port) {
+  return `cosmicring:local-port:${Number(port)}`
+}
+
+function remoteCosmicRingCanonicalId(baseCanonicalId, endpoint) {
+  const endpointIdentity = normalizeIdentityToken(
+    endpoint?.fqdn || `${normalizeHost(endpoint?.host)}-${Number(endpoint?.port)}`
+  ) || 'unknown-endpoint'
+  return `${baseCanonicalId}:remote:${endpointIdentity}`
+}
+
+function hasVerifiedLocalCosmicRingEndpoint(record, localAddresses) {
+  if (!record || record.deviceType !== DEVICE_TYPES.COSMIC_RING) return false
+  const endpoints = Array.from(record.endpoints?.values?.() || record.endpoints || [])
+  return endpoints.some((endpoint) => isVerifiedLocalCosmicRing({
+    ...record,
+    host: endpoint.host,
+    port: endpoint.port,
+    activeEndpoint: endpoint,
+    endpoints
+  }, localAddresses))
+}
+
 export function resolveCanonicalIdentity(input, options = {}) {
   const localAddresses = options.localAddresses || getLocalInterfaceAddresses()
   const host = normalizeHost(input.host)
@@ -151,8 +206,28 @@ export function resolveCanonicalIdentity(input, options = {}) {
   )
 
   if (persistentDeviceId) {
+    const baseCanonicalId = `${normalizeIdentityToken(deviceType)}:uuid:${persistentDeviceId}`
+    // CosmicRing receiver authority is local-machine scoped. A remote service
+    // never shares the local VST's base UUID identity, even when it copies the
+    // same DEVICE_ID. Prefer FQDN for DHCP continuity; fall back to endpoint
+    // coordinates for legacy announcements without a service identity.
+    if (
+      deviceType === DEVICE_TYPES.COSMIC_RING &&
+      !isVerifiedLocalHost(host, localAddresses)
+    ) {
+      return {
+        canonicalId: remoteCosmicRingCanonicalId(baseCanonicalId, {
+          host,
+          port,
+          fqdn: input.fqdn
+        }),
+        deviceType,
+        persistentDeviceId,
+        identitySource: 'persistent-id-remote-endpoint'
+      }
+    }
     return {
-      canonicalId: `${normalizeIdentityToken(deviceType)}:uuid:${persistentDeviceId}`,
+      canonicalId: baseCanonicalId,
       deviceType,
       persistentDeviceId,
       identitySource: 'persistent-id'
@@ -165,6 +240,28 @@ export function resolveCanonicalIdentity(input, options = {}) {
       deviceType,
       persistentDeviceId: '',
       identitySource: 'verified-local-port'
+    }
+  }
+
+  // Max/Ring is a single Node-for-Max receiver bound on this computer. Bonjour
+  // can announce that listener through loopback and every active LAN interface,
+  // so exact MaxRing:8005 local aliases share one registry identity. Name/port
+  // matching alone is deliberately insufficient for remote OSCQuery devices.
+  if (isVerifiedLocalMaxRing({ ...input, host, port }, localAddresses)) {
+    return {
+      canonicalId: localMaxRingCanonicalId(port),
+      deviceType,
+      persistentDeviceId: '',
+      identitySource: 'verified-local-maxring'
+    }
+  }
+
+  if (isVerifiedLocalCosmicRing({ ...input, host, port }, localAddresses)) {
+    return {
+      canonicalId: localCosmicRingCanonicalId(port),
+      deviceType,
+      persistentDeviceId: '',
+      identitySource: 'verified-local-cosmicring'
     }
   }
 
@@ -195,7 +292,10 @@ function endpointFrom(input, now, source) {
 function preferEndpoint(endpoints, deviceType, localAddresses) {
   if (!endpoints.length) return null
   const sorted = endpoints.slice().sort((a, b) => {
-    if (deviceType === DEVICE_TYPES.COSMIC_UNITY) {
+    if (
+      deviceType === DEVICE_TYPES.COSMIC_UNITY ||
+      deviceType === DEVICE_TYPES.COSMIC_RING
+    ) {
       const aLoopback = normalizeHost(a.host) === '127.0.0.1'
       const bLoopback = normalizeHost(b.host) === '127.0.0.1'
       if (aLoopback !== bLoopback) return aLoopback ? -1 : 1
@@ -221,15 +321,56 @@ function legacyStatus(connectionState, saved) {
 }
 
 function publicRecord(record, localAddresses) {
-  const endpoints = Array.from(record.endpoints.values())
+  const rawEndpoints = Array.from(record.endpoints.values())
     .sort((a, b) => endpointKey(a.host, a.port).localeCompare(endpointKey(b.host, b.port)))
-  const activeEndpoint = record.activeEndpoint || preferEndpoint(
-    endpoints,
+  const rawActiveEndpoint = record.activeEndpoint || preferEndpoint(
+    rawEndpoints,
     record.deviceType,
     localAddresses
   )
+  // Local receiver authority belongs to an endpoint, not merely to a UUID.
+  // Carry that server-owned proof into the public registry snapshot so a
+  // browser-submitted FQDN can never select a remote alias from a trusted
+  // local record.
+  const endpoints = rawEndpoints.map((endpoint) => ({
+    ...endpoint,
+    verifiedLocal: isVerifiedLocalHost(endpoint.host, localAddresses)
+  }))
+  const activeEndpoint = rawActiveEndpoint
+    ? endpoints.find((endpoint) =>
+        endpointKey(endpoint.host, endpoint.port) ===
+        endpointKey(rawActiveEndpoint.host, rawActiveEndpoint.port)
+      ) || {
+        ...rawActiveEndpoint,
+        verifiedLocal: isVerifiedLocalHost(rawActiveEndpoint.host, localAddresses)
+      }
+    : null
   const isLocal = record.deviceType === DEVICE_TYPES.COSMIC_UNITY &&
-    activeEndpoint && isVerifiedLocalHost(activeEndpoint.host, localAddresses)
+    activeEndpoint?.verifiedLocal === true
+  // Max/Ring is an OSCQuery service hosted by Node-for-Max, not a
+  // CosmicUnity VST. Keep its canonical device type untouched and assign an
+  // orthogonal role only after its exact service/port is proven local.
+  const isLocalMaxRing = Boolean(
+    activeEndpoint &&
+    activeEndpoint.verifiedLocal === true &&
+    isMaxRingIdentity({
+      ...record,
+      port: activeEndpoint.port,
+      activeEndpoint,
+      endpoints
+    })
+  )
+  const isLocalCosmicRing = Boolean(
+    record.deviceType === DEVICE_TYPES.COSMIC_RING &&
+    activeEndpoint &&
+    activeEndpoint.verifiedLocal === true &&
+    isCosmicRingIdentity({
+      ...record,
+      deviceType: record.deviceType,
+      activeEndpoint,
+      endpoints
+    })
+  )
   return {
     canonicalId: record.canonicalId,
     id: record.manifestId ?? null,
@@ -247,7 +388,19 @@ function publicRecord(record, localAddresses) {
     port: activeEndpoint?.port || 0,
     oscQueryPort: activeEndpoint?.port || 0,
     isLocal,
-    locationLabel: isLocal ? `Bu Bilgisayar · Port ${activeEndpoint.port}` : '',
+    runtimeKind: isLocalMaxRing
+      ? MAX_RING_RUNTIME_KIND
+      : isLocalCosmicRing
+        ? COSMIC_RING_RUNTIME_KIND
+        : null,
+    linkRole: isLocalMaxRing
+      ? MAX_RING_LINK_ROLE
+      : isLocalCosmicRing
+        ? COSMIC_RING_LINK_ROLE
+        : null,
+    locationLabel: (isLocal || isLocalMaxRing || isLocalCosmicRing)
+      ? `Bu Bilgisayar · Port ${activeEndpoint.port}`
+      : '',
     discoveryState: record.discoveryState,
     connectionState: record.connectionState,
     // Keep the historical lowercase field for API/OSC integrations while the
@@ -259,7 +412,8 @@ function publicRecord(record, localAddresses) {
     error: record.error || null,
     paramCount: record.paramCount || 0,
     runtimeGeneration: record.runtimeGeneration || 0,
-    legacyIds: Array.from(record.legacyIds || [])
+    legacyIds: Array.from(record.legacyIds || []),
+    legacyCanonicalIds: Array.from(record.legacyCanonicalIds || [])
   }
 }
 
@@ -278,8 +432,10 @@ export class DeviceRegistry {
 
   _moveRecord(record, nextCanonicalId) {
     if (record.canonicalId === nextCanonicalId) return record
+    const previousCanonicalId = record.canonicalId
     this.records.delete(record.canonicalId)
     record.canonicalId = nextCanonicalId
+    if (previousCanonicalId) record.legacyCanonicalIds.add(previousCanonicalId)
     this.records.set(nextCanonicalId, record)
     for (const endpoint of record.endpoints.values()) {
       this.endpointIndex.set(endpointKey(endpoint.host, endpoint.port), nextCanonicalId)
@@ -290,15 +446,165 @@ export class DeviceRegistry {
     return record
   }
 
+  _localCosmicRecordForPort(port) {
+    return Array.from(this.records.values()).find((candidate) =>
+      candidate.deviceType === DEVICE_TYPES.COSMIC_UNITY &&
+      Array.from(candidate.endpoints.values()).some((endpoint) =>
+        Number(endpoint.port) === Number(port) &&
+        isVerifiedLocalHost(endpoint.host, this.localAddresses)
+      )
+    )
+  }
+
+  _localMaxRingRecordForPort(port) {
+    return Array.from(this.records.values()).find((candidate) =>
+      Array.from(candidate.endpoints.values()).some((endpoint) =>
+        Number(endpoint.port) === Number(port) &&
+        isVerifiedLocalMaxRing({
+          ...candidate,
+          host: endpoint.host,
+          port: endpoint.port,
+          activeEndpoint: endpoint,
+          endpoints: Array.from(candidate.endpoints.values())
+        }, this.localAddresses)
+      )
+    )
+  }
+
+  _localCosmicRingRecordForPort(port) {
+    return Array.from(this.records.values()).find((candidate) =>
+      candidate.deviceType === DEVICE_TYPES.COSMIC_RING &&
+      Array.from(candidate.endpoints.values()).some((endpoint) =>
+        Number(endpoint.port) === Number(port) &&
+        isVerifiedLocalCosmicRing({
+          ...candidate,
+          host: endpoint.host,
+          port: endpoint.port,
+          activeEndpoint: endpoint,
+          endpoints: Array.from(candidate.endpoints.values())
+        }, this.localAddresses)
+      )
+    )
+  }
+
+  _mergeRecords(primary, duplicate) {
+    if (!primary || !duplicate || primary === duplicate) return primary || duplicate
+
+    // Prefer the durable routing entity. Startup migration normally prevents
+    // two saved records from reaching this path, but the rule remains stable
+    // under discovery/manifest races.
+    if (!primary.saved && duplicate.saved) [primary, duplicate] = [duplicate, primary]
+
+    for (const endpoint of duplicate.endpoints.values()) {
+      const key = endpointKey(endpoint.host, endpoint.port)
+      const previous = primary.endpoints.get(key)
+      if (!previous || Number(endpoint.lastSeen || 0) >= Number(previous.lastSeen || 0)) {
+        primary.endpoints.set(key, endpoint)
+      }
+    }
+    for (const legacyId of duplicate.legacyIds || []) primary.legacyIds.add(legacyId)
+    for (const alias of duplicate.legacyCanonicalIds || []) primary.legacyCanonicalIds.add(alias)
+    if (duplicate.canonicalId !== primary.canonicalId) {
+      primary.legacyCanonicalIds.add(duplicate.canonicalId)
+    }
+    primary.lastSeen = Math.max(Number(primary.lastSeen || 0), Number(duplicate.lastSeen || 0))
+    primary.discoveryState =
+      primary.discoveryState === 'Discovered' || duplicate.discoveryState === 'Discovered'
+        ? 'Discovered'
+        : primary.discoveryState
+
+    this.records.delete(duplicate.canonicalId)
+    for (const endpoint of primary.endpoints.values()) {
+      this.endpointIndex.set(endpointKey(endpoint.host, endpoint.port), primary.canonicalId)
+      if (endpoint.fqdn) this.fqdnIndex.set(endpoint.fqdn, primary.canonicalId)
+    }
+    primary.activeEndpoint = preferEndpoint(
+      Array.from(primary.endpoints.values()),
+      primary.deviceType,
+      this.localAddresses
+    )
+    return primary
+  }
+
   _findOrCreate(input, source) {
     const now = this.now()
     const identity = resolveCanonicalIdentity(input, { localAddresses: this.localAddresses })
     const endpoint = endpointFrom(input, now, source)
     const byEndpointId = this.endpointIndex.get(endpointKey(endpoint.host, endpoint.port))
-    let record = this.records.get(identity.canonicalId) || this.records.get(byEndpointId)
+    const isVerifiedLocalCosmicObservation =
+      identity.deviceType === DEVICE_TYPES.COSMIC_UNITY &&
+      isVerifiedLocalHost(endpoint.host, this.localAddresses)
+    const isVerifiedLocalMaxRingObservation = isVerifiedLocalMaxRing({
+      ...input,
+      host: endpoint.host,
+      port: endpoint.port,
+      activeEndpoint: endpoint
+    }, this.localAddresses)
+    const isVerifiedLocalCosmicRingObservation = isVerifiedLocalCosmicRing({
+      ...input,
+      deviceType: identity.deviceType,
+      host: endpoint.host,
+      port: endpoint.port,
+      activeEndpoint: endpoint
+    }, this.localAddresses)
+    let identityRecord = this.records.get(identity.canonicalId)
+    const endpointRecord = this.records.get(byEndpointId)
+    let record = identityRecord || endpointRecord
 
-    // A copied VST state can duplicate its UUID. Two simultaneously bound local
-    // ports cannot be one instance, so keep them separate and surface the clash.
+    // A persistent UUID authenticates continuity, not locality. If a remote
+    // CosmicRing advertises the same UUID as this computer's Live-Ring, keep
+    // it in a separate untrusted entity. This handles both discovery orders:
+    // remote-first is moved aside when the local VST appears; local-first
+    // makes the later remote observation use a scoped collision identity.
+    if (identity.deviceType === DEVICE_TYPES.COSMIC_RING && identity.persistentDeviceId) {
+      const identityIsTrustedLocal = hasVerifiedLocalCosmicRingEndpoint(
+        identityRecord,
+        this.localAddresses
+      )
+      if (isVerifiedLocalCosmicRingObservation && identityRecord && !identityIsTrustedLocal) {
+        const remoteEndpoint = identityRecord.activeEndpoint ||
+          Array.from(identityRecord.endpoints.values())[0]
+        this._moveRecord(
+          identityRecord,
+          remoteCosmicRingCanonicalId(identity.canonicalId, remoteEndpoint)
+        )
+        identityRecord = null
+        record = endpointRecord && hasVerifiedLocalCosmicRingEndpoint(
+          endpointRecord,
+          this.localAddresses
+        ) ? endpointRecord : null
+      } else if (!isVerifiedLocalCosmicRingObservation && identityIsTrustedLocal) {
+        identity.canonicalId = remoteCosmicRingCanonicalId(identity.canonicalId, endpoint)
+        identity.identitySource = 'persistent-id-remote-collision'
+        record = endpointRecord && !hasVerifiedLocalCosmicRingEndpoint(
+          endpointRecord,
+          this.localAddresses
+        ) ? endpointRecord : this.records.get(identity.canonicalId)
+      }
+    }
+    // A host:port can be reused after DHCP churn, an app reinstall, or a
+    // device replacement. Once both observations carry different persistent
+    // IDs, endpoint equality is not identity proof. The sole exception is a
+    // verified-local CosmicUnity listener: Ableton can restore/restart the one
+    // VST bound to that local port with a new UUID, and the port owner remains
+    // the same physical instance/card.
+    if (
+      record &&
+      identity.persistentDeviceId &&
+      record.persistentDeviceId &&
+      identity.persistentDeviceId !== record.persistentDeviceId &&
+      !isVerifiedLocalCosmicObservation &&
+      !isVerifiedLocalMaxRingObservation &&
+      !isVerifiedLocalCosmicRingObservation
+    ) {
+      record = this.records.get(identity.canonicalId)
+    }
+
+    // A copied CosmicUnity state can duplicate its UUID. Two simultaneously
+    // bound local ports cannot be one instance, so keep them separate and
+    // surface the clash. CosmicRing is intentionally excluded: Live-Ring has
+    // one receiver identity and its configurable listener may legitimately
+    // move to a fallback port.
     if (
       record && identity.persistentDeviceId &&
       identity.deviceType === DEVICE_TYPES.COSMIC_UNITY &&
@@ -317,10 +623,63 @@ export class DeviceRegistry {
     // listener.
     if (
       !record && identity.persistentDeviceId &&
-      identity.deviceType === DEVICE_TYPES.COSMIC_UNITY &&
-      isVerifiedLocalHost(endpoint.host, this.localAddresses)
+      isVerifiedLocalCosmicObservation
     ) {
-      record = this.records.get(`cosmicunity:local-port:${endpoint.port}`)
+      record = this.records.get(`cosmicunity:local-port:${endpoint.port}`) ||
+        this._localCosmicRecordForPort(endpoint.port)
+    }
+
+
+    // Preserve a saved loopback Max/Ring entity when a newer build eventually
+    // gains a persistent identity on its LAN advertisement.
+    if (
+      !record && identity.persistentDeviceId &&
+      isVerifiedLocalMaxRingObservation
+    ) {
+      record = this.records.get(localMaxRingCanonicalId(endpoint.port)) ||
+        this._localMaxRingRecordForPort(endpoint.port)
+    }
+
+
+    if (
+      !record && identity.persistentDeviceId &&
+      isVerifiedLocalCosmicRingObservation
+    ) {
+      record = this.records.get(localCosmicRingCanonicalId(endpoint.port)) ||
+        this._localCosmicRingRecordForPort(endpoint.port)
+    }
+
+    // A restarted/restored VST can legitimately report a new persistent UUID.
+    // On this computer, a single bound TCP port still identifies the physical
+    // instance more strongly than that stale UUID. Merge only after proving the
+    // endpoint belongs to a real local interface; never apply this to Android
+    // or remote CosmicUnity devices.
+    if (
+      isVerifiedLocalCosmicObservation
+    ) {
+      const localPortRecord = this._localCosmicRecordForPort(endpoint.port)
+      if (!record) record = localPortRecord
+      else if (localPortRecord && localPortRecord !== record) {
+        record = this._mergeRecords(localPortRecord, record)
+      }
+    }
+
+
+    if (isVerifiedLocalMaxRingObservation) {
+      const localMaxRingRecord = this._localMaxRingRecordForPort(endpoint.port)
+      if (!record) record = localMaxRingRecord
+      else if (localMaxRingRecord && localMaxRingRecord !== record) {
+        record = this._mergeRecords(localMaxRingRecord, record)
+      }
+    }
+
+
+    if (isVerifiedLocalCosmicRingObservation) {
+      const localCosmicRingRecord = this._localCosmicRingRecordForPort(endpoint.port)
+      if (!record) record = localCosmicRingRecord
+      else if (localCosmicRingRecord && localCosmicRingRecord !== record) {
+        record = this._mergeRecords(localCosmicRingRecord, record)
+      }
     }
 
     if (!record) {
@@ -342,10 +701,27 @@ export class DeviceRegistry {
         enabled: true,
         lastSeen: now,
         error: null,
-        legacyIds: new Set()
+        legacyIds: new Set(),
+        legacyCanonicalIds: new Set()
       }
       this.records.set(record.canonicalId, record)
-    } else if (identity.persistentDeviceId && !record.persistentDeviceId) {
+    } else if (
+      identity.persistentDeviceId &&
+      (
+        identity.persistentDeviceId !== record.persistentDeviceId ||
+        (isVerifiedLocalCosmicRingObservation && identity.canonicalId !== record.canonicalId)
+      ) &&
+      (
+        !record.persistentDeviceId ||
+        isVerifiedLocalCosmicObservation ||
+        isVerifiedLocalMaxRingObservation ||
+        isVerifiedLocalCosmicRingObservation
+      )
+    ) {
+      const existingAtIdentity = this.records.get(identity.canonicalId)
+      if (existingAtIdentity && existingAtIdentity !== record) {
+        record = this._mergeRecords(record, existingAtIdentity)
+      }
       record.persistentDeviceId = identity.persistentDeviceId
       record.identitySource = identity.identitySource
       record = this._moveRecord(record, identity.canonicalId)
@@ -395,7 +771,17 @@ export class DeviceRegistry {
     record.error = manifest.error || null
     record.paramCount = Number(manifest.paramCount || 0)
     record.runtimeGeneration = Number(manifest.runtimeGeneration || 0)
+    const manifestCanonicalId = cleanText(manifest.canonicalId)
+    if (manifestCanonicalId && manifestCanonicalId !== record.canonicalId) {
+      record.legacyCanonicalIds.add(manifestCanonicalId)
+    }
     for (const legacyId of manifest.legacyIds || []) record.legacyIds.add(Number(legacyId))
+    for (const alias of manifest.legacyCanonicalIds || []) {
+      const canonicalAlias = cleanText(alias)
+      if (canonicalAlias && canonicalAlias !== record.canonicalId) {
+        record.legacyCanonicalIds.add(canonicalAlias)
+      }
+    }
     for (const alias of manifest.endpoints || []) {
       if (!alias?.host || !alias?.port) continue
       const endpoint = endpointFrom(alias, Number(alias.lastSeen) || this.now(), alias.source || 'manifest')
@@ -533,39 +919,120 @@ export function deduplicateManifestEntries(entries, options = {}) {
       deviceType: manifest.deviceType || manifest.type,
       serviceName: manifest.serviceName || manifest.name
     }, { localAddresses })
-    // A newly available persistent id outranks a canonical key written by an
-    // older Manager version. Otherwise a stale local-port key would keep the
-    // UUID-backed instance split after migration.
-    const canonicalId = identity.persistentDeviceId
-      ? identity.canonicalId
-      : (cleanText(manifest.canonicalId) || identity.canonicalId)
-    const group = groups.get(canonicalId) || []
-    group.push({ ...entry, identity: { ...identity, canonicalId } })
-    groups.set(canonicalId, group)
+    const endpoints = manifestEndpoints(manifest)
+    const isVerifiedLocalCosmic =
+      identity.deviceType === DEVICE_TYPES.COSMIC_UNITY &&
+      endpoints.some((endpoint) =>
+        Number(endpoint.port) === Number(manifest.oscQueryPort) &&
+        isVerifiedLocalHost(endpoint.host, localAddresses)
+      )
+    const isVerifiedLocalMaxRingManifest = endpoints.some((endpoint) =>
+      isVerifiedLocalMaxRing({
+        ...manifest,
+        host: endpoint.host,
+        port: endpoint.port,
+        activeEndpoint: endpoint,
+        endpoints
+      }, localAddresses)
+    )
+    const isVerifiedLocalCosmicRingManifest = endpoints.some((endpoint) =>
+      isVerifiedLocalCosmicRing({
+        ...manifest,
+        deviceType: identity.deviceType,
+        host: endpoint.host,
+        port: endpoint.port,
+        activeEndpoint: endpoint,
+        endpoints
+      }, localAddresses)
+    )
+
+    // A local listener can only have one physical owner per port. Grouping by
+    // the verified local port lets a current HOST_INFO UUID replace a stale
+    // persisted UUID without merging 5001/5002/5003 or any remote device.
+    const groupKey = isVerifiedLocalCosmic
+      ? `cosmicunity:local-port:${Number(manifest.oscQueryPort)}`
+      : isVerifiedLocalMaxRingManifest
+        ? localMaxRingCanonicalId(manifest.oscQueryPort)
+        : isVerifiedLocalCosmicRingManifest
+          ? identity.persistentDeviceId
+            ? `cosmicring:verified-local-uuid:${identity.persistentDeviceId}`
+            : localCosmicRingCanonicalId(manifest.oscQueryPort)
+          : identity.canonicalId
+    const observedAt = Math.max(
+      Number(manifest.lastSeen || 0),
+      ...endpoints.map((endpoint) => Number(endpoint.lastSeen || 0))
+    )
+    const group = groups.get(groupKey) || []
+    group.push({ ...entry, identity, endpoints, observedAt, groupKey })
+    groups.set(groupKey, group)
   }
 
   const kept = []
   const duplicates = []
-  for (const [canonicalId, group] of groups) {
+  for (const [groupKey, group] of groups) {
     group.sort((a, b) => Number(a.manifest.id) - Number(b.manifest.id))
     const primary = group[0]
-    const allEndpoints = group.flatMap((entry) => manifestEndpoints(entry.manifest))
-    const endpointMap = new Map(allEndpoints.map((endpoint) => [endpointKey(endpoint.host, endpoint.port), endpoint]))
+    const identitySource = group.slice().sort((a, b) =>
+      Number(b.observedAt || 0) - Number(a.observedAt || 0) ||
+      Number(b.manifest.id) - Number(a.manifest.id)
+    ).find((entry) => entry.identity.persistentDeviceId) || primary
+    const persistentDeviceId = identitySource.identity.persistentDeviceId || ''
+    const canonicalId = persistentDeviceId
+      ? identitySource.identity.identitySource === 'persistent-id-remote-endpoint'
+        ? identitySource.identity.canonicalId
+        : `${normalizeIdentityToken(primary.identity.deviceType)}:uuid:${persistentDeviceId}`
+      : groupKey
+
+    const endpointMap = new Map()
+    for (const entry of group) {
+      for (const endpoint of entry.endpoints) {
+        const key = endpointKey(endpoint.host, endpoint.port)
+        const previous = endpointMap.get(key)
+        if (!previous || Number(endpoint.lastSeen || 0) >= Number(previous.lastSeen || 0)) {
+          endpointMap.set(key, endpoint)
+        }
+      }
+    }
     const endpoints = Array.from(endpointMap.values())
     const preferred = preferEndpoint(endpoints, primary.identity.deviceType, localAddresses)
-    const legacyIds = Array.from(new Set(group.slice(1).map((entry) => Number(entry.manifest.id))))
+    const legacyIds = Array.from(new Set([
+      ...group.flatMap((entry) => entry.manifest.legacyIds || []).map(Number),
+      ...group.slice(1).map((entry) => Number(entry.manifest.id))
+    ])).filter(Number.isFinite).sort((a, b) => a - b)
+    const legacyCanonicalIds = Array.from(new Set([
+      ...group.flatMap((entry) => entry.manifest.legacyCanonicalIds || []),
+      ...group.flatMap((entry) => [entry.manifest.canonicalId, entry.identity.canonicalId])
+    ].map((value) => cleanText(value)).filter((value) => value && value !== canonicalId)))
     const merged = {
       ...primary.manifest,
       canonicalId,
       deviceType: primary.identity.deviceType,
-      persistentDeviceId: primary.identity.persistentDeviceId || primary.manifest.persistentDeviceId || null,
+      persistentDeviceId: persistentDeviceId || null,
       serviceName: primary.manifest.serviceName || primary.manifest.name,
       host: preferred?.host || primary.manifest.host,
       oscQueryPort: preferred?.port || Number(primary.manifest.oscQueryPort),
       endpoints,
-      legacyIds: Array.from(new Set([...(primary.manifest.legacyIds || []), ...legacyIds]))
+      legacyIds,
+      legacyCanonicalIds
     }
-    kept.push({ file: primary.file, manifest: merged, changed: group.length > 1 || !primary.manifest.canonicalId })
+    const changed =
+      group.length > 1 ||
+      !primary.manifest.canonicalId ||
+      primary.manifest.canonicalId !== canonicalId ||
+      cleanText(primary.manifest.deviceType) !== merged.deviceType ||
+      cleanText(primary.manifest.serviceName) !== cleanText(merged.serviceName) ||
+      normalizeHost(primary.manifest.host) !== normalizeHost(merged.host) ||
+      Number(primary.manifest.oscQueryPort) !== Number(merged.oscQueryPort) ||
+      cleanText(primary.manifest.persistentDeviceId) !== persistentDeviceId ||
+      JSON.stringify(primary.manifest.legacyIds || []) !== JSON.stringify(legacyIds) ||
+      JSON.stringify(primary.manifest.legacyCanonicalIds || []) !== JSON.stringify(legacyCanonicalIds) ||
+      JSON.stringify(manifestEndpoints(primary.manifest)) !== JSON.stringify(endpoints)
+    kept.push({
+      file: primary.file,
+      manifest: merged,
+      identity: { ...identitySource.identity, canonicalId },
+      changed
+    })
     for (const duplicate of group.slice(1)) {
       duplicates.push({
         file: duplicate.file,

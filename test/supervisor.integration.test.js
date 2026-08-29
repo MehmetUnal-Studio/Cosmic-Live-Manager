@@ -207,6 +207,8 @@ test('supervisor repeatedly stop/starts/restarts one hub without losing manifest
       HUB_START_TIMEOUT_MS: '7000',
       HUB_STOP_TIMEOUT_MS: '3500',
       ABLETON_FORWARD: '0',
+      COSMICNOISE_FORWARD: '0',
+      COSMICNOISE_SNAPSHOT_MS: '0',
       HUB_NAME: `Supervisor Lifecycle Integration ${process.pid} ${Date.now()}`,
       MANIFESTS_DIR: manifestsDir
     },

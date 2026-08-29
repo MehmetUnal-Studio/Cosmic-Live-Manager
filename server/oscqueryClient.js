@@ -9,7 +9,7 @@
 //   3. For every path in the namespace, send {"COMMAND":"LISTEN","DATA":"/path"}
 //   4. Inbound frames may be JSON (OSCQuery commands) or binary OSC packets
 //      (TouchDesigner-style devices push raw OSC over the WS). Both are
-//      decoded and reported via onValue(path, value).
+//      decoded and reported via onValue(path, value, metadata).
 //   5. If an established WS drops, retry quickly; ordinary connection failures
 //      keep the slower retry interval.
 
@@ -24,7 +24,10 @@ export class OscQueryClient {
    *   onConnect: () => void,
    *   onDisconnect: (reason: string) => void,
    *   onAttemptFailed?: (reason: string, details: { timeout: boolean }) => void,
-   *   onValue: (path: string, value: any) => void,
+   *   onValue: (path: string, value: any, metadata: {
+   *     oscQueryType?: string,
+   *     wireArgs?: Array<{type: string, value?: any}>
+   *   }) => void,
    *   onLog: (msg: string) => void,
    * }} events
    * @param {{
@@ -56,6 +59,10 @@ export class OscQueryClient {
     // path, with full OSCQuery metadata (TYPE, RANGE, ACCESS, …). Consumed by
     // the hub to render proper ParameterControl widgets on the UI.
     this.flatNodes = []
+    // Fast lookup used when a value update only carries path + value. Keeping
+    // the OSCQuery TYPE beside the path prevents JavaScript number inference
+    // from changing f to i and preserves multi-argument nodes such as fff.
+    this.nodeTypes = new Map()
     // The device's OSC UDP port, fetched via ?HOST_INFO. Falls back to the
     // OSCQuery HTTP port if HOST_INFO is unavailable or doesn't expose it.
     this.oscPort = port
@@ -91,6 +98,7 @@ export class OscQueryClient {
       // Build the flat metadata table the hub broadcasts to the UI.
       this.flatNodes = []
       this._collectNodes(tree, this.flatNodes)
+      this._rebuildNodeTypes()
       const paths = this.flatNodes.map((n) => n.FULL_PATH)
       this.events.onLog(`Namespace received: ${paths.length} parameters`)
 
@@ -186,6 +194,16 @@ export class OscQueryClient {
     }
   }
 
+  _rebuildNodeTypes() {
+    // Replace, rather than append to, the map on every reconnect. A path that
+    // disappeared from the refreshed namespace must not keep stale TYPE data.
+    this.nodeTypes = new Map(
+      this.flatNodes
+        .filter((node) => typeof node.TYPE === 'string')
+        .map((node) => [node.FULL_PATH, node.TYPE])
+    )
+  }
+
   _openWebSocket(paths, attempt) {
     try {
       if (!this._isCurrentAttempt(attempt)) return
@@ -268,7 +286,7 @@ export class OscQueryClient {
 
   _handleOscBinary(buf) {
     try {
-      const packet = osc.readPacket(buf, { metadata: true })
+      const packet = osc.readPacket(buf, { metadata: true, unpackSingleArgs: false })
       this._processOscPacket(packet)
     } catch (err) {
       // Don't spam: log at most a few parse errors per session.
@@ -286,11 +304,25 @@ export class OscQueryClient {
       return
     }
     // Single message.
-    if (packet.address && packet.args) {
-      const values = packet.args.map((a) => a.value)
+    if (packet.address && packet.args !== undefined) {
+      const args = Array.isArray(packet.args) ? packet.args : [packet.args]
+      const hasWireMetadata = args.every(
+        (arg) => arg && typeof arg === 'object' && typeof arg.type === 'string' && 'value' in arg
+      )
+      const values = args.map((arg) => (
+        arg && typeof arg === 'object' && 'value' in arg ? arg.value : arg
+      ))
       const value = values.length === 1 ? values[0] : values
-      this.events.onValue(packet.address, value)
+      this._emitValue(packet.address, value, hasWireMetadata ? args : undefined)
     }
+  }
+
+  _emitValue(path, value, wireArgs, inlineType) {
+    // Inline TYPE applies to this update only. Do not cache arbitrary dynamic
+    // paths here: the authoritative, reconnect-replaced namespace map is
+    // bounded by the fetched namespace instead of an untrusted event stream.
+    const oscQueryType = inlineType || this.nodeTypes.get(path)
+    this.events.onValue(path, value, { oscQueryType, wireArgs })
   }
 
   _handleJsonMessage(data) {
@@ -299,11 +331,11 @@ export class OscQueryClient {
     if (data.COMMAND) return
 
     if (data.PATH && data.VALUE !== undefined) {
-      this.events.onValue(data.PATH, data.VALUE)
+      this._emitValue(data.PATH, data.VALUE, undefined, data.TYPE)
       return
     }
     if (data.FULL_PATH && data.VALUE !== undefined) {
-      this.events.onValue(data.FULL_PATH, data.VALUE)
+      this._emitValue(data.FULL_PATH, data.VALUE, undefined, data.TYPE)
     }
   }
 

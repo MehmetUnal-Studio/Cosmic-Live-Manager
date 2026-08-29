@@ -7,7 +7,21 @@ import { sanitizePeerId } from '../composables/usePeer.js'
 import { useHubPresets } from '../composables/useHubPresets.js'
 import { useRecording } from '../composables/useRecording.js'
 import { useHub } from '../composables/useHub.js'
-import { isCosmicUnityDevice } from '../utils/linkTargets.js'
+import {
+  findLinkTargetByFqdn,
+  isAbletonRingReceiverDevice,
+  isCosmicRingReceiverDevice,
+  isCosmicUnityOrAbletonDevice,
+  isMaxRingIdentity,
+  isMaxRingReceiverDevice,
+  isRingInstrumentIdentity
+} from '../utils/linkTargets.js'
+import { MAX_RING_DEFAULT_UDP_PORT } from '../../shared/maxRingLink.js'
+import {
+  planScopedStorageMigration,
+  scopedStorageMigrationKeys,
+  STORAGE_MIGRATION_KINDS
+} from '../utils/storageMigration.js'
 
 const props = defineProps({
   device: { type: Object, required: true },
@@ -16,8 +30,11 @@ const props = defineProps({
   // FULL_PATH is the device-relative path (no /deviceName prefix).
   params: { type: Object, default: () => new Map() },
   hint: { type: Object, default: null },
-  // Discovered Bonjour services on the LAN — feeds the Announce target picker
+  // Parent-filtered Bonjour services allowed by the LINK topology.
   services: { type: Array, default: () => [] },
+  // Raw services that are definitively incompatible with this source device.
+  // Unknown/offline targets are omitted so sticky selections survive reconnects.
+  disallowedTargetFqdns: { type: Array, default: () => [] },
   // Result of the last announce attempt, shown as a hint under the button
   announceResult: { type: Object, default: null }
 })
@@ -140,50 +157,63 @@ function onParamSet(payload) {
 // pipeline as a widget edit, so the optimistic update + Ableton forward +
 // dashboard broadcast all happen identically.
 const storageIdentityRef = toRef(() => props.device.canonicalId || props.device.id)
+const PRESET_STORAGE_PREFIX = 'clm:hub-presets:'
+const ANNOUNCE_STORAGE_PREFIX = 'clm:hub-announce:'
+let reloadPresets = () => {}
 
-function migrateScopedStorage(prefix) {
+function migrateScopedStorage(prefix, kind) {
   if (!props.device.canonicalId || props.device.id == null) return
   try {
-    const canonicalKey = `${prefix}${props.device.canonicalId}`
-    const candidates = [props.device.id, ...(props.device.legacyIds || [])]
-    if (prefix === 'clm:hub-presets:') {
-      const merged = []
-      const seen = new Set()
-      for (const key of [canonicalKey, ...candidates.map((legacyId) => `${prefix}${legacyId}`)]) {
-        const raw = localStorage.getItem(key)
-        if (raw == null) continue
-        let values
-        try { values = JSON.parse(raw) } catch { continue }
-        if (!Array.isArray(values)) continue
-        for (const value of values) {
-          const signature = JSON.stringify([value?.id, value?.name, value?.path, value?.value])
-          if (seen.has(signature)) continue
-          seen.add(signature)
-          merged.push(value)
-        }
-      }
-      if (merged.length > 0) localStorage.setItem(canonicalKey, JSON.stringify(merged))
-      return
+    const migration = {
+      prefix,
+      canonicalId: props.device.canonicalId,
+      manifestId: props.device.id,
+      legacyCanonicalIds: props.device.legacyCanonicalIds || [],
+      legacyIds: props.device.legacyIds || []
     }
-    if (localStorage.getItem(canonicalKey) != null) return
-    for (const legacyId of candidates) {
-      const value = localStorage.getItem(`${prefix}${legacyId}`)
-      if (value == null) continue
-      localStorage.setItem(canonicalKey, value)
-      return
+    const { canonicalKey, lineageKey, sources } = scopedStorageMigrationKeys(migration)
+    const values = new Map([
+      [canonicalKey, localStorage.getItem(canonicalKey)],
+      [lineageKey, localStorage.getItem(lineageKey)]
+    ])
+    for (const { key, markerKey, lineageKey: sourceLineageKey } of sources) {
+      values.set(key, localStorage.getItem(key))
+      values.set(markerKey, localStorage.getItem(markerKey))
+      values.set(sourceLineageKey, localStorage.getItem(sourceLineageKey))
     }
+    const plan = planScopedStorageMigration({ ...migration, kind, values })
+    for (const write of plan.writes) localStorage.setItem(write.key, write.value)
   } catch { /* storage unavailable */ }
 }
 
-migrateScopedStorage('clm:hub-presets:')
-migrateScopedStorage('clm:hub-announce:')
+function migrateDeviceScopedStorage() {
+  migrateScopedStorage(PRESET_STORAGE_PREFIX, STORAGE_MIGRATION_KINDS.PRESETS)
+  migrateScopedStorage(ANNOUNCE_STORAGE_PREFIX, STORAGE_MIGRATION_KINDS.SCALAR)
+  // Alias-only registry updates do not change storageIdentityRef, so the
+  // preset composable's normal identity watcher would not reload the just-
+  // migrated canonical data. Keep its live ref synchronized immediately.
+  reloadPresets()
+}
+
+watch(
+  [
+    () => props.device.id,
+    () => props.device.canonicalId,
+    () => JSON.stringify(props.device.legacyCanonicalIds || []),
+    () => JSON.stringify(props.device.legacyIds || [])
+  ],
+  migrateDeviceScopedStorage,
+  { immediate: true }
+)
 const {
   presets,
   add: addPreset,
   remove: removePreset,
   update: updatePresetFn,
-  reorder: reorderPreset
+  reorder: reorderPreset,
+  reload: reloadPresetStorage
 } = useHubPresets(storageIdentityRef)
+reloadPresets = reloadPresetStorage
 
 // ─── Recording / playback panel ───────────────────────────────────────
 // Mounts inside the device card so each device has its own buffer + UI.
@@ -238,13 +268,20 @@ function onPresetUpdate(id, patch)        { updatePresetFn(id, patch) }
 function onPresetReorder({ from, to })    { reorderPreset(from, to) }
 
 // ─── Announce section ───────────────────────────────────────────────────
-// Per-device persistence in localStorage. The mapping says "device <id> wants
-// to announce itself to <target fqdn>, using <peerId> and optionally
-// <udpPortOverride>". On Push we resolve the target via the Bonjour services
-// list and emit('announce') so the parent sends ANNOUNCE_DEVICE to the hub.
+// Per-device persistence in localStorage. On a CosmicUnity card, the selected
+// Android or generic OSCQuery service is the instrument peer; Push writes that
+// peer's coordinates to this VST. The server also accepts the external-device
+// card direction and resolves both UI shapes to the same asymmetric bootstrap.
 
 const announceOpen = ref(false)
-const storageKey = computed(() => `clm:hub-announce:${props.device.canonicalId || props.device.id}`)
+const storageKey = computed(() => `${ANNOUNCE_STORAGE_PREFIX}${props.device.canonicalId || props.device.id}`)
+const isMaxRingReceiver = computed(() => isMaxRingReceiverDevice(props.device))
+const isCosmicRingReceiver = computed(() => isCosmicRingReceiverDevice(props.device))
+const isFixedRingReceiver = computed(() => isAbletonRingReceiverDevice(props.device))
+const isRingInstrumentPeer = computed(() => isRingInstrumentIdentity(props.device))
+const defaultUdpOverride = () => isMaxRingReceiver.value
+  ? MAX_RING_DEFAULT_UDP_PORT
+  : 0
 
 function loadAnnounce() {
   try {
@@ -255,10 +292,9 @@ function loadAnnounce() {
 }
 function persistAnnounce() {
   try {
-    // Note: udpPortOverride is INTENTIONALLY not persisted. We want every
-    // fresh page load (and every freshly-added device) to start with the
-    // default UDP port (0 = use device's HOST_INFO.OSC_PORT). It's an
-    // override knob, not a sticky preference.
+    // Note: udpPortOverride is intentionally not persisted. Zero means the VST
+    // binds its own unique ephemeral receive port. A positive value is an
+    // expert-only, per-session override.
     localStorage.setItem(storageKey.value, JSON.stringify({
       targetFqdn: targetFqdn.value,
       peerId: peerId.value
@@ -268,23 +304,32 @@ function persistAnnounce() {
 
 const _initial = loadAnnounce()
 const targetFqdn         = ref(_initial.targetFqdn)
-const peerId             = ref(_initial.peerId || sanitizePeerId(props.device.name))
-// Always starts at 0 (= "use device default") on every mount / reload.
-const udpOverride        = ref(0)
+const peerId             = ref(_initial.peerId || '')
+// VST receivers choose a unique ephemeral port from zero. The current
+// Node-for-Max bridge cannot publish the actual ephemeral bind, so Max/Ring
+// uses its own stable, non-Manager receive port.
+const udpOverride        = ref(defaultUdpOverride())
 
-// Reload when the device id changes (e.g. manifest reload renumbers IDs)
-watch(() => props.device.id, () => {
+// Reload after the earlier migration watcher has handled identity changes.
+watch([
+  () => props.device.id,
+  () => props.device.canonicalId,
+  () => props.device.linkRole,
+  () => JSON.stringify(props.device.legacyCanonicalIds || []),
+  () => JSON.stringify(props.device.legacyIds || [])
+], () => {
   const fresh = loadAnnounce()
   targetFqdn.value  = fresh.targetFqdn
-  peerId.value      = fresh.peerId || sanitizePeerId(props.device.name)
-  udpOverride.value = 0
+  peerId.value      = fresh.peerId || ''
+  udpOverride.value = defaultUdpOverride()
 })
 
 // Persist only the sticky fields. udpOverride is in-session-only — see
 // persistAnnounce comment.
 watch([targetFqdn, peerId], persistAnnounce)
 
-// Target list = every discovered service except this device itself.
+// The parent applies the source/target topology; keep a defensive self check
+// here so manually supplied candidates cannot link a device to itself.
 const targetCandidates = computed(() => {
   return props.services.filter((s) => {
     // Skip if the discovered service matches THIS device's host:port
@@ -292,14 +337,122 @@ const targetCandidates = computed(() => {
     return true
   })
 })
-const selectedTarget = computed(() => targetCandidates.value.find((s) => s.fqdn === targetFqdn.value))
-const usesAndroidTargets = computed(() => isCosmicUnityDevice(props.device))
-const targetPlaceholder = computed(() => {
-  if (!usesAndroidTargets.value) return '— pick destination —'
-  return targetCandidates.value.length > 0
-    ? '— Android tablet seç —'
-    : '— Ağda Android tablet bulunamadı —'
+const selectedTarget = computed(() => {
+  return findLinkTargetByFqdn(targetCandidates.value, targetFqdn.value)
 })
+
+// Live-Ring is a dedicated Ableton receiver with one legal peer. Keep that
+// pairing sticky without auto-sending the connect command; Push remains the
+// explicit operator action used everywhere else in the Manager.
+watch(
+  [isCosmicRingReceiver, targetCandidates, targetFqdn],
+  ([isLiveRing, candidates, selectedFqdn]) => {
+    if (!isLiveRing || selectedFqdn) return
+    const ring = candidates.find((candidate) => isRingInstrumentIdentity(candidate))
+    if (ring?.fqdn) targetFqdn.value = ring.fqdn
+  },
+  { immediate: true, flush: 'post' }
+)
+
+// Canonical dedup may replace a historical Bonjour alias with the preferred
+// live endpoint. Preserve the saved LINK by migrating its stored FQDN to the
+// surviving option instead of showing an empty/offline selection.
+watch(
+  [targetFqdn, targetCandidates],
+  ([selectedFqdn]) => {
+    if (!selectedFqdn) return
+    const target = findLinkTargetByFqdn(targetCandidates.value, selectedFqdn)
+    if (target?.fqdn && target.fqdn !== selectedFqdn) {
+      targetFqdn.value = target.fqdn
+    }
+  },
+  { immediate: true, flush: 'post' }
+)
+const usesMaxRingRoute = computed(() =>
+  isMaxRingReceiver.value ||
+  (isRingInstrumentPeer.value && isMaxRingIdentity(selectedTarget.value))
+)
+const usesFixedRingRoute = computed(() =>
+  isFixedRingReceiver.value ||
+  (isRingInstrumentPeer.value && isAbletonRingReceiverDevice(selectedTarget.value))
+)
+const usesExternalTargets = computed(() => isCosmicUnityOrAbletonDevice(props.device))
+const usesCosmicUnityTargets = computed(() => !isCosmicUnityOrAbletonDevice(props.device))
+const automaticPeerId = computed(() => {
+  // peer_id identifies the external instrument in both supported UI shapes:
+  // external card -> its source name; CosmicUnity card -> selected peer.
+  if (usesCosmicUnityTargets.value) return sanitizePeerId(props.device.name)
+  if (usesExternalTargets.value) return sanitizePeerId(selectedTarget.value?.name || '')
+  return sanitizePeerId(props.device.name)
+})
+let previousAutomaticPeerId = automaticPeerId.value
+watch(
+  [automaticPeerId, selectedTarget, () => props.device.name],
+  ([nextAutomaticPeerId, target]) => {
+    const legacyAutomaticPeerId = usesCosmicUnityTargets.value
+      ? sanitizePeerId(target?.name || '')
+      : sanitizePeerId(props.device.name)
+    if (usesFixedRingRoute.value && nextAutomaticPeerId) {
+      // The Max/Ring route is a fixed one-to-one contract. Do not preserve a
+      // stale custom peer id from an older generic LINK configuration.
+      peerId.value = nextAutomaticPeerId
+    } else if (
+      nextAutomaticPeerId &&
+      (
+        !peerId.value ||
+        peerId.value === previousAutomaticPeerId ||
+        peerId.value === legacyAutomaticPeerId
+      )
+    ) {
+      peerId.value = nextAutomaticPeerId
+    }
+    previousAutomaticPeerId = nextAutomaticPeerId || previousAutomaticPeerId
+  },
+  { immediate: true }
+)
+
+watch(usesMaxRingRoute, (active, wasActive) => {
+  const current = Number(udpOverride.value) || 0
+  if (active && current === 0) {
+    udpOverride.value = MAX_RING_DEFAULT_UDP_PORT
+  } else if (!active && wasActive && current === MAX_RING_DEFAULT_UDP_PORT) {
+    udpOverride.value = 0
+  }
+}, { immediate: true })
+const targetPlaceholder = computed(() => {
+  if (usesExternalTargets.value) {
+    if (isFixedRingReceiver.value) {
+      return targetCandidates.value.length > 0
+        ? '— Ring-Instrument seç —'
+        : '— Ağda Ring-Instrument:9011 bulunamadı —'
+    }
+    return targetCandidates.value.length > 0
+      ? '— Android / OSCQuery cihazı seç —'
+      : '— Ağda Android / OSCQuery cihazı bulunamadı —'
+  }
+  if (usesCosmicUnityTargets.value) {
+    return targetCandidates.value.length > 0
+      ? '— CosmicUnity / Ableton seç —'
+      : '— Ağda CosmicUnity / Ableton bulunamadı —'
+  }
+  return '— pick destination —'
+})
+
+// Migrate only selections proven incompatible by current registry identity.
+// Do not clear an absent target: it may simply be offline or discovery may
+// still be converging after a restart.
+watch(
+  [targetFqdn, () => props.disallowedTargetFqdns],
+  ([selectedFqdn, disallowedFqdns]) => {
+    if (!selectedFqdn) return
+    const selectedKey = String(selectedFqdn).toLowerCase()
+    const isDisallowed = disallowedFqdns.some(
+      (fqdn) => String(fqdn).toLowerCase() === selectedKey
+    )
+    if (isDisallowed) targetFqdn.value = ''
+  },
+  { immediate: true, flush: 'post' }
+)
 
 const canPush = computed(() =>
   (props.device.connectionState === 'Connected' || props.device.status === 'connected') &&
@@ -307,11 +460,19 @@ const canPush = computed(() =>
   !!peerId.value
 )
 const announceSummary = computed(() => {
-  if (!targetFqdn.value) return usesAndroidTargets.value ? 'Android hedefi yok' : 'no target'
+  if (!targetFqdn.value) {
+    if (isFixedRingReceiver.value) return 'Ring-Instrument hedefi yok'
+    if (usesExternalTargets.value) return 'Harici OSCQuery hedefi yok'
+    if (isRingInstrumentPeer.value) return 'CosmicUnity / Max hedefi yok'
+    if (usesCosmicUnityTargets.value) return 'CosmicUnity hedefi yok'
+    return 'no target'
+  }
   const t = selectedTarget.value
-  if (!t && usesAndroidTargets.value) return 'Android hedefi yok'
+  if (!t) return 'Hedef çevrimdışı'
   const tname = t ? t.name : '(target gone)'
-  return `${peerId.value || props.device.name} → ${tname}`
+  return usesExternalTargets.value
+    ? `${tname} → ${props.device.name}`
+    : `${props.device.name} → ${tname}`
 })
 function onPush() {
   if (!canPush.value) return
@@ -321,11 +482,11 @@ function onPush() {
     udpPortOverride: Number(udpOverride.value) || 0
   })
 }
-// Reset the Peer ID field to the auto-derived value (sanitized device name).
+// Reset the Peer ID field to the auto-derived selected peer identity.
 // Useful when localStorage has a stale value left over from a previous device
 // name — manual edits get overwritten only when the user explicitly clicks.
 function onResetPeerId() {
-  peerId.value = sanitizePeerId(props.device.name)
+  peerId.value = automaticPeerId.value
 }
 // Note: auto-push-on-connect was intentionally removed — the user wants
 // LINK pushes to stay manual. The Push button is the only trigger.
@@ -351,6 +512,14 @@ const connectionLabel = computed(() => {
   const port = props.device.activeEndpoint?.port || props.device.port || props.device.oscQueryPort
   return `${props.device.serviceName || props.device.name} · Port ${port}`
 })
+const deviceTypeLabel = computed(() => isMaxRingReceiver.value
+  ? 'ABLETON / MAX'
+  : isCosmicRingReceiver.value
+    ? 'COSMICRING / ABLETON'
+    : (props.device.deviceType || props.device.type))
+const udpOverrideHint = computed(() => usesMaxRingRoute.value
+  ? `${MAX_RING_DEFAULT_UDP_PORT} = Max/Ring alım portu`
+  : '0 = VST için otomatik benzersiz port')
 const paramCount = computed(() => props.params.size)
 </script>
 
@@ -378,7 +547,7 @@ const paramCount = computed(() => props.params.size)
             spellcheck="false"
           />
         </div>
-        <div class="device-type">{{ device.deviceType || device.type }}</div>
+        <div class="device-type">{{ deviceTypeLabel }}</div>
       </div>
     </div>
 
@@ -538,7 +707,7 @@ const paramCount = computed(() => props.params.size)
             <label>Target</label>
             <select
               v-model="targetFqdn"
-              :disabled="usesAndroidTargets && targetCandidates.length === 0"
+              :disabled="targetCandidates.length === 0"
             >
               <option value="">{{ targetPlaceholder }}</option>
               <option v-for="s in targetCandidates" :key="s.fqdn" :value="s.fqdn">
@@ -550,16 +719,17 @@ const paramCount = computed(() => props.params.size)
             <label>Peer ID</label>
             <input
               v-model="peerId"
+              :readonly="usesFixedRingRoute"
               placeholder="announce as…"
               spellcheck="false"
-              title="Written to TARGET's /system/peer/peer_id"
+              title="Written to the CosmicUnity device as /system/peer/peer_id"
             />
             <button
               class="hub-peerid-reset"
               type="button"
-              :disabled="peerId === sanitizePeerId(device.name)"
+              :disabled="peerId === automaticPeerId"
               @click="onResetPeerId"
-              :title="`Reset to device name: ${sanitizePeerId(device.name)}`"
+              :title="`Reset to peer name: ${automaticPeerId}`"
             >↺</button>
           </div>
           <div class="hub-announce-row">
@@ -569,10 +739,10 @@ const paramCount = computed(() => props.params.size)
               type="number"
               min="0"
               max="65535"
-              placeholder="0 = use device OSC port"
-              title="Override the announced UDP port. 0 = use HOST_INFO.OSC_PORT or OSCQuery port."
+              :placeholder="udpOverrideHint"
+              :title="udpOverrideHint"
             />
-            <span class="hub-announce-hint">0 = use device's OSC port</span>
+            <span class="hub-announce-hint">{{ udpOverrideHint }}</span>
           </div>
           <div class="hub-announce-row hub-announce-actions">
             <button
@@ -580,7 +750,7 @@ const paramCount = computed(() => props.params.size)
               :disabled="!canPush"
               @click="onPush"
               :title="device.connectionState === 'Connected' || device.status === 'connected'
-                ? 'Send /system/peer/* + connect to target'
+                ? 'Write the external OSCQuery peer to CosmicUnity and connect'
                 : 'Device must be connected'"
             >
               Push
@@ -591,8 +761,10 @@ const paramCount = computed(() => props.params.size)
             </span>
           </div>
           <div class="hub-announce-hint hub-announce-meta">
-            Writes <code>/system/peer/{peer_id, host, oscquery_port, udp_port}</code>
-            to target, then bangs <code>/system/peer/connect</code>.
+            {{ usesFixedRingRoute
+              ? 'Ring-Instrument peer bilgisini Ableton Ring alıcısına yazar, ardından'
+              : 'Android/OSCQuery peer bilgisini CosmicUnity cihazına yazar, ardından' }}
+            <code>/system/peer/connect</code> gönderir.
           </div>
         </div>
       </div>

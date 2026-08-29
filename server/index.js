@@ -12,11 +12,14 @@
 //     for OSC relay style, and a central /ws/hub WebSocket pushes
 //     PATH_CHANGED, DEVICE_UPDATED, DEVICE_NAMESPACE, … to the dashboard.
 //   - Accepts SET_DEVICE_PARAM (write a value back to a managed device) and
-//     ANNOUNCE_DEVICE (push the device's contact info onto a target's
-//     /system/peer/* parameters) over /ws/hub.
+//     ANNOUNCE_DEVICE (write the selected external OSCQuery peer's contact info
+//     onto the CosmicUnity instance's /system/peer/* parameters) over /ws/hub.
 //   - Forwards every device value to Ableton on UDP ABLETON_PORT using
 //     the historical "device<id> <path> <value>" two-string + value packet
 //     shape (compatible with the existing Cosmic Unity M4L patch).
+//   - Mirrors every managed-device value to CosmicNoise using the typed,
+//     versioned /cosmicnoise/v1/input envelope on a separate UDP port.
+//
 // All commentary, logs and identifiers are in English.
 
 import express from 'express'
@@ -35,6 +38,27 @@ import {
   deduplicateManifestEntries,
   getLocalInterfaceAddresses
 } from './deviceRegistry.js'
+import {
+  SNAPSHOT_FRESHNESS_MS,
+  createCosmicNoiseForwarderFromEnv
+} from './cosmicNoiseForwarder.js'
+import {
+  findRegistryDeviceForTarget,
+  resolveLinkAnnouncement,
+  resolveRingReceiverFromRegistry,
+  resolveRingInstrumentTargetFromRegistry,
+  resolveRingInstrumentSourceFromRegistry,
+  resolveOscUdpPort
+} from './linkRouting.js'
+import {
+  isMaxRingReceiverDevice,
+  isRingInstrumentIdentity
+} from '../shared/maxRingLink.js'
+import { isCosmicRingReceiverDevice } from '../shared/cosmicRingLink.js'
+
+function isAbletonRingReceiverDevice(device) {
+  return isMaxRingReceiverDevice(device) || isCosmicRingReceiverDevice(device)
+}
 
 // ─── Configuration ────────────────────────────────────────────────────────
 const PORT               = Number(process.env.PORT || 7400)          // helper HTTP/WS + hub OSCQuery HTTP
@@ -63,6 +87,7 @@ function ensureManifestsDir() {
 }
 ensureManifestsDir()
 const ABLETON_FORWARD    = process.env.ABLETON_FORWARD !== '0'         // on by default; set to "0" to disable
+const cosmicNoiseForwarder = createCosmicNoiseForwarderFromEnv(process.env)
 
 // ─── Security constants ───────────────────────────────────────────────────
 const MAX_SUBSCRIBERS = 50
@@ -128,6 +153,21 @@ let nextDeviceRuntimeGeneration = 1
 let isShuttingDown = false
 let deviceRegistry = new DeviceRegistry({ localAddresses: getLocalInterfaceAddresses() })
 
+function canReplayCosmicNoiseDevice(deviceId, now) {
+  const dev = devices.get(deviceId)
+  if (!dev || dev.enabled !== true || dev.status !== 'connected') return false
+  const messageAge = now - Number(dev.lastMessageAt)
+  return Number.isFinite(messageAge) && messageAge >= 0 && messageAge <= SNAPSHOT_FRESHNESS_MS
+}
+
+const cosmicNoiseSnapshotTimer =
+  cosmicNoiseForwarder.enabled && cosmicNoiseForwarder.snapshotMs > 0
+    ? setInterval(() => {
+        cosmicNoiseForwarder.replaySnapshots(canReplayCosmicNoiseDevice)
+      }, cosmicNoiseForwarder.snapshotMs)
+    : null
+if (cosmicNoiseSnapshotTimer) cosmicNoiseSnapshotTimer.unref()
+
 let suppressWatcher = false // flip while we write a manifest ourselves
 
 // ─── Hub WebSocket state ──────────────────────────────────────────────────
@@ -155,6 +195,8 @@ function applyRegistryIdentity(dev, record) {
   dev.canonicalId = record.canonicalId
   dev.deviceType = record.deviceType
   dev.persistentDeviceId = record.persistentDeviceId
+  dev.legacyIds = record.legacyIds || []
+  dev.legacyCanonicalIds = record.legacyCanonicalIds || []
   dev.endpoints = record.endpoints
   dev.activeEndpoint = record.activeEndpoint
   dev.isLocal = record.isLocal
@@ -203,6 +245,12 @@ function rebuildDeviceRegistry() {
     if (Number(service.port) === PORT) continue
     upsertServiceInRegistry(service)
   }
+  // A later manifest/discovery observation can move or merge a registry
+  // entity. Re-read every managed device after the whole rebuild so no client
+  // keeps a canonical ID that now belongs to a different physical device.
+  for (const dev of devices.values()) {
+    applyRegistryIdentity(dev, deviceRegistry.findByManifestId(dev.id))
+  }
 }
 
 function broadcastRegistry() {
@@ -210,6 +258,7 @@ function broadcastRegistry() {
 }
 
 function clearManagedDeviceRuntimeState(deviceId) {
+  cosmicNoiseForwarder.clearDeviceSnapshots(deviceId)
   deviceMsgCount.delete(deviceId)
   for (const [path, param] of namespace.entries()) {
     if (param.deviceId === deviceId) namespace.delete(path)
@@ -422,6 +471,7 @@ function reconcileClients(oldDevices, oldManifestFilenames = manifestFilenames) 
       newDev.host !== oldDev.host ||
       newDev.oscQueryPort !== oldDev.oscQueryPort
 
+    if (shouldDisconnect) cosmicNoiseForwarder.clearDeviceSnapshots(id)
     if (shouldDisconnect && oscQueryClients.has(id)) {
       const client = oscQueryClients.get(id)
       oscQueryClients.delete(id)
@@ -463,7 +513,12 @@ function connectToDevice(dev) {
       currentDev.connectionState = CONNECTION_STATES.CONNECTED
       currentDev.error = null
       currentDev.lastMessageAt = Date.now()
-      currentDev.oscPort = client.oscPort || currentDev.oscQueryPort
+      // Keep only an OSC UDP port actually advertised by HOST_INFO. The
+      // OSCQuery HTTP port is not a safe fallback for CosmicUnity: the VST's
+      // control UDP listener is intentionally independent.
+      currentDev.oscPort = isValidOscPort(Number(client.hostInfo?.OSC_PORT))
+        ? Number(client.hostInfo.OSC_PORT)
+        : null
       const ns = client.lastNamespace
       if (ns) {
         const count = countParams(ns)
@@ -482,6 +537,7 @@ function connectToDevice(dev) {
     },
     onDisconnect: (reason) => {
       if (oscQueryClients.get(dev.id) !== client) return
+      cosmicNoiseForwarder.clearDeviceSnapshots(dev.id)
       const currentDev = devices.get(dev.id)
       if (!currentDev) return
       currentDev.status = 'lost'
@@ -509,6 +565,9 @@ function connectToDevice(dev) {
       const previousPersistentId = currentDev.persistentDeviceId
       const previousCanonicalId = currentDev.canonicalId
       currentDev.hostInfo = hostInfo
+      currentDev.oscPort = isValidOscPort(Number(hostInfo.OSC_PORT))
+        ? Number(hostInfo.OSC_PORT)
+        : null
       const identityRecord = deviceRegistry.upsertManifest({
         ...registryManifest(currentDev),
         hostInfo,
@@ -531,11 +590,11 @@ function connectToDevice(dev) {
     onLog: (msg) => {
       console.log(`     [${dev.name}] ${msg}`)
     },
-    onValue: (path, value) => {
+    onValue: (path, value, metadata) => {
       if (oscQueryClients.get(dev.id) !== client) return
       const currentDev = devices.get(dev.id)
       if (!currentDev) return
-      handleClientValue(currentDev, path, value)
+      handleClientValue(currentDev, path, value, metadata)
     }
   }, {
     reconnectDelayMs: 3000,
@@ -547,7 +606,7 @@ function connectToDevice(dev) {
   client.connect()
 }
 
-function handleClientValue(dev, path, value) {
+function handleClientValue(dev, path, value, metadata = {}) {
   const receivedAt = Date.now()
   dev.lastMessageAt = receivedAt
   dev.status = 'connected'
@@ -567,6 +626,24 @@ function handleClientValue(dev, path, value) {
       : typeof firstVal === 'boolean'
       ? firstVal ? 'T' : 'F'
       : 's'
+  const sourceMetadata = metadata || {}
+
+  // Independent of the historical Ableton mirror. This path keeps every
+  // payload argument and uses the OSCQuery node TYPE (or binary wire metadata)
+  // so f/i/s/T/F/d values are not collapsed by JavaScript inference.
+  if (cosmicNoiseForwarder.enabled && dev.enabled) {
+    cosmicNoiseForwarder.forward(
+      {
+        deviceId: dev.id,
+        sourcePath: path,
+        payload: v,
+        oscQueryType: sourceMetadata.oscQueryType,
+        wireArgs: sourceMetadata.wireArgs
+      },
+      { cacheSnapshot: true, receivedAt }
+    )
+  }
+
   if (!namespace.has(hubPath) && namespace.size >= MAX_NAMESPACE) {
     return // hard cap to prevent runaway memory if a device misbehaves
   }
@@ -612,6 +689,28 @@ function broadcastDeviceUpdate(dev) {
 }
 
 // ─── Manifest save ────────────────────────────────────────────────────────
+const RUNTIME_ONLY_MANIFEST_FIELDS = new Set([
+  'activeEndpoint',
+  'connectionState',
+  'discoveryState',
+  'error',
+  'hostInfo',
+  'isLocal',
+  'lastMessageAt',
+  'locationLabel',
+  'oscPort',
+  'paramCount',
+  'runtimeGeneration',
+  'saved',
+  'status'
+])
+
+function persistentManifestFields(dev) {
+  return Object.fromEntries(
+    Object.entries(dev || {}).filter(([key]) => !RUNTIME_ONLY_MANIFEST_FIELDS.has(key))
+  )
+}
+
 function saveManifest(deviceId, updates) {
   const dev = devices.get(deviceId)
   const filename = manifestFilenames.get(deviceId)
@@ -633,7 +732,11 @@ function saveManifest(deviceId, updates) {
     return { ok: false, error: 'Invalid device name' }
   }
 
+  // Start from every non-runtime field loaded from disk so migrations and
+  // identity refreshes cannot silently erase future/extension settings (for
+  // example routing, presets metadata or operator-specific configuration).
   const updated = {
+    ...persistentManifestFields(dev),
     id: dev.id,
     name: updates.name ?? dev.name,
     type: dev.type || 'oscquery-device',
@@ -655,7 +758,8 @@ function saveManifest(deviceId, updates) {
           lastSeen: Date.now()
         }]
       : (dev.endpoints || []),
-    legacyIds: dev.legacyIds || []
+    legacyIds: dev.legacyIds || [],
+    legacyCanonicalIds: dev.legacyCanonicalIds || []
   }
 
   try {
@@ -794,7 +898,7 @@ function broadcastToOscSubscribers(path, value, type, exceptSource) {
 
 // ─── Shared UDP OSC sender ────────────────────────────────────────────────
 // One outbound-only socket used by SET_DEVICE_PARAM (write to managed
-// device) and by announceToTarget() (announce to LAN peer). Kept separate
+// device) and by announceToTarget() (bootstrap a CosmicUnity peer). Kept separate
 // from the hub's inbound UDP port so the two listeners don't collide.
 const udpSender = new osc.UDPPort({
   localAddress: '0.0.0.0',
@@ -1077,7 +1181,21 @@ app.get('/_status', (_req, res) => {
     osc_subscribers: Array.from(oscSubscribers.values()),
     devices: deviceRegistry.snapshot(),
     registryDevices: deviceRegistry.snapshot(),
-    abletonMsgsSent
+    abletonMsgsSent,
+    cosmicNoise: {
+      enabled: cosmicNoiseForwarder.enabled,
+      host: cosmicNoiseForwarder.host,
+      port: cosmicNoiseForwarder.port,
+      sent: cosmicNoiseForwarder.sent,
+      dropped: cosmicNoiseForwarder.dropped,
+      errors: cosmicNoiseForwarder.errors,
+      snapshotMs: cosmicNoiseForwarder.snapshotMs,
+      snapshotFreshnessMs: SNAPSHOT_FRESHNESS_MS,
+      snapshotDevices: cosmicNoiseForwarder.snapshotDevices,
+      snapshotEntries: cosmicNoiseForwarder.snapshotEntries,
+      snapshotReplayed: cosmicNoiseForwarder.snapshotReplayed,
+      snapshotDropped: cosmicNoiseForwarder.snapshotDropped
+    }
   })
 })
 
@@ -1146,29 +1264,16 @@ wssDiscovery.on('connection', (ws) => {
 })
 
 /**
- * Push a device's contact info onto a target's /system/peer/* OSCQuery
- * parameters by sending five OSC UDP messages to the target.
+ * Write an external OSCQuery peer's contact info onto a CosmicUnity instance's
+ * /system/peer/* OSCQuery parameters by sending five OSC UDP messages.
  *
  * @param {{ target: any, peerId: string, host: string, oscQueryPort: number, udpPort: number }} args
  */
 async function announceToTarget({ target, peerId, host, oscQueryPort, udpPort }) {
-  // Resolve the target's OSC UDP port: prefer HOST_INFO.OSC_PORT, fall back
-  // to the OSCQuery HTTP port (often the same on devices like Max/Chataigne).
-  let targetOscPort = Number(target.port)
-  try {
-    const ctl = new AbortController()
-    const to = setTimeout(() => ctl.abort(), 2000)
-    const r = await fetch(`http://${target.address}:${target.port}/?HOST_INFO`, {
-      signal: ctl.signal
-    })
-    clearTimeout(to)
-    if (r.ok) {
-      const info = await r.json()
-      if (info && Number(info.OSC_PORT)) targetOscPort = Number(info.OSC_PORT)
-    }
-  } catch {
-    // HOST_INFO unsupported → keep the fallback port
-  }
+  // CosmicUnity's OSCQuery HTTP port and OSC UDP control port are independent.
+  // The resolver uses cached HOST_INFO first, then performs one bounded refresh
+  // and fails closed rather than guessing the HTTP endpoint.
+  const targetOscPort = await resolveOscUdpPort(target)
   // Fire the five canonical announce messages. We use the shared UDP sender.
   sendOscViaSender(target.address, targetOscPort, '/system/peer/peer_id', [peerId])
   sendOscViaSender(target.address, targetOscPort, '/system/peer/host', [host])
@@ -1209,7 +1314,14 @@ wssHub.on('connection', (ws, req) => {
     discoveredDevices: deviceRegistry.snapshot().filter((record) => !record.saved),
     registryDevices: deviceRegistry.snapshot(),
     hubName: HUB_NAME,
-    abletonForward: ABLETON_FORWARD ? { host: ABLETON_HOST, port: ABLETON_PORT } : null
+    abletonForward: ABLETON_FORWARD ? { host: ABLETON_HOST, port: ABLETON_PORT } : null,
+    cosmicNoiseForward: cosmicNoiseForwarder.enabled
+      ? {
+          host: cosmicNoiseForwarder.host,
+          port: cosmicNoiseForwarder.port,
+          snapshotMs: cosmicNoiseForwarder.snapshotMs
+        }
+      : null
   }))
 
   // A browser can open long after devices connected. Re-send each currently
@@ -1275,6 +1387,7 @@ wssHub.on('connection', (ws, req) => {
     if (msg.type === 'RECONNECT_DEVICE' && typeof msg.deviceId === 'number') {
       const dev = devices.get(msg.deviceId)
       if (dev && dev.enabled) {
+        cosmicNoiseForwarder.clearDeviceSnapshots(dev.id)
         if (oscQueryClients.has(dev.id)) {
           const client = oscQueryClients.get(dev.id)
           oscQueryClients.delete(dev.id)
@@ -1321,17 +1434,16 @@ wssHub.on('connection', (ws, req) => {
       return
     }
 
-    // ANNOUNCE_DEVICE — push one of our managed devices' contact info onto a
-    // discovered target's /system/peer/* OSCQuery parameters. The hub
-    // resolves the target's OSC UDP port via HOST_INFO, then fires five OSC
-    // UDP messages: peer_id, host, oscquery_port, udp_port, connect.
+    // ANNOUNCE_DEVICE — resolve the UI selection into the asymmetric VST
+    // bootstrap: external OSCQuery coordinates are always written to
+    // CosmicUnity. The selected target can come from either card type.
     if (msg.type === 'ANNOUNCE_DEVICE' && typeof msg.deviceId === 'number' && msg.target) {
       const dev = devices.get(msg.deviceId)
       if (!dev) {
         ws.send(JSON.stringify({ type: 'ANNOUNCE_RESULT', deviceId: msg.deviceId, ok: false, error: 'Device not found' }))
         return
       }
-      const target = msg.target // { address, port }
+      const target = msg.target // { address, port, fqdn, name }
       if (!isValidHost(String(target.address || ''))) {
         ws.send(JSON.stringify({ type: 'ANNOUNCE_RESULT', deviceId: dev.id, ok: false, error: 'Invalid target host' }))
         return
@@ -1340,23 +1452,70 @@ wssHub.on('connection', (ws, req) => {
         ws.send(JSON.stringify({ type: 'ANNOUNCE_RESULT', deviceId: dev.id, ok: false, error: 'Invalid target port' }))
         return
       }
-      const peerId = String(msg.peerId || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '_') || dev.name.toLowerCase().replace(/[^a-z0-9_-]+/g, '_')
-      const udpPort = Number(msg.udpPortOverride) > 0
-        ? Number(msg.udpPortOverride)
-        : (Number(dev.oscPort) || Number(dev.oscQueryPort))
+      // Keep an omitted peer id empty until routing knows which side is the
+      // external instrument. Falling back to target.name here is wrong for an
+      // external-device card because that card's selected target is the VST.
+      const peerId = String(msg.peerId || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '_')
+      let announcement
+      try {
+        const sourceRegistryDevice = deviceRegistry.findByManifestId(dev.id)
+        const registrySnapshot = deviceRegistry.snapshot()
+        let selectedRegistryDevice = findRegistryDeviceForTarget(
+          registrySnapshot,
+          target
+        )
+        let selectedTarget = target
+        let routedSourceDevice = dev
+        if (isAbletonRingReceiverDevice(sourceRegistryDevice)) {
+          const resolved = resolveRingInstrumentTargetFromRegistry(registrySnapshot, target)
+          selectedRegistryDevice = resolved.record
+          selectedTarget = resolved.target
+        } else if (isRingInstrumentIdentity(sourceRegistryDevice)) {
+          routedSourceDevice = {
+            ...dev,
+            ...resolveRingInstrumentSourceFromRegistry(sourceRegistryDevice)
+          }
+          if (isAbletonRingReceiverDevice(selectedRegistryDevice)) {
+            const resolved = resolveRingReceiverFromRegistry(registrySnapshot, target)
+            selectedRegistryDevice = resolved.record
+            selectedTarget = resolved.target
+          }
+        }
+        const selectedManagedDevice = selectedRegistryDevice?.manifestId != null
+          ? devices.get(selectedRegistryDevice.manifestId)
+          : null
+        announcement = resolveLinkAnnouncement({
+          sourceDevice: {
+            ...routedSourceDevice,
+            runtimeKind: sourceRegistryDevice?.runtimeKind,
+            linkRole: sourceRegistryDevice?.linkRole
+          },
+          selectedTarget: {
+            ...selectedTarget,
+            deviceType: selectedTarget.deviceType || selectedRegistryDevice?.deviceType,
+            runtimeKind: selectedRegistryDevice?.runtimeKind,
+            linkRole: selectedRegistryDevice?.linkRole,
+            oscPort: selectedManagedDevice?.oscPort || selectedTarget.oscPort
+          },
+          peerId,
+          udpPortOverride: msg.udpPortOverride
+        })
+      } catch (err) {
+        ws.send(JSON.stringify({
+          type: 'ANNOUNCE_RESULT',
+          deviceId: dev.id,
+          ok: false,
+          error: err.message
+        }))
+        return
+      }
 
-      announceToTarget({
-        target,
-        peerId,
-        host: dev.host,
-        oscQueryPort: Number(dev.oscQueryPort),
-        udpPort
-      })
+      announceToTarget(announcement)
         .then(() => ws.send(JSON.stringify({
           type: 'ANNOUNCE_RESULT',
           deviceId: dev.id,
           ok: true,
-          summary: `${peerId} → ${target.name || target.address}`
+          summary: `${announcement.peerName} → ${announcement.receiverName}`
         })))
         .catch((err) => ws.send(JSON.stringify({
           type: 'ANNOUNCE_RESULT',
@@ -1382,6 +1541,7 @@ wssHub.on('connection', (ws, req) => {
       // save and re-import later. We send only the on-disk fields (not the
       // runtime ones like status / paramCount / lastMessageAt).
       const payload = Array.from(devices.values()).map((d) => ({
+        ...persistentManifestFields(d),
         id:           d.id,
         name:         d.name,
         type:         d.type || 'oscquery-device',
@@ -1394,7 +1554,8 @@ wssHub.on('connection', (ws, req) => {
         enabled:      d.enabled !== false,
         description:  d.description || '',
         endpoints:    d.endpoints || [],
-        legacyIds:    d.legacyIds || []
+        legacyIds:    d.legacyIds || [],
+        legacyCanonicalIds: d.legacyCanonicalIds || []
       }))
       ws.send(JSON.stringify({
         type: 'MANIFESTS_EXPORT',
@@ -1419,6 +1580,7 @@ wssHub.on('connection', (ws, req) => {
       try {
         // Disconnect everyone first so reconcileClients doesn't get confused
         // by the in-flight rename.
+        cosmicNoiseForwarder.clearSnapshots()
         for (const [id, client] of oscQueryClients.entries()) {
           oscQueryClients.delete(id)
           try { client.disconnect() } catch {}
@@ -1457,6 +1619,7 @@ wssHub.on('connection', (ws, req) => {
           if (id == null) id = nextId++
           usedIds.add(id)
           const manifest = {
+            ...persistentManifestFields(m),
             id,
             name:         String(m.name).slice(0, 64),
             type:         m.type || 'oscquery-device',
@@ -1469,7 +1632,8 @@ wssHub.on('connection', (ws, req) => {
             enabled:      m.enabled !== false,
             description:  m.description || 'Imported',
             endpoints:    Array.isArray(m.endpoints) ? m.endpoints : [],
-            legacyIds:    Array.isArray(m.legacyIds) ? m.legacyIds : []
+            legacyIds:    Array.isArray(m.legacyIds) ? m.legacyIds : [],
+            legacyCanonicalIds: Array.isArray(m.legacyCanonicalIds) ? m.legacyCanonicalIds : []
           }
           const filename = `${manifest.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${id}.json`
           writeFileSync(join(MANIFESTS_DIR, filename), JSON.stringify(manifest, null, 2) + '\n', 'utf-8')
@@ -1555,7 +1719,8 @@ wssHub.on('connection', (ws, req) => {
         enabled: true,
         description: msg.type === 'SAVE_DEVICE' ? 'Saved from Device Registry' : 'Discovered via Bonjour',
         endpoints: registryRecord?.endpoints || [endpoint],
-        legacyIds: []
+        legacyIds: [],
+        legacyCanonicalIds: registryRecord?.legacyCanonicalIds || []
       }
       const filename = `${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${nextId}.json`
       // Suppress the manifest folder watcher so it doesn't race our explicit
@@ -1623,6 +1788,12 @@ server.listen(PORT, '0.0.0.0', () => {
   if (ABLETON_FORWARD) {
     console.log(`  Ableton forward:   UDP ${ABLETON_HOST}:${ABLETON_PORT}`)
   }
+  if (cosmicNoiseForwarder.enabled) {
+    const snapshot = cosmicNoiseForwarder.snapshotMs > 0
+      ? `snapshot ${cosmicNoiseForwarder.snapshotMs} ms`
+      : 'snapshot disabled'
+    console.log(`  CosmicNoise v1:    UDP ${cosmicNoiseForwarder.host}:${cosmicNoiseForwarder.port} · ${snapshot}`)
+  }
   console.log(`  Manifests dir:     ${MANIFESTS_DIR}`)
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   publishBonjour()
@@ -1637,6 +1808,7 @@ function shutdown(signal = 'SIGTERM') {
   if (isShuttingDown) return
   isShuttingDown = true
   console.log(`\nShutting down (${signal})…`)
+  if (cosmicNoiseSnapshotTimer) clearInterval(cosmicNoiseSnapshotTimer)
   clearInterval(deviceMessageCounterTimer)
   clearInterval(discoveryStaleTimer)
   if (manifestReloadTimer) clearTimeout(manifestReloadTimer)
@@ -1646,6 +1818,7 @@ function shutdown(signal = 'SIGTERM') {
     oscQueryClients.delete(id)
     client.disconnect()
   }
+  cosmicNoiseForwarder.close()
   try { udpSender.close() } catch {}
   try { abletonSocket.close() } catch {}
   const forceExit = setTimeout(() => process.exit(0), 2500)

@@ -80,5 +80,5 @@ export function useHubPresets(deviceIdRef) {
 
   watch(deviceIdRef, load, { immediate: true })
 
-  return { presets, add, remove, update, reorder }
+  return { presets, add, remove, update, reorder, reload: load }
 }

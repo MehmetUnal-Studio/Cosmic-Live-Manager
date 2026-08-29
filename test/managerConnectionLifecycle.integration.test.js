@@ -272,6 +272,8 @@ test('a connected device becomes Unavailable, reconnects as the same saved card,
       PORT: String(managerPort),
       OSC_LISTEN_PORT: String(managerOscPort),
       ABLETON_FORWARD: '0',
+      COSMICNOISE_FORWARD: '0',
+      COSMICNOISE_SNAPSHOT_MS: '0',
       HUB_NAME: `Reconnect Lifecycle Integration ${process.pid} ${Date.now()}`,
       MANIFESTS_DIR: manifestsDir
     },
@@ -410,6 +412,8 @@ test('an initial connection cannot remain Connecting beyond the three-second dea
       PORT: String(managerPort),
       OSC_LISTEN_PORT: String(managerOscPort),
       ABLETON_FORWARD: '0',
+      COSMICNOISE_FORWARD: '0',
+      COSMICNOISE_SNAPSHOT_MS: '0',
       HUB_NAME: `Connection Deadline Integration ${process.pid} ${Date.now()}`,
       MANIFESTS_DIR: manifestsDir
     },

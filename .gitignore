@@ -8,4 +8,5 @@ dist
 # but keep the folder around so the helper finds it on every clone (the
 # .gitkeep below is whitelisted).
 manifests/*.json
+manifests/.deduplicated/
 !manifests/.gitkeep

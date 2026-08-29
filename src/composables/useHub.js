@@ -1,4 +1,5 @@
 import { ref } from 'vue'
+import { serializeLinkTarget } from '../utils/linkTargets.js'
 
 // Hub state — connects to the helper's /ws/hub channel.
 //
@@ -124,7 +125,7 @@ function createHub() {
     send({
       type: 'ANNOUNCE_DEVICE',
       deviceId,
-      target: { address: target.address, port: target.port, name: target.name },
+      target: serializeLinkTarget(target),
       peerId,
       udpPortOverride: udpPortOverride || 0
     })
