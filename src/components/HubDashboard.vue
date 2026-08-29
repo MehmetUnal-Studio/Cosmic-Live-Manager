@@ -7,6 +7,11 @@ import { usePerformancePresets } from '../composables/usePerformancePresets.js'
 import DeviceCard from './DeviceCard.vue'
 import SceneBar from './SceneBar.vue'
 import ServerControl from './ServerControl.vue'
+import {
+  filterLinkTargetServices,
+  isAndroidDevice,
+  isCosmicUnityDevice
+} from '../utils/linkTargets.js'
 
 const {
   connected,
@@ -195,11 +200,13 @@ const orderedDevices = computed(() => {
 })
 
 function isCosmicUnity(d) {
-  return d?.deviceType === 'CosmicUnity' ||
-    (d?.isLocal && Number(d?.port || d?.oscQueryPort) >= 5001 && Number(d?.port || d?.oscQueryPort) <= 5016)
+  return isCosmicUnityDevice(d)
 }
 function isAndroid(d) {
-  return d?.deviceType === 'Android' || /android/i.test(d?.name || '')
+  return isAndroidDevice(d)
+}
+function linkTargetServices(device) {
+  return filterLinkTargetServices(device, services.value, devices.value)
 }
 const deviceGroups = computed(() => {
   const cosmic = orderedDevices.value.filter(isCosmicUnity)
@@ -561,7 +568,7 @@ watch(devices, (list) => {
               :msg-count="deviceMsgCounts.get(dev.id) || 0"
               :params="deviceParams.get(dev.id) || new Map()"
               :hint="saveHints.get(dev.id) || null"
-              :services="services"
+              :services="linkTargetServices(dev)"
               :announce-result="announceResults.get(dev.id) || null"
               @update="(u) => updateDevice(dev.id, u)"
               @reconnect="reconnectDevice(dev.id)"

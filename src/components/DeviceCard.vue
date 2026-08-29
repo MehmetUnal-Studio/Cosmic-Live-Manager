@@ -7,6 +7,7 @@ import { sanitizePeerId } from '../composables/usePeer.js'
 import { useHubPresets } from '../composables/useHubPresets.js'
 import { useRecording } from '../composables/useRecording.js'
 import { useHub } from '../composables/useHub.js'
+import { isCosmicUnityDevice } from '../utils/linkTargets.js'
 
 const props = defineProps({
   device: { type: Object, required: true },
@@ -292,6 +293,13 @@ const targetCandidates = computed(() => {
   })
 })
 const selectedTarget = computed(() => targetCandidates.value.find((s) => s.fqdn === targetFqdn.value))
+const usesAndroidTargets = computed(() => isCosmicUnityDevice(props.device))
+const targetPlaceholder = computed(() => {
+  if (!usesAndroidTargets.value) return '— pick destination —'
+  return targetCandidates.value.length > 0
+    ? '— Android tablet seç —'
+    : '— Ağda Android tablet bulunamadı —'
+})
 
 const canPush = computed(() =>
   (props.device.connectionState === 'Connected' || props.device.status === 'connected') &&
@@ -299,8 +307,9 @@ const canPush = computed(() =>
   !!peerId.value
 )
 const announceSummary = computed(() => {
-  if (!targetFqdn.value) return 'no target'
+  if (!targetFqdn.value) return usesAndroidTargets.value ? 'Android hedefi yok' : 'no target'
   const t = selectedTarget.value
+  if (!t && usesAndroidTargets.value) return 'Android hedefi yok'
   const tname = t ? t.name : '(target gone)'
   return `${peerId.value || props.device.name} → ${tname}`
 })
@@ -527,8 +536,11 @@ const paramCount = computed(() => props.params.size)
         <div v-show="announceOpen" class="hub-announce-body">
           <div class="hub-announce-row">
             <label>Target</label>
-            <select v-model="targetFqdn">
-              <option value="">— pick destination —</option>
+            <select
+              v-model="targetFqdn"
+              :disabled="usesAndroidTargets && targetCandidates.length === 0"
+            >
+              <option value="">{{ targetPlaceholder }}</option>
               <option v-for="s in targetCandidates" :key="s.fqdn" :value="s.fqdn">
                 {{ s.name }} ({{ s.address }}:{{ s.port }})
               </option>
