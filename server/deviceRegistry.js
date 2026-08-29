@@ -403,6 +403,7 @@ function publicRecord(record, localAddresses) {
       : '',
     discoveryState: record.discoveryState,
     connectionState: record.connectionState,
+    reachability: record.reachability || 'ok',
     // Keep the historical lowercase field for API/OSC integrations while the
     // explicit state machine lives in `connectionState`.
     status: legacyStatus(record.connectionState, record.saved),
@@ -551,6 +552,20 @@ export class DeviceRegistry {
     const endpointRecord = this.records.get(byEndpointId)
     let record = identityRecord || endpointRecord
 
+    // TXT-less (legacy) services embed the host in their canonical identity,
+    // so a multi-homed machine (Wi-Fi + Ethernet) would otherwise fragment
+    // into one card per address. The Bonjour FQDN is the strongest identity
+    // such a service has: fold every address alias of the same fqdn into one
+    // record, collapsing duplicates onto the freshest observation.
+    if (!identity.persistentDeviceId && endpoint.fqdn) {
+      const byFqdnId = this.fqdnIndex.get(endpoint.fqdn)
+      const fqdnRecord = byFqdnId ? this.records.get(byFqdnId) : null
+      if (fqdnRecord && !fqdnRecord.persistentDeviceId) {
+        if (!record) record = fqdnRecord
+        else if (fqdnRecord !== record) record = this._mergeRecords(record, fqdnRecord)
+      }
+    }
+
     // A persistent UUID authenticates continuity, not locality. If a remote
     // CosmicRing advertises the same UUID as this computer's Live-Ring, keep
     // it in a separate untrusted entity. This handles both discovery orders:
@@ -696,6 +711,7 @@ export class DeviceRegistry {
         activeEndpoint: null,
         discoveryState: 'Absent',
         connectionState: CONNECTION_STATES.DISCOVERED,
+        reachability: 'ok',
         saved: false,
         manifestId: null,
         enabled: true,
@@ -729,6 +745,7 @@ export class DeviceRegistry {
 
     record.deviceType = identity.deviceType
     record.lastSeen = now
+    record.reachability = 'ok'
     record.endpoints.set(endpointKey(endpoint.host, endpoint.port), endpoint)
     this.endpointIndex.set(endpointKey(endpoint.host, endpoint.port), record.canonicalId)
     if (endpoint.fqdn) this.fqdnIndex.set(endpoint.fqdn, record.canonicalId)
@@ -787,6 +804,7 @@ export class DeviceRegistry {
       const endpoint = endpointFrom(alias, Number(alias.lastSeen) || this.now(), alias.source || 'manifest')
       record.endpoints.set(endpointKey(endpoint.host, endpoint.port), endpoint)
       this.endpointIndex.set(endpointKey(endpoint.host, endpoint.port), record.canonicalId)
+      if (endpoint.fqdn) this.fqdnIndex.set(endpoint.fqdn, record.canonicalId)
     }
     record.activeEndpoint = preferEndpoint(
       Array.from(record.endpoints.values()),
@@ -821,20 +839,80 @@ export class DeviceRegistry {
   }
 
   markDiscoveryDown({ fqdn, host, port }) {
-    const canonicalId = (fqdn && this.fqdnIndex.get(fqdn)) ||
-      this.endpointIndex.get(endpointKey(host, port))
-    const record = this.records.get(canonicalId)
-    if (!record) return null
-    for (const endpoint of record.endpoints.values()) {
-      if ((fqdn && endpoint.fqdn === fqdn) || endpointKey(endpoint.host, endpoint.port) === endpointKey(host, port)) {
-        endpoint.available = false
+    // One mDNS goodbye covers every record that carries the fqdn. The
+    // fqdnIndex alone is last-writer-wins, so consult all records: a
+    // multi-homed legacy service observed before the fqdn folding fix may
+    // still exist as sibling records sharing the same fqdn.
+    const affected = new Set()
+    if (fqdn) {
+      const indexed = this.records.get(this.fqdnIndex.get(fqdn))
+      if (indexed) affected.add(indexed)
+      for (const record of this.records.values()) {
+        for (const endpoint of record.endpoints.values()) {
+          if (endpoint.fqdn === fqdn) {
+            affected.add(record)
+            break
+          }
+        }
       }
     }
-    record.discoveryState = Array.from(record.endpoints.values()).some(
-      (endpoint) => endpoint.source === 'discovery' && endpoint.available
-    ) ? 'Discovered' : 'Stale'
-    if (!record.saved && record.connectionState !== CONNECTION_STATES.CONNECTED) {
-      record.connectionState = CONNECTION_STATES.UNAVAILABLE
+    const endpointRecord = this.records.get(this.endpointIndex.get(endpointKey(host, port)))
+    if (endpointRecord) affected.add(endpointRecord)
+    if (affected.size === 0) return null
+
+    let result = null
+    for (const record of affected) {
+      for (const endpoint of record.endpoints.values()) {
+        if ((fqdn && endpoint.fqdn === fqdn) || endpointKey(endpoint.host, endpoint.port) === endpointKey(host, port)) {
+          endpoint.available = false
+        }
+      }
+      record.discoveryState = Array.from(record.endpoints.values()).some(
+        (endpoint) => endpoint.source === 'discovery' && endpoint.available
+      ) ? 'Discovered' : 'Stale'
+      if (record.discoveryState === 'Stale') record.reachability = 'dead'
+      if (!record.saved && record.connectionState !== CONNECTION_STATES.CONNECTED) {
+        record.connectionState = CONNECTION_STATES.UNAVAILABLE
+      }
+      result = publicRecord(record, this.localAddresses)
+    }
+    return result
+  }
+
+  /**
+   * Records that look alive ("Discovered") but have not been observed for
+   * `maxSilentMs`. Devices that hard-power-off never send an mDNS goodbye, so
+   * without an active probe these ghosts would stay `Discovered` forever.
+   * Marks each candidate `reachability: 'silent'` and returns its snapshot so
+   * the caller can run a reachability probe and report back via
+   * `markProbeResult`.
+   */
+  reachabilityProbeCandidates(maxSilentMs) {
+    const cutoff = this.now() - maxSilentMs
+    const out = []
+    for (const record of this.records.values()) {
+      if (record.saved) continue
+      if (record.discoveryState !== 'Discovered') continue
+      if (Number(record.lastSeen || 0) > cutoff) continue
+      if (record.reachability !== 'dead') record.reachability = 'silent'
+      out.push(publicRecord(record, this.localAddresses))
+    }
+    return out
+  }
+
+  markProbeResult(canonicalId, ok) {
+    const record = this.records.get(canonicalId)
+    if (!record) return null
+    if (ok) {
+      record.reachability = 'ok'
+      record.lastSeen = this.now()
+    } else {
+      record.reachability = 'dead'
+      record.discoveryState = 'Stale'
+      for (const endpoint of record.endpoints.values()) endpoint.available = false
+      if (!record.saved && record.connectionState !== CONNECTION_STATES.CONNECTED) {
+        record.connectionState = CONNECTION_STATES.UNAVAILABLE
+      }
     }
     return publicRecord(record, this.localAddresses)
   }
@@ -864,6 +942,17 @@ export class DeviceRegistry {
         : CONNECTION_STATES.UNAVAILABLE
       if (record.discoveryState !== 'Discovered') {
         this.records.delete(record.canonicalId)
+        // Clean the lookup indexes like pruneStale does, so a later service
+        // reusing the same endpoint/fqdn key cannot resolve to a ghost id.
+        for (const endpoint of record.endpoints.values()) {
+          const key = endpointKey(endpoint.host, endpoint.port)
+          if (this.endpointIndex.get(key) === record.canonicalId) {
+            this.endpointIndex.delete(key)
+          }
+          if (endpoint.fqdn && this.fqdnIndex.get(endpoint.fqdn) === record.canonicalId) {
+            this.fqdnIndex.delete(endpoint.fqdn)
+          }
+        }
       }
       return true
     }
