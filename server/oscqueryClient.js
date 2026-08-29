@@ -16,6 +16,13 @@
 import WebSocket from 'ws'
 import osc from 'osc'
 
+// Defensive caps applied to a remote device's namespace JSON. A buggy or
+// hostile OSCQuery server on the LAN must not be able to balloon hub memory
+// or blow the stack with a pathological tree.
+export const MAX_NAMESPACE_BYTES = 2 * 1024 * 1024 // 2 MB
+export const MAX_NAMESPACE_DEPTH = 12
+export const MAX_NAMESPACE_NODES = 10_000
+
 export class OscQueryClient {
   /**
    * @param {string} host
@@ -48,6 +55,22 @@ export class OscQueryClient {
     this.reconnectDelayMs = options.reconnectDelayMs ?? 3000
     this.disconnectReconnectDelayMs = options.disconnectReconnectDelayMs ?? 500
     this.attemptTimeoutMs = options.attemptTimeoutMs ?? 3000
+    // Exponential backoff cap for post-`everConnected` retries. Without it a
+    // venue-wide power cut turns the hub into a 2 Hz HTTP hammer per device.
+    this.reconnectBackoffMaxMs = options.reconnectBackoffMaxMs ?? 5000
+    // WS keepalive: ping every keepaliveIntervalMs; after keepaliveMaxMissed
+    // unanswered pings the socket is considered half-open and terminated so
+    // the normal reconnect path takes over. Devices only need to answer
+    // standard WS pings (the ws library and our VSTs do this automatically).
+    this.keepaliveIntervalMs = options.keepaliveIntervalMs ?? 5000
+    this.keepaliveMaxMissed = options.keepaliveMaxMissed ?? 2
+    this.hostInfoRetryBaseMs = options.hostInfoRetryBaseMs ?? 1000
+    this.hostInfoRetryMaxMs = options.hostInfoRetryMaxMs ?? 10_000
+    this.random = options.random ?? Math.random
+    this.keepaliveTimer = null
+    this.missedPongs = 0
+    this.hostInfoRetryTimer = null
+    this.consecutiveRetryFailures = 0
     this.connectAttempt = 0
     this.fetchControllers = new Set()
     this.attemptTimer = null
@@ -75,6 +98,7 @@ export class OscQueryClient {
     const controller = new AbortController()
     this.fetchControllers.add(controller)
     this._clearAttemptTimer()
+    this._clearHostInfoRetry()
     this.attemptTimer = setTimeout(() => {
       this._failAttempt(attempt, `Connection timed out after ${this.attemptTimeoutMs} ms`, true)
     }, this.attemptTimeoutMs)
@@ -91,8 +115,18 @@ export class OscQueryClient {
       if (!this._isCurrentAttempt(attempt)) return
 
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const tree = await res.json()
+      // Enforce the byte cap BEFORE parsing. Content-Length lets us reject
+      // early; the decoded text length is the authoritative check.
+      const contentLength = Number(res.headers?.get?.('content-length'))
+      if (Number.isFinite(contentLength) && contentLength > MAX_NAMESPACE_BYTES) {
+        throw new Error(`Namespace JSON too large (${contentLength} bytes > ${MAX_NAMESPACE_BYTES})`)
+      }
+      const text = await res.text()
       if (!this._isCurrentAttempt(attempt)) return
+      if (Buffer.byteLength(text, 'utf-8') > MAX_NAMESPACE_BYTES) {
+        throw new Error(`Namespace JSON too large (> ${MAX_NAMESPACE_BYTES} bytes)`)
+      }
+      const tree = JSON.parse(text)
       this.lastNamespace = tree
 
       // Build the flat metadata table the hub broadcasts to the UI.
@@ -112,20 +146,24 @@ export class OscQueryClient {
     }
   }
 
-  async _fetchHostInfo(attempt) {
+  async _fetchHostInfo(attempt, retryCount = 0) {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), Math.min(2000, this.attemptTimeoutMs))
     this.fetchControllers.add(controller)
+    let received = false
     try {
       const infoUrl = `http://${this.host}:${this.port}/?HOST_INFO`
       const infoRes = await fetch(infoUrl, { signal: controller.signal })
-      if (!this._isCurrentAttempt(attempt) || !infoRes.ok) return
-      const info = await infoRes.json()
       if (!this._isCurrentAttempt(attempt)) return
-      if (info && (info.OSC_PORT || info.OSC_TRANSPORT || info.NAME)) {
-        this.hostInfo = info
-        if (info.OSC_PORT) this.oscPort = Number(info.OSC_PORT)
-        this.events.onHostInfo?.(info)
+      if (infoRes.ok) {
+        const info = await infoRes.json()
+        if (!this._isCurrentAttempt(attempt)) return
+        if (info && (info.OSC_PORT || info.OSC_TRANSPORT || info.NAME)) {
+          received = true
+          this.hostInfo = info
+          if (info.OSC_PORT) this.oscPort = Number(info.OSC_PORT)
+          this.events.onHostInfo?.(info)
+        }
       }
     } catch {
       // HOST_INFO is optional; namespace + WebSocket remain authoritative.
@@ -133,6 +171,31 @@ export class OscQueryClient {
       clearTimeout(timeout)
       this.fetchControllers.delete(controller)
     }
+    // A single failed HOST_INFO fetch must not leave the device without an
+    // OSC UDP port for the whole WS session (writes would have nowhere safe
+    // to go). Keep retrying with backoff while this attempt stays current.
+    if (!received && this._isCurrentAttempt(attempt)) {
+      this._scheduleHostInfoRetry(attempt, retryCount + 1)
+    }
+  }
+
+  _scheduleHostInfoRetry(attempt, retryCount) {
+    if (this.hostInfoRetryTimer) return
+    const delay = Math.min(
+      this.hostInfoRetryBaseMs * 2 ** Math.max(0, retryCount - 1),
+      this.hostInfoRetryMaxMs
+    )
+    this.hostInfoRetryTimer = setTimeout(() => {
+      this.hostInfoRetryTimer = null
+      if (!this._isCurrentAttempt(attempt)) return
+      this._fetchHostInfo(attempt, retryCount)
+    }, delay)
+  }
+
+  _clearHostInfoRetry() {
+    if (!this.hostInfoRetryTimer) return
+    clearTimeout(this.hostInfoRetryTimer)
+    this.hostInfoRetryTimer = null
   }
 
   _isCurrentAttempt(attempt) {
@@ -149,6 +212,8 @@ export class OscQueryClient {
     if (!this._isCurrentAttempt(attempt) || this.failedAttempt === attempt) return
     this.failedAttempt = attempt
     this._clearAttemptTimer()
+    this._clearHostInfoRetry()
+    this._stopKeepalive()
     for (const controller of this.fetchControllers) controller.abort()
     this.fetchControllers.clear()
     const ws = this.ws
@@ -157,11 +222,64 @@ export class OscQueryClient {
       try { ws.terminate() } catch {}
     }
     this.connected = false
+    this.consecutiveRetryFailures++
     this.events.onLog(reason)
     this.events.onAttemptFailed?.(reason, { timeout })
-    this._scheduleReconnect(
-      this.everConnected ? this.disconnectReconnectDelayMs : this.reconnectDelayMs
+    this._scheduleReconnect(this._nextReconnectDelay())
+  }
+
+  /**
+   * Reconnect delay for the current failure streak. Before the first
+   * successful connection the slower `reconnectDelayMs` applies unchanged.
+   * After `everConnected`, retries start at `disconnectReconnectDelayMs`
+   * (fast recovery from a blip) and back off exponentially with jitter up to
+   * `reconnectBackoffMaxMs` so an extended outage does not hammer the device.
+   */
+  _nextReconnectDelay() {
+    if (!this.everConnected) return this.reconnectDelayMs
+    return this._reconnectDelayForFailureCount(this.consecutiveRetryFailures)
+  }
+
+  _reconnectDelayForFailureCount(failures) {
+    const exponent = Math.max(0, Math.min(failures - 1, 10))
+    const base = Math.min(
+      this.disconnectReconnectDelayMs * 2 ** exponent,
+      this.reconnectBackoffMaxMs
     )
+    const jitter = Math.floor(base * 0.2 * this.random())
+    return Math.min(base + jitter, this.reconnectBackoffMaxMs)
+  }
+
+  _startKeepalive(ws) {
+    this._stopKeepalive()
+    this.missedPongs = 0
+    if (!(this.keepaliveIntervalMs > 0)) return
+    this.keepaliveTimer = setInterval(() => {
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) {
+        this._stopKeepalive()
+        return
+      }
+      if (this.missedPongs >= this.keepaliveMaxMissed) {
+        this.events.onLog(
+          `Keepalive: ${this.missedPongs} pings unanswered — terminating half-open WS`
+        )
+        this._stopKeepalive()
+        // terminate() emits 'close', which drives the normal disconnect and
+        // reconnect path.
+        try { ws.terminate() } catch {}
+        return
+      }
+      this.missedPongs++
+      try { ws.ping() } catch {}
+    }, this.keepaliveIntervalMs)
+    if (typeof this.keepaliveTimer.unref === 'function') this.keepaliveTimer.unref()
+  }
+
+  _stopKeepalive() {
+    if (!this.keepaliveTimer) return
+    clearInterval(this.keepaliveTimer)
+    this.keepaliveTimer = null
+    this.missedPongs = 0
   }
 
   _collectPaths(node) {
@@ -176,9 +294,16 @@ export class OscQueryClient {
   }
 
   // Walk the tree and push every leaf (any node with a TYPE) into out[] as a
-  // compact node descriptor. Keeps just the fields the UI needs.
-  _collectNodes(node, out) {
+  // compact node descriptor. Keeps just the fields the UI needs. Depth and
+  // node-count caps bound recursion against pathological remote trees.
+  _collectNodes(node, out, depth = 0) {
+    if (depth > MAX_NAMESPACE_DEPTH) {
+      throw new Error(`Namespace tree exceeds max depth ${MAX_NAMESPACE_DEPTH}`)
+    }
     if (node.TYPE !== undefined && node.FULL_PATH) {
+      if (out.length >= MAX_NAMESPACE_NODES) {
+        throw new Error(`Namespace tree exceeds max node count ${MAX_NAMESPACE_NODES}`)
+      }
       out.push({
         FULL_PATH: node.FULL_PATH,
         TYPE: node.TYPE,
@@ -190,7 +315,9 @@ export class OscQueryClient {
       })
     }
     if (node.CONTENTS) {
-      for (const child of Object.values(node.CONTENTS)) this._collectNodes(child, out)
+      for (const child of Object.values(node.CONTENTS)) {
+        this._collectNodes(child, out, depth + 1)
+      }
     }
   }
 
@@ -219,9 +346,16 @@ export class OscQueryClient {
         this._clearAttemptTimer()
         this.connected = true
         this.everConnected = true
+        this.consecutiveRetryFailures = 0
+        this._startKeepalive(ws)
         this.events.onLog(`WebSocket open · sending LISTEN for ${paths.length} paths`)
         this.events.onConnect()
         for (const path of paths) this._listen(path)
+      })
+
+      ws.on('pong', () => {
+        if (this.ws !== ws) return
+        this.missedPongs = 0
       })
 
       // Critical: also catch binary frames. TouchDesigner-style servers send
@@ -252,10 +386,16 @@ export class OscQueryClient {
         if (this.ws !== ws || !this._isCurrentAttempt(attempt)) return
         this.ws = null
         this.connected = false
+        this._stopKeepalive()
+        this._clearHostInfoRetry()
+        // A dropped connection invalidates any cached HOST_INFO: a restarted
+        // device usually rebinds a new ephemeral OSC UDP port, and writing to
+        // the old one would silently vanish.
+        this.hostInfo = null
         if (this.everConnected) {
           this._clearAttemptTimer()
           this.events.onDisconnect(`WS closed (code ${code})`)
-          this._scheduleReconnect(this.disconnectReconnectDelayMs)
+          this._scheduleReconnect(this._nextReconnectDelay())
         } else {
           this._failAttempt(attempt, `WebSocket closed before connect (code ${code})`, false)
         }
@@ -263,9 +403,7 @@ export class OscQueryClient {
     } catch (err) {
       if (!this._isCurrentAttempt(attempt)) return
       this.events.onLog(`WS open error: ${err.message}`)
-      this._scheduleReconnect(
-        this.everConnected ? this.disconnectReconnectDelayMs : this.reconnectDelayMs
-      )
+      this._scheduleReconnect(this._nextReconnectDelay())
     }
   }
 
@@ -306,6 +444,17 @@ export class OscQueryClient {
     // Single message.
     if (packet.address && packet.args !== undefined) {
       const args = Array.isArray(packet.args) ? packet.args : [packet.args]
+      // Zero-argument frame: old Android builds emit an empty typetag for a
+      // TRUE toggle (bang/impulse semantics). Map it onto the declared node
+      // TYPE when that node is boolean-typed; drop it otherwise instead of
+      // fabricating a `value: []` string parameter that renders as false.
+      if (args.length === 0) {
+        const declaredType = this.nodeTypes.get(packet.address)
+        if (typeof declaredType === 'string' && /^[TF]$/.test(declaredType)) {
+          this._emitValue(packet.address, true, [{ type: 'T' }], 'T')
+        }
+        return
+      }
       const hasWireMetadata = args.every(
         (arg) => arg && typeof arg === 'object' && typeof arg.type === 'string' && 'value' in arg
       )
@@ -367,6 +516,9 @@ export class OscQueryClient {
     this.shouldReconnect = false
     this.connectAttempt++
     this._clearAttemptTimer()
+    this._clearHostInfoRetry()
+    this._stopKeepalive()
+    this.hostInfo = null
     for (const controller of this.fetchControllers) controller.abort()
     this.fetchControllers.clear()
     if (this.reconnectTimer) {
