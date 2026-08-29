@@ -13,7 +13,11 @@ const portSummary = computed(() => {
 </script>
 
 <template>
-  <section class="server-control" aria-label="Manager Bridge controls">
+  <section
+    class="server-control"
+    aria-label="Manager Bridge controls"
+    title="Node Manager/OSCQuery köprüsünü kontrol eder. Ableton ve VST instance'ları host'a aittir."
+  >
     <div class="server-control-main">
       <div class="server-control-label">Manager Bridge</div>
       <div class="server-control-state" :class="stateClass">
@@ -28,6 +32,5 @@ const portSummary = computed(() => {
       <button class="hub-btn hub-btn-primary" :disabled="busy" @click="restart">Restart</button>
     </div>
     <div v-if="status.error" class="server-control-error">{{ status.error }}</div>
-    <div class="server-control-note">Controls the Node Manager/OSCQuery bridge. Ableton and VST instances remain host-owned.</div>
   </section>
 </template>

@@ -165,6 +165,8 @@ const manualName = ref('')
 const manualHost = ref('')
 const manualPort = ref('')
 const manualErr  = ref('')
+// Rarely used on the fixed rig — the form stays folded behind a toggle.
+const showManualAdd = ref(false)
 
 const canManualAdd = computed(() => {
   const host = String(manualHost.value || '').trim()
@@ -462,14 +464,14 @@ watch(devices, (list) => {
       </div>
       <div class="hub-topbar-spacer"></div>
       <button
-        class="hub-rediscover-btn"
+        class="hub-rediscover-btn icon-only"
         type="button"
-        title="Download the current manifest set as a JSON preset. Restore it later via Import."
+        title="Export — manifest setini JSON olarak indir (Import ile geri yüklenir)"
+        aria-label="Export manifests"
         @click="onExportClick"
         :disabled="devices.length === 0"
       >
         <span class="hub-rediscover-icon">⬇</span>
-        Export
       </button>
       <input
         ref="importInputRef"
@@ -479,23 +481,23 @@ watch(devices, (list) => {
         @change="onImportFile"
       />
       <button
-        class="hub-rediscover-btn"
+        class="hub-rediscover-btn icon-only"
         type="button"
-        title="Load a previously exported manifest preset. Replaces the current set."
+        title="Import — dışa aktarılmış manifest setini yükle (mevcut seti değiştirir)"
+        aria-label="Import manifests"
         @click="onImportClick"
       >
         <span class="hub-rediscover-icon">⬆</span>
-        Import
       </button>
       <button
-        class="hub-rediscover-btn"
+        class="hub-rediscover-btn icon-only"
         :class="{ spinning: rediscovering }"
         type="button"
-        title="Rebuild the helper's network discovery cache (equivalent of restarting npm run dev). Use when a device has renamed/changed port and isn't showing up."
+        title="Rediscover — ağ keşif önbelleğini yeniden kur (cihaz ad/port değiştirip görünmüyorsa)"
+        aria-label="Rediscover network"
         @click="onRediscoverClick"
       >
         <span class="hub-rediscover-icon">⟳</span>
-        Rediscover
       </button>
       <div class="ws-badge" :class="{ connected }">
         <span class="dot"></span>
@@ -508,36 +510,28 @@ watch(devices, (list) => {
     <main class="hub-main" :class="{ 'hub-stale': !connected }">
       <ServerControl />
 
-      <!-- Stats row -->
-      <div class="stats-row">
-        <div class="stat-card">
-          <div class="stat-num">{{ statTotal }}</div>
-          <div class="stat-label">Total Devices</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-num">{{ statActive }}</div>
-          <div class="stat-label">Active</div>
-        </div>
-        <div class="stat-card" :class="statTotal > 0 ? (statConn === statActive ? 'stat-ok' : 'stat-warn') : ''">
-          <div class="stat-num">{{ statConn }}<span class="stat-of">/{{ statActive }}</span></div>
-          <div class="stat-label">Connected / Active</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-num">{{ statParams }}</div>
-          <div class="stat-label">Parameters</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-num">{{ msgsThisSecond }}</div>
-          <div class="stat-label">Msg / s</div>
-        </div>
+      <!-- Stats strip — one slim line instead of five cards. The connected
+           count keeps its ok/warn color: that is the number that matters. -->
+      <div class="stats-strip">
+        <span class="ss-item"><b>{{ statTotal }}</b> cihaz</span>
+        <span class="ss-sep">·</span>
+        <span class="ss-item"><b>{{ statActive }}</b> aktif</span>
+        <span class="ss-sep">·</span>
+        <span class="ss-item" :class="statTotal > 0 ? (statConn === statActive ? 'ss-ok' : 'ss-warn') : ''">
+          <b>{{ statConn }}/{{ statActive }}</b> bağlı
+        </span>
+        <span class="ss-sep">·</span>
+        <span class="ss-item"><b>{{ statParams }}</b> parametre</span>
+        <span class="ss-sep">·</span>
+        <span class="ss-item"><b>{{ msgsThisSecond }}</b> msg/s</span>
       </div>
 
       <!-- Scenes (global snapshot recall) -->
       <div class="section-header">
-        <div class="section-title">Scenes</div>
-        <div class="section-hint">
-          Snapshot current state of every device · click a chip to recall · ⟳ overwrite · ✎ rename · × delete
-        </div>
+        <div
+          class="section-title"
+          title="Tüm cihazların anlık durumunu kaydeder · çipe tıkla: geri çağır · ⟳ üstüne yaz · ✎ yeniden adlandır · × sil"
+        >Scenes</div>
       </div>
       <SceneBar
         :scenes="scenes"
@@ -549,54 +543,59 @@ watch(devices, (list) => {
         @reorder="({ from, to }) => reorderScene(from, to)"
       />
 
+      <!-- Manual add — rare on the fixed rig, folded behind a toggle. -->
       <div class="section-header manifest-header">
-        <div class="section-title-group">
-          <div class="section-title">Add Device Manually</div>
-          <div class="section-hint">
-            Discovery misses a device only: save it by host and OSCQuery port.
-          </div>
-        </div>
-        <div class="manual-add-row inline" title="Register a device manually by IP + port when discovery misses it. Saved to manifests just like the others.">
-          <input
-            v-model="manualName"
-            type="text"
-            class="manual-add-input manual-add-name"
-            placeholder="Name (optional)"
-            maxlength="64"
-            @keydown.enter="canManualAdd && onManualAddClick()"
-          />
-          <input
-            v-model="manualHost"
-            type="text"
-            class="manual-add-input manual-add-host"
-            placeholder="192.168.1.42"
-            @keydown.enter="canManualAdd && onManualAddClick()"
-          />
-          <input
-            v-model="manualPort"
-            type="number"
-            class="manual-add-input manual-add-port"
-            placeholder="Port"
-            min="1"
-            max="65535"
-            @keydown.enter="canManualAdd && onManualAddClick()"
-          />
-          <button
-            type="button"
-            class="manual-add-btn"
-            :disabled="!canManualAdd"
-            @click="onManualAddClick"
-          >
-            + Add
-          </button>
-          <span v-if="manualErr" class="manual-add-err">{{ manualErr }}</span>
-        </div>
+        <div
+          class="section-title"
+          title="Discovery bir cihazı kaçırırsa: host + OSCQuery portu ile elle kaydet. Manifest'e diğerleri gibi yazılır."
+        >Devices</div>
+        <button
+          type="button"
+          class="manual-add-toggle"
+          :class="{ active: showManualAdd }"
+          title="Discovery bir cihazı kaçırırsa: host + OSCQuery portu ile elle kaydet"
+          @click="showManualAdd = !showManualAdd"
+        >{{ showManualAdd ? '× Kapat' : '+ Manuel Ekle' }}</button>
+      </div>
+      <div v-show="showManualAdd" class="manual-add-row">
+        <input
+          v-model="manualName"
+          type="text"
+          class="manual-add-input manual-add-name"
+          placeholder="Name (optional)"
+          maxlength="64"
+          @keydown.enter="canManualAdd && onManualAddClick()"
+        />
+        <input
+          v-model="manualHost"
+          type="text"
+          class="manual-add-input manual-add-host"
+          placeholder="192.168.1.42"
+          @keydown.enter="canManualAdd && onManualAddClick()"
+        />
+        <input
+          v-model="manualPort"
+          type="number"
+          class="manual-add-input manual-add-port"
+          placeholder="Port"
+          min="1"
+          max="65535"
+          @keydown.enter="canManualAdd && onManualAddClick()"
+        />
+        <button
+          type="button"
+          class="manual-add-btn"
+          :disabled="!canManualAdd"
+          @click="onManualAddClick"
+        >
+          + Add
+        </button>
+        <span v-if="manualErr" class="manual-add-err">{{ manualErr }}</span>
       </div>
 
       <section v-for="group in deviceGroups" :key="group.key" class="device-group">
         <div class="section-header">
-          <div class="section-title">{{ group.title }}</div>
-          <div class="section-hint">{{ group.hint }}</div>
+          <div class="section-title" :title="group.hint">{{ group.title }}</div>
         </div>
         <div class="devices-grid">
           <div v-if="group.devices.length === 0" class="empty">{{ group.empty }}</div>

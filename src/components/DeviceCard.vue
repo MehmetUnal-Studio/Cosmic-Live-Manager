@@ -53,6 +53,27 @@ function onRemove() {
 //     the card. Once open, "Parameters" and "Announce" can be toggled freely.
 const expanded = ref(false)
 
+// ─── Whole-card collapse (minimal UI) ───────────────────────────────────
+// The compact header carries identity + status + LINK health; everything
+// else (host row, actions, presets, params, LINK panel, recordings) lives
+// in a body that opens on demand. Open state persists per device so a
+// reload lands on the same layout.
+const CARD_OPEN_KEY = 'clm:hub-card-open'
+function loadCardOpenMap() {
+  try { return JSON.parse(localStorage.getItem(CARD_OPEN_KEY) || '{}') || {} } catch { return {} }
+}
+const cardOpenKey = computed(() => String(props.device.canonicalId || props.device.id))
+const cardOpen = ref(!!loadCardOpenMap()[String(props.device.canonicalId || props.device.id)])
+function toggleCardOpen() {
+  cardOpen.value = !cardOpen.value
+  try {
+    const all = loadCardOpenMap()
+    if (cardOpen.value) all[cardOpenKey.value] = true
+    else delete all[cardOpenKey.value]
+    localStorage.setItem(CARD_OPEN_KEY, JSON.stringify(all))
+  } catch { /* storage unavailable */ }
+}
+
 // ─── Editable header fields ──────────────────────────────────────────────
 const draftName = ref(props.device.name)
 const draftHost = ref(props.device.host)
@@ -320,7 +341,7 @@ onMounted(() => {
     if (msgActiveTimer) clearTimeout(msgActiveTimer)
     msgActiveTimer = setTimeout(() => { msgActive.value = false }, 180)
     // Value flash — only pay for it while the params list can be seen.
-    if (expanded.value && relPath) flashPath(relPath)
+    if (cardOpen.value && expanded.value && relPath) flashPath(relPath)
   })
 })
 onBeforeUnmount(() => {
@@ -654,6 +675,17 @@ function onClearLink() {
   emit('clear-link')
 }
 
+// Compact LINK health glyph for the collapsed header — same data as
+// autoLinkStatus, one character wide.
+const linkGlyph = computed(() => {
+  if (!savedLink.value) return null
+  const target = savedLinkTargetLabel.value
+  const a = props.device.autoLink
+  if (!a || a.state === 'pending') return { cls: 'pending', icon: '⋯', title: `LINK → ${target}: hedef bekleniyor` }
+  if (a.state === 'ok') return { cls: 'ok', icon: '✓', title: `LINK → ${target}: ${a.summary || 'otomatik bağlı'}` }
+  return { cls: 'err', icon: '✗', title: `LINK → ${target}: ${a.error || 'otomatik bağlantı başarısız'}` }
+})
+
 // ─── Status visuals ─────────────────────────────────────────────────────
 const statusClass = computed(() => {
   if (!props.device.enabled) return 'disabled'
@@ -675,6 +707,11 @@ const connectionLabel = computed(() => {
   const port = props.device.activeEndpoint?.port || props.device.port || props.device.oscQueryPort
   return `${props.device.serviceName || props.device.name} · Port ${port}`
 })
+// The fixed-rig port (5001–5005) is identity for the operator — keep it in
+// the compact meta line even when everything else is collapsed.
+const displayPort = computed(() =>
+  props.device.activeEndpoint?.port || props.device.port || props.device.oscQueryPort
+)
 const deviceTypeLabel = computed(() => isMaxRingReceiver.value
   ? 'ABLETON / MAX'
   : isCosmicRingReceiver.value
@@ -690,7 +727,7 @@ const paramCount = computed(() => {
 </script>
 
 <template>
-  <div class="device-card" :class="[statusClass, { 'identity-collision': identityCollision }]">
+  <div class="device-card" :class="[statusClass, { 'identity-collision': identityCollision, 'card-collapsed': !cardOpen }]">
     <button
       v-if="isSaved"
       class="device-remove"
@@ -712,11 +749,49 @@ const paramCount = computed(() => {
             @keydown.enter.prevent="$event.target.blur()"
             spellcheck="false"
           />
+          <span
+            v-if="linkGlyph"
+            class="device-link-glyph"
+            :class="linkGlyph.cls"
+            :title="linkGlyph.title"
+          >{{ linkGlyph.icon }}</span>
+          <span v-if="msgCount > 0" class="device-msgs">
+            <span
+              class="msg-activity-dot"
+              :class="{ active: msgActive }"
+              title="Lights up on each incoming OSC message"
+            ></span>
+            {{ msgCount }}
+          </span>
+          <button
+            class="device-expand-btn"
+            :class="{ open: cardOpen }"
+            type="button"
+            :title="cardOpen ? 'Detayları gizle' : 'Detayları göster'"
+            :aria-expanded="cardOpen ? 'true' : 'false'"
+            @click.stop="toggleCardOpen"
+          ><span class="hub-chevron">▶</span></button>
         </div>
-        <div class="device-type">
-          {{ deviceTypeLabel }}
+        <!-- One-line summary: type · port · status. Clicking it toggles the
+             body — the whole line is the touch target on a dark stage. -->
+        <button class="device-meta-line" type="button" :title="connectionLabel" @click="toggleCardOpen">
+          <span class="device-meta-type">{{ deviceTypeLabel }}</span>
+          <span class="device-meta-sep">·</span>
+          <span class="device-meta-port">:{{ displayPort }}</span>
+          <span class="device-meta-sep">·</span>
+          <span class="device-status-text device-meta-status" :class="statusClass">{{ statusLabel }}</span>
+          <span
+            v-if="reachability === 'silent'"
+            class="device-reach-badge"
+            title="Bağlantı açık ama cihazdan veri gelmiyor"
+          >SESSİZ</span>
+          <span
+            v-else-if="reachability === 'dead'"
+            class="device-reach-badge dead"
+            title="Cihaz yanıt vermiyor"
+          >YANIT YOK</span>
           <span v-if="identityCollision" class="device-collision-badge">Kimlik Çakışması</span>
-        </div>
+        </button>
       </div>
     </div>
 
@@ -734,8 +809,18 @@ const paramCount = computed(() => {
       </div>
     </div>
 
-    <div class="device-connection-summary">{{ connectionLabel }}</div>
+    <!-- Faults and save feedback must not hide behind the collapse. -->
+    <div v-if="device.error" class="device-error-text">{{ device.error }}</div>
+    <div v-if="hint?.text" class="save-hint" :class="hint?.type || ''">{{ hint.text }}</div>
 
+    <!-- Discovered cards keep their one meaningful action visible. -->
+    <div v-if="!isSaved" class="device-actions">
+      <button class="hub-btn hub-btn-primary" @click="emit('save', draftName)">
+        + Save Device
+      </button>
+    </div>
+
+    <div v-show="cardOpen" class="device-body">
     <details class="device-technical-details">
       <summary>Details</summary>
       <div v-if="isSaved" class="device-host-row">
@@ -766,31 +851,8 @@ const paramCount = computed(() => {
     </details>
 
     <div class="device-footer">
-      <div class="device-status-row">
-        <span class="device-status-text" :class="statusClass">{{ statusLabel }}</span>
-        <span
-          v-if="reachability === 'silent'"
-          class="device-reach-badge"
-          title="Bağlantı açık ama cihazdan veri gelmiyor"
-        >SESSİZ</span>
-        <span
-          v-else-if="reachability === 'dead'"
-          class="device-reach-badge dead"
-          title="Cihaz yanıt vermiyor"
-        >YANIT YOK</span>
-        <span v-if="msgCount > 0" class="device-msgs">
-          <span
-            class="msg-activity-dot"
-            :class="{ active: msgActive }"
-            title="Lights up on each incoming OSC message"
-          ></span>
-          {{ msgCount }}
-        </span>
-      </div>
-
-      <div class="device-actions">
+      <div v-if="isSaved" class="device-actions">
         <button
-          v-if="isSaved"
           class="hub-btn"
           :class="{ 'hub-btn-primary': device.enabled, pending: enablePending }"
           :disabled="enablePending"
@@ -801,17 +863,10 @@ const paramCount = computed(() => {
             ? ((pendingDesired ?? !device.enabled) ? 'Açılıyor…' : 'Kapatılıyor…')
             : (device.enabled ? 'Enabled' : 'Enable') }}
         </button>
-        <button v-if="isSaved" class="hub-btn" :disabled="!device.enabled" @click="emit('reconnect')">
+        <button class="hub-btn" :disabled="!device.enabled" @click="emit('reconnect')">
           ⟳ Tekrar Dene
         </button>
-        <button v-else class="hub-btn hub-btn-primary" @click="emit('save', draftName)">
-          + Save Device
-        </button>
       </div>
-
-      <div v-if="device.error" class="device-error-text">{{ device.error }}</div>
-
-      <div class="save-hint" :class="hint?.type || ''">{{ hint?.text || '' }}</div>
 
       <template v-if="isSaved">
       <!-- ─── Presets ─── -->
@@ -988,6 +1043,7 @@ const paramCount = computed(() => {
       <RecordingPanel :rec="recording" />
       </template>
 
+    </div>
     </div>
   </div>
 </template>

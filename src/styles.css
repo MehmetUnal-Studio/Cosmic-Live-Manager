@@ -2340,3 +2340,115 @@ details.row-section summary {
 /* Enable button pending state */
 .hub-btn.pending { opacity: 0.6; cursor: progress; }
 .hub-btn.pending .hub-btn-icon { animation: hub-rediscover-spin 0.8s linear infinite; }
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Minimal mode — compact cards + slim chrome. Only identity, status and
+   faults stay visible; everything else opens on demand.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ─── Stats strip: one line instead of five cards ─── */
+.stats-strip {
+  display: flex; align-items: baseline; flex-wrap: wrap;
+  gap: 0.5rem 0.65rem;
+  padding: 0.55rem 1rem;
+  margin-bottom: 1.25rem;
+  border: 1px solid var(--hub-border);
+  border-radius: var(--hub-radius-sm);
+  background: var(--hub-surface);
+  font-family: var(--hub-mono); font-size: 12px;
+  color: var(--hub-ink-dim);
+}
+.stats-strip .ss-item b {
+  color: var(--hub-accent); font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.stats-strip .ss-item.ss-ok b   { color: var(--hub-green); }
+.stats-strip .ss-item.ss-warn b { color: var(--hub-yellow); }
+.stats-strip .ss-sep { opacity: 0.4; }
+
+/* ─── Icon-only topbar buttons ─── */
+.hub-rediscover-btn.icon-only {
+  padding: 0.3rem 0.45rem;
+  margin-right: 0.25rem;
+}
+
+/* ─── Manual add toggle ─── */
+.manual-add-toggle {
+  background: transparent;
+  border: 1px dashed var(--hub-border);
+  border-radius: 999px;
+  color: var(--hub-ink-dim);
+  font: inherit; font-size: 0.68rem; letter-spacing: 0.05em;
+  padding: 0.25rem 0.75rem;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.manual-add-toggle:hover,
+.manual-add-toggle.active { color: var(--hub-accent); border-color: rgba(91,184,255,0.45); }
+
+/* ─── Compact device card ─── */
+.device-card.card-collapsed { padding: 0.85rem 1rem 0.75rem; }
+.device-card.card-collapsed .device-header { margin-bottom: 0; }
+.device-name-row { padding-right: 20px; } /* keep clear of the absolute × */
+
+.device-link-glyph {
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 50%;
+  font-family: var(--hub-mono); font-size: 11px; line-height: 1;
+  color: var(--hub-ink-dim);
+  border: 1px solid var(--hub-border);
+  background: var(--hub-surface-2);
+  cursor: help;
+}
+.device-link-glyph.ok {
+  color: var(--hub-green);
+  border-color: rgba(61,220,132,0.45);
+  background: rgba(61,220,132,0.10);
+}
+.device-link-glyph.err {
+  color: var(--hub-red);
+  border-color: rgba(255,122,110,0.5);
+  background: rgba(255,122,110,0.10);
+}
+
+.device-expand-btn {
+  flex: 0 0 auto;
+  background: transparent; border: none;
+  padding: 2px 4px;
+  cursor: pointer; line-height: 1;
+}
+.device-expand-btn .hub-chevron { font-size: 11px; }
+.device-expand-btn:hover .hub-chevron { color: var(--hub-ink); }
+.device-expand-btn.open .hub-chevron { transform: rotate(90deg); }
+
+/* One-line summary under the name; the whole line toggles the body. */
+.device-meta-line {
+  width: 100%;
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: 0.15rem 0.4rem;
+  background: transparent; border: none; padding: 0;
+  margin-top: 0.2rem;
+  cursor: pointer; text-align: left;
+  font-family: var(--hub-mono); font-size: 0.65rem;
+  color: var(--hub-ink-dim);
+}
+.device-meta-line:hover .device-meta-type { color: var(--hub-ink-mid); }
+.device-meta-type {
+  text-transform: uppercase; letter-spacing: 0.1em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 45%;
+}
+.device-meta-port { color: var(--hub-cyan); }
+.device-meta-sep { opacity: 0.45; }
+.device-meta-line .device-meta-status {
+  font-size: 0.62rem; letter-spacing: 0.06em;
+}
+.device-meta-line .device-reach-badge { font-size: 9px; padding: 1px 6px; }
+.device-meta-line .device-collision-badge { font-size: 9px; padding: 1px 6px; }
+
+.device-body { margin-top: 0.75rem; }
+.device-card .save-hint { text-align: left; height: auto; margin-top: 0.35rem; }
+.device-card > .device-error-text { margin-top: 0.5rem; }
+.device-card > .device-actions { margin-top: 0.65rem; margin-bottom: 0; }
+.device-card .device-collision-banner { margin-top: 0.65rem; }
