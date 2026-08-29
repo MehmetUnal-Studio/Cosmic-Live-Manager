@@ -10,7 +10,8 @@
 //   4. Inbound frames may be JSON (OSCQuery commands) or binary OSC packets
 //      (TouchDesigner-style devices push raw OSC over the WS). Both are
 //      decoded and reported via onValue(path, value).
-//   5. If the WS drops, auto-reconnect every 3 seconds.
+//   5. If an established WS drops, retry quickly; ordinary connection failures
+//      keep the slower retry interval.
 
 import WebSocket from 'ws'
 import osc from 'osc'
@@ -22,18 +23,32 @@ export class OscQueryClient {
    * @param {{
    *   onConnect: () => void,
    *   onDisconnect: (reason: string) => void,
+   *   onAttemptFailed?: (reason: string, details: { timeout: boolean }) => void,
    *   onValue: (path: string, value: any) => void,
    *   onLog: (msg: string) => void,
    * }} events
+   * @param {{
+   *   reconnectDelayMs?: number,
+   *   disconnectReconnectDelayMs?: number,
+   *   attemptTimeoutMs?: number
+   * }} options
    */
-  constructor(host, port, events) {
+  constructor(host, port, events, options = {}) {
     this.host = host
     this.port = port
     this.events = events
     this.ws = null
     this.connected = false
+    this.everConnected = false
     this.reconnectTimer = null
     this.shouldReconnect = true
+    this.reconnectDelayMs = options.reconnectDelayMs ?? 3000
+    this.disconnectReconnectDelayMs = options.disconnectReconnectDelayMs ?? 500
+    this.attemptTimeoutMs = options.attemptTimeoutMs ?? 3000
+    this.connectAttempt = 0
+    this.fetchControllers = new Set()
+    this.attemptTimer = null
+    this.failedAttempt = 0
     this.listenedPaths = new Set()
     this.debugCount = 0
     this.lastNamespace = null
@@ -48,20 +63,29 @@ export class OscQueryClient {
   }
 
   async connect() {
-    this.shouldReconnect = true
+    if (!this.shouldReconnect) return
+    const attempt = ++this.connectAttempt
+    const controller = new AbortController()
+    this.fetchControllers.add(controller)
+    this._clearAttemptTimer()
+    this.attemptTimer = setTimeout(() => {
+      this._failAttempt(attempt, `Connection timed out after ${this.attemptTimeoutMs} ms`, true)
+    }, this.attemptTimeoutMs)
 
     try {
       const url = `http://${this.host}:${this.port}/`
       this.events.onLog(`HTTP GET ${url}`)
 
-      const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 3000)
-
+      // HOST_INFO is optional and must not extend the connection deadline.
+      // Fetch it in parallel with the namespace; the WebSocket can open as
+      // soon as the namespace is ready.
+      this._fetchHostInfo(attempt)
       const res = await fetch(url, { signal: controller.signal })
-      clearTimeout(timeout)
+      if (!this._isCurrentAttempt(attempt)) return
 
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const tree = await res.json()
+      if (!this._isCurrentAttempt(attempt)) return
       this.lastNamespace = tree
 
       // Build the flat metadata table the hub broadcasts to the UI.
@@ -70,32 +94,66 @@ export class OscQueryClient {
       const paths = this.flatNodes.map((n) => n.FULL_PATH)
       this.events.onLog(`Namespace received: ${paths.length} parameters`)
 
-      // Fetch HOST_INFO to find the device's OSC UDP port (separate from the
-      // OSCQuery HTTP port). Optional — we keep going even if it fails.
-      try {
-        const infoUrl = `http://${this.host}:${this.port}/?HOST_INFO`
-        const infoCtl = new AbortController()
-        const infoTo = setTimeout(() => infoCtl.abort(), 2000)
-        const infoRes = await fetch(infoUrl, { signal: infoCtl.signal })
-        clearTimeout(infoTo)
-        if (infoRes.ok) {
-          const info = await infoRes.json()
-          // Heuristic — a HOST_INFO response has OSC_PORT/OSC_TRANSPORT/NAME.
-          // If we got the tree back instead, ignore.
-          if (info && (info.OSC_PORT || info.OSC_TRANSPORT || info.NAME)) {
-            this.hostInfo = info
-            if (info.OSC_PORT) this.oscPort = Number(info.OSC_PORT)
-          }
-        }
-      } catch {
-        // HOST_INFO not supported — fall back to oscQueryPort already set
-      }
-
-      this._openWebSocket(paths)
+      if (!this._isCurrentAttempt(attempt)) return
+      this._openWebSocket(paths, attempt)
     } catch (err) {
-      this.events.onLog(`Connection error: ${err.message}`)
-      this._scheduleReconnect()
+      if (!this._isCurrentAttempt(attempt)) return
+      this._failAttempt(attempt, `Connection error: ${err.message}`, false)
+    } finally {
+      this.fetchControllers.delete(controller)
     }
+  }
+
+  async _fetchHostInfo(attempt) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), Math.min(2000, this.attemptTimeoutMs))
+    this.fetchControllers.add(controller)
+    try {
+      const infoUrl = `http://${this.host}:${this.port}/?HOST_INFO`
+      const infoRes = await fetch(infoUrl, { signal: controller.signal })
+      if (!this._isCurrentAttempt(attempt) || !infoRes.ok) return
+      const info = await infoRes.json()
+      if (!this._isCurrentAttempt(attempt)) return
+      if (info && (info.OSC_PORT || info.OSC_TRANSPORT || info.NAME)) {
+        this.hostInfo = info
+        if (info.OSC_PORT) this.oscPort = Number(info.OSC_PORT)
+        this.events.onHostInfo?.(info)
+      }
+    } catch {
+      // HOST_INFO is optional; namespace + WebSocket remain authoritative.
+    } finally {
+      clearTimeout(timeout)
+      this.fetchControllers.delete(controller)
+    }
+  }
+
+  _isCurrentAttempt(attempt) {
+    return this.shouldReconnect && attempt === this.connectAttempt
+  }
+
+  _clearAttemptTimer() {
+    if (!this.attemptTimer) return
+    clearTimeout(this.attemptTimer)
+    this.attemptTimer = null
+  }
+
+  _failAttempt(attempt, reason, timeout) {
+    if (!this._isCurrentAttempt(attempt) || this.failedAttempt === attempt) return
+    this.failedAttempt = attempt
+    this._clearAttemptTimer()
+    for (const controller of this.fetchControllers) controller.abort()
+    this.fetchControllers.clear()
+    const ws = this.ws
+    this.ws = null
+    if (ws) {
+      try { ws.terminate() } catch {}
+    }
+    this.connected = false
+    this.events.onLog(reason)
+    this.events.onAttemptFailed?.(reason, { timeout })
+    this._scheduleReconnect(
+      this.everConnected ? this.disconnectReconnectDelayMs : this.reconnectDelayMs
+    )
   }
 
   _collectPaths(node) {
@@ -128,13 +186,21 @@ export class OscQueryClient {
     }
   }
 
-  _openWebSocket(paths) {
+  _openWebSocket(paths, attempt) {
     try {
+      if (!this._isCurrentAttempt(attempt)) return
       const wsUrl = `ws://${this.host}:${this.port}`
-      this.ws = new WebSocket(wsUrl)
+      const ws = new WebSocket(wsUrl)
+      this.ws = ws
 
-      this.ws.on('open', () => {
+      ws.on('open', () => {
+        if (this.ws !== ws || !this._isCurrentAttempt(attempt)) {
+          try { ws.close() } catch {}
+          return
+        }
+        this._clearAttemptTimer()
         this.connected = true
+        this.everConnected = true
         this.events.onLog(`WebSocket open · sending LISTEN for ${paths.length} paths`)
         this.events.onConnect()
         for (const path of paths) this._listen(path)
@@ -142,7 +208,8 @@ export class OscQueryClient {
 
       // Critical: also catch binary frames. TouchDesigner-style servers send
       // raw OSC packets over the WS instead of JSON COMMAND/DATA envelopes.
-      this.ws.on('message', (raw, isBinary) => {
+      ws.on('message', (raw, isBinary) => {
+        if (this.ws !== ws || !this._isCurrentAttempt(attempt)) return
         const buf = this._toBuffer(raw)
         if (isBinary || this._looksLikeOscPacket(buf)) {
           this._handleOscBinary(buf)
@@ -158,18 +225,29 @@ export class OscQueryClient {
         }
       })
 
-      this.ws.on('error', (err) => {
+      ws.on('error', (err) => {
+        if (this.ws !== ws || !this._isCurrentAttempt(attempt)) return
         this.events.onLog(`WS error: ${err.message}`)
       })
 
-      this.ws.on('close', (code) => {
+      ws.on('close', (code) => {
+        if (this.ws !== ws || !this._isCurrentAttempt(attempt)) return
+        this.ws = null
         this.connected = false
-        this.events.onDisconnect(`WS closed (code ${code})`)
-        this._scheduleReconnect()
+        if (this.everConnected) {
+          this._clearAttemptTimer()
+          this.events.onDisconnect(`WS closed (code ${code})`)
+          this._scheduleReconnect(this.disconnectReconnectDelayMs)
+        } else {
+          this._failAttempt(attempt, `WebSocket closed before connect (code ${code})`, false)
+        }
       })
     } catch (err) {
+      if (!this._isCurrentAttempt(attempt)) return
       this.events.onLog(`WS open error: ${err.message}`)
-      this._scheduleReconnect()
+      this._scheduleReconnect(
+        this.everConnected ? this.disconnectReconnectDelayMs : this.reconnectDelayMs
+      )
     }
   }
 
@@ -239,14 +317,14 @@ export class OscQueryClient {
     }
   }
 
-  _scheduleReconnect() {
+  _scheduleReconnect(delayMs = this.reconnectDelayMs) {
     if (!this.shouldReconnect) return
     if (this.reconnectTimer) return
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       this.events.onLog('Reconnecting…')
       this.connect()
-    }, 3000)
+    }, delayMs)
   }
 
   isConnected() {
@@ -255,17 +333,22 @@ export class OscQueryClient {
 
   disconnect() {
     this.shouldReconnect = false
+    this.connectAttempt++
+    this._clearAttemptTimer()
+    for (const controller of this.fetchControllers) controller.abort()
+    this.fetchControllers.clear()
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
-    if (this.ws) {
+    const ws = this.ws
+    this.ws = null
+    if (ws) {
       try {
-        this.ws.close()
+        ws.close()
       } catch {
         // ignore
       }
-      this.ws = null
     }
     this.connected = false
   }

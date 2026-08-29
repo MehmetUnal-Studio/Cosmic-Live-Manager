@@ -26,7 +26,7 @@ The app has two pages, switchable from the top tab bar:
 │  - ParameterControl  │                              │    client (HTTP + WS)  │
 │  - PresetSection     │                              │  - aggregated OSCQuery │
 │  - RecordingPanel    │                              │    tree re-exposed     │
-│  - DiscoveredCard    │                              │    at GET /            │
+│  - Device Registry   │                              │    at GET /            │
 └──────────────────────┘                              │  - UDP OSC inbound on  │
                                                       │    OSC_PORT            │
                                                       │  - /subscribe relay    │
@@ -44,19 +44,21 @@ The browser never talks to the instruments directly. The Node hub at
 `127.0.0.1:7400`:
 
 - Loads device declarations from `manifests/*.json` (live-watched — drop a
-  file in or edit one and the hub picks it up).
+  file in or edit one and the hub picks it up). Startup migration assigns
+  canonical IDs and safely merges verified local-interface duplicates.
 - Opens an OSCQuery client (HTTP + WebSocket) to every enabled device,
-  fetches the namespace, and subscribes to value changes. Auto-reconnects
-  on drop.
+  fetches the namespace, and subscribes to value changes. One connection
+  attempt owns a hard 3,000 ms deadline; timeout closes its HTTP/WS resources,
+  reports `Unavailable`, and keeps the same manifest/card for retry.
 - Aggregates every device's namespace under a single tree (rooted at the
   device name) and re-exposes it as a standard OSCQuery server at
   `GET /`, so third parties on the LAN can read the whole rig as one source.
 - Publishes itself as `_oscjson._tcp` + `_osc._udp` (Bonjour) and also
-  browses for other `_oscjson._tcp` services on the LAN. Both lists feed
-  the dashboard's "Discovered on Network" section and the per-device
-  LINK target picker.
+  browses for other `_oscjson._tcp` services on the LAN. Discovery and saved
+  manifests atomically upsert the same canonical registry record, while the
+  raw service list still feeds the per-device LINK target picker.
 - Pushes `PATH_CHANGED`, `DEVICE_UPDATED`, `DEVICE_NAMESPACE`,
-  `DEVICES_RELOADED`, `DISCOVERED_DEVICES`, `ANNOUNCE_RESULT`, and
+  `DEVICE_REMOVED`, `DEVICES_RELOADED`, `DISCOVERED_DEVICES`, `ANNOUNCE_RESULT`, and
   `SAVE_HINT` events to the dashboard over `/ws/hub`. Accepts
   `SET_DEVICE_PARAM`, `UPDATE_DEVICE`, `RECONNECT_DEVICE`, `REMOVE_DEVICE`,
   `ADD_DISCOVERED`, `RELOAD_MANIFESTS`, `REDISCOVER`, and `ANNOUNCE_DEVICE`
@@ -66,7 +68,6 @@ The browser never talks to the instruments directly. The Node hub at
 - Forwards every received value to Ableton on `ABLETON_PORT` with the
   legacy `device<id> <path> <value>` packet shape (compatible with the
   existing Cosmic Unity M4L patch). Disable with `ABLETON_FORWARD=0`.
-
 ## Run
 
 ```bash
@@ -78,18 +79,23 @@ This starts:
 
 - the Vite dev server on every interface, port `5173` (bound to `0.0.0.0`
   so tablets / phones / other Macs on the same LAN can open the dashboard)
-- the Node hub on every interface, port `7400` (with `--watch` reload)
+- the loopback-only Manager supervisor on port `7399`
+- the supervised Node hub on every interface, port `7400`
 
 Open `http://localhost:5173` locally, or `http://<this-machine-LAN-IP>:5173`
 from another device on the same network. The startup logs print every LAN
 address the server is reachable on.
 
-The header shows `helper online · N device(s) · M msg/s`, a live counter
-of packets forwarded to Ableton, and a `⟳ Rediscover` button that flushes
-the helper's Bonjour cache (without needing `sudo killall -HUP
-mDNSResponder`).
+The compact **Manager Bridge** panel reports the real supervised process state
+(`Running`, `Stopped`, `Restarting`, `Error`), active ports, and provides
+Start/Stop/Restart. Restart shuts down the hub's sockets, timers, discovery,
+watchers and clients before binding again; manifests, presets and links are
+not erased. Ableton owns the VST processes, so the panel does not pretend to
+start or stop a plug-in instance.
 
-Each manifest in `manifests/` becomes a card in the dashboard. From a card
+Each canonical registry entity becomes one card in the dashboard. Discovery,
+saved/manifest state and connection state are facets of that card, not separate
+cards. From a card
 you can:
 
 - toggle the device on/off, edit its name, host, and OSCQuery port inline
@@ -104,25 +110,35 @@ you can:
 - **Record / play back** the live PATH_CHANGED stream for that device
   (see *Recording* below).
 
-The "Discovered on Network" panel — sits above the Manifest Devices grid —
-lists every `_oscjson._tcp` service the hub finds on the LAN that isn't
-already a managed device. Click "Add" on any of them to auto-create a
-manifest and **auto-connect** in one step.
+Unsaved discoveries appear in the correct `CosmicUnity / Ableton` or
+`Android Tablets` section with a Save action. Local CosmicUnity aliases are
+shown as `Bu Bilgisayar · Port N`; raw endpoint aliases live under Details.
 
 Press-and-hold a manifest card to drag-and-drop it into a new position;
 the order is persisted in `localStorage`.
 
+### Identity and reconnect state
+
+Identity priority is persistent `DEVICE_ID`/DNS-SD `device_id`, followed by the
+Android installation token and then conservative legacy fallback. Only
+loopback and addresses currently reported by this computer's network
+interfaces may fold into one local CosmicUnity port. Ports remain separate
+instances, and remote Android endpoints never merge merely because their names
+or ports match. Saved devices remain available for retry after disconnect;
+only an explicit Remove action deletes a manifest.
+
 Environment variables (all optional):
 
-| var               | default                | meaning                                          |
-| ----------------- | ---------------------- | ------------------------------------------------ |
-| `PORT`            | `7400`                 | hub HTTP/WS + aggregated OSCQuery HTTP           |
-| `OSC_LISTEN_PORT` | `9001`                 | UDP OSC inbound (instruments → hub)              |
-| `ABLETON_HOST`    | `127.0.0.1`            | Ableton/M4L target                               |
-| `ABLETON_PORT`    | `10000`                | hub → Ableton `udpreceive` port                  |
-| `ABLETON_FORWARD` | `1`                    | set to `0` to disable the Ableton mirror         |
-| `HUB_NAME`        | `Cosmic Live Manager`  | Bonjour name advertised by the hub               |
-| `MANIFESTS_DIR`   | `./manifests`          | where manifests are loaded/watched               |
+| var                   | default                | meaning                                              |
+| --------------------- | ---------------------- | ---------------------------------------------------- |
+| `PORT`                | `7400`                 | hub HTTP/WS + aggregated OSCQuery HTTP               |
+| `SUPERVISOR_PORT`     | `7399`                 | loopback Manager lifecycle control plane             |
+| `OSC_LISTEN_PORT`     | `9001`                 | UDP OSC inbound (instruments → hub)                  |
+| `ABLETON_HOST`        | `127.0.0.1`            | Ableton/M4L target                                   |
+| `ABLETON_PORT`        | `10000`                | hub → Ableton `udpreceive` port                      |
+| `ABLETON_FORWARD`     | `1`                    | set to `0` to disable the Ableton mirror             |
+| `HUB_NAME`            | `Cosmic Live Manager`  | Bonjour name advertised by the hub                   |
+| `MANIFESTS_DIR`       | `./manifests`          | where manifests are loaded/watched                   |
 
 ## Parameter widgets
 
@@ -293,20 +309,27 @@ index.html
 manifests/                  # one JSON per managed device; live-watched
 server/
   index.js                  # Node hub: mDNS, /ws/hub, OSCQuery aggregator,
-                            # UDP listener, Ableton forwarder, manifest CRUD
+                            # UDP listener, output routing, manifest CRUD
+  supervisor.js             # idempotent Manager Bridge start/stop/restart API
+  deviceRegistry.js         # canonical identity, atomic upsert, migration/TTL
   oscqueryClient.js         # per-device OSCQuery client (HTTP + WS + relays,
-                            # binary OSC + bundle decoder)
+                            # binary OSC + bundle decoder + 3s deadline)
+test/
+  deviceRegistry.test.js       # canonical identity/races/migration/TTL
+  managerConnectionLifecycle.integration.test.js # unavailable/reconnect/same id
+  supervisor.integration.test.js # repeated lifecycle + port/manifest proof
+  oscqueryClient.test.js       # connection deadline and cleanup
 src/
   main.js
   App.vue                   # 2-tab switch: Dashboard / Performance Mode
   styles.css
   components/
-    HubDashboard.vue        # Dashboard page: stats, scenes, discovered,
-                            #   manifest grid, drag-reorder
+    HubDashboard.vue        # server control, grouped canonical registry,
+                            #   stats, scenes and drag-reorder
     PerformanceMode.vue     # Blank canvas of preset shortcuts
     DeviceCard.vue          # Header + host/port + Presets + Parameters
                             #   + LINK + Recordings
-    DiscoveredCard.vue      # Bonjour-only entries waiting to be added
+    ServerControl.vue       # real Manager Bridge state + lifecycle actions
     ParameterControl.vue    # Widget picker (trigger / bool / enum / num / …)
     PresetSection.vue       # Per-device preset save / recall list
     RecordingPanel.vue      # Per-device recording + playback UI
@@ -316,6 +339,7 @@ src/
   composables/
     useHub.js               # /ws/hub client (singleton), devices,
                             #   deviceParams, onPathChange subscribe API
+    useServerControl.js     # supervisor state polling and commands
     useHubPresets.js        # localStorage-backed presets per device
     useDiscovery.js         # mirror of the hub's Bonjour discovery list
     usePeer.js              # peer_id sanitisation for the LINK flow

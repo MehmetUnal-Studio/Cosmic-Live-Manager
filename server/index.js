@@ -17,19 +17,24 @@
 //   - Forwards every device value to Ableton on UDP ABLETON_PORT using
 //     the historical "device<id> <path> <value>" two-string + value packet
 //     shape (compatible with the existing Cosmic Unity M4L patch).
-//
 // All commentary, logs and identifiers are in English.
 
 import express from 'express'
 import http from 'node:http'
 import os from 'node:os'
 import dgram from 'node:dgram'
-import { readdirSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync, watch } from 'node:fs'
+import { readdirSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync, watch, renameSync } from 'node:fs'
 import { join } from 'node:path'
 import { WebSocketServer, WebSocket } from 'ws'
 import { Bonjour } from 'bonjour-service'
 import osc from 'osc'
 import { OscQueryClient } from './oscqueryClient.js'
+import {
+  CONNECTION_STATES,
+  DeviceRegistry,
+  deduplicateManifestEntries,
+  getLocalInterfaceAddresses
+} from './deviceRegistry.js'
 
 // ─── Configuration ────────────────────────────────────────────────────────
 const PORT               = Number(process.env.PORT || 7400)          // helper HTTP/WS + hub OSCQuery HTTP
@@ -38,6 +43,8 @@ const ABLETON_HOST       = process.env.ABLETON_HOST || '127.0.0.1'
 const ABLETON_PORT       = Number(process.env.ABLETON_PORT || 10000)   // hub → Ableton M4L udpreceive
 const HUB_NAME           = process.env.HUB_NAME || 'Cosmic Live Manager'
 const MANIFESTS_DIR      = process.env.MANIFESTS_DIR || './manifests'
+const CONNECTION_TIMEOUT_MS = 3000
+const DISCOVERY_STALE_TTL_MS = Number(process.env.DISCOVERY_STALE_TTL_MS || 15000)
 
 // Make sure `MANIFESTS_DIR` actually exists on disk. Fresh clones, Windows
 // machines, or a user who manually deleted the folder would otherwise hit
@@ -108,10 +115,18 @@ const server = http.createServer(app)
 const devices = new Map()
 /** @type {Map<number, string>} */
 const manifestFilenames = new Map()
+/** @type {Map<number, string[]>} all parsed files, including duplicate-id shadows */
+const manifestFilesByDeviceId = new Map()
 /** @type {Map<number, OscQueryClient>} */
 const oscQueryClients = new Map()
 /** @type {Map<number, number>} */
 const deviceMsgCount = new Map()
+/** @type {Map<string, any>} bonjour-service ServiceInfo by fqdn */
+const services = new Map()
+let nextDeviceRuntimeGeneration = 1
+
+let isShuttingDown = false
+let deviceRegistry = new DeviceRegistry({ localAddresses: getLocalInterfaceAddresses() })
 
 let suppressWatcher = false // flip while we write a manifest ourselves
 
@@ -125,20 +140,207 @@ function broadcastHub(data) {
   }
 }
 
+function connectionStateFor(dev) {
+  if (!dev.enabled) return CONNECTION_STATES.DISABLED
+  if (dev.connectionState) return dev.connectionState
+  if (dev.status === 'connected') return CONNECTION_STATES.CONNECTED
+  if (dev.status === 'connecting') return CONNECTION_STATES.CONNECTING
+  if (dev.status === 'lost') return CONNECTION_STATES.UNAVAILABLE
+  if (dev.status === 'error') return CONNECTION_STATES.ERROR
+  return CONNECTION_STATES.DISCOVERED
+}
+
+function applyRegistryIdentity(dev, record) {
+  if (!record) return dev
+  dev.canonicalId = record.canonicalId
+  dev.deviceType = record.deviceType
+  dev.persistentDeviceId = record.persistentDeviceId
+  dev.endpoints = record.endpoints
+  dev.activeEndpoint = record.activeEndpoint
+  dev.isLocal = record.isLocal
+  dev.locationLabel = record.locationLabel
+  dev.saved = true
+  dev.discoveryState = record.discoveryState
+  dev.connectionState = record.connectionState
+  return dev
+}
+
+function registryManifest(dev) {
+  return {
+    ...dev,
+    port: dev.oscQueryPort,
+    connectionState: connectionStateFor(dev)
+  }
+}
+
+function upsertServiceInRegistry(service) {
+  const addresses = (service.addresses || [])
+    .filter((address) => /^\d+\.\d+\.\d+\.\d+$/.test(address))
+  const hosts = addresses.length > 0
+    ? addresses
+    : [service.referer?.address || service.host].filter(Boolean)
+  let record = null
+  for (const host of hosts) {
+    record = deviceRegistry.upsertDiscovery({
+      name: service.name,
+      serviceName: service.name,
+      host,
+      port: Number(service.port),
+      fqdn: service.fqdn,
+      txt: service.txt || {}
+    })
+  }
+  return record
+}
+
+function rebuildDeviceRegistry() {
+  deviceRegistry = new DeviceRegistry({ localAddresses: getLocalInterfaceAddresses() })
+  for (const dev of devices.values()) {
+    const record = deviceRegistry.upsertManifest(registryManifest(dev))
+    applyRegistryIdentity(dev, record)
+  }
+  for (const service of services.values()) {
+    if (Number(service.port) === PORT) continue
+    upsertServiceInRegistry(service)
+  }
+}
+
+function broadcastRegistry() {
+  broadcastHub({ type: 'REGISTRY_UPDATED', devices: deviceRegistry.snapshot() })
+}
+
+function clearManagedDeviceRuntimeState(deviceId) {
+  deviceMsgCount.delete(deviceId)
+  for (const [path, param] of namespace.entries()) {
+    if (param.deviceId === deviceId) namespace.delete(path)
+  }
+  broadcastHub({ type: 'DEVICE_REMOVED', deviceId })
+}
+
+/**
+ * Permanently remove one manifest. This path deliberately creates no backup,
+ * Trash copy, tombstone, or restore record.
+ */
+function removeManagedDevicePermanently(
+  deviceId,
+  { cause = 'manual', expectedClient, armedAt } = {}
+) {
+  const dev = devices.get(deviceId)
+  const filename = manifestFilenames.get(deviceId)
+  const filenames = Array.from(new Set([
+    filename,
+    ...(manifestFilesByDeviceId.get(deviceId) || [])
+  ].filter(Boolean)))
+  const currentClient = oscQueryClients.get(deviceId)
+
+  if (expectedClient && currentClient !== expectedClient) {
+    console.log(`  [manifest-delete] skipped id=${deviceId} reason=stale_client`)
+    return { ok: false, stale: true }
+  }
+  if (!dev || filenames.length === 0) {
+    return { ok: false, stale: true, error: `Device not found: id ${deviceId}` }
+  }
+
+  suppressWatcher = true
+  const failures = []
+  for (const manifestFile of filenames) {
+    try {
+      unlinkSync(join(MANIFESTS_DIR, manifestFile))
+    } catch (err) {
+      if (err?.code !== 'ENOENT') {
+        failures.push({ filename: manifestFile, error: err })
+      } else {
+        console.log(`  [manifest-delete] already-absent id=${deviceId} file=${manifestFile}`)
+      }
+    }
+  }
+  if (failures.length > 0) {
+    suppressWatcher = false
+    for (const failure of failures) {
+      console.log(`  [manifest-delete] failed id=${deviceId} file=${failure.filename} code=${failure.error?.code || 'UNKNOWN'}: ${failure.error.message}`)
+    }
+    return {
+      ok: false,
+      error: `Could not delete ${failures.map((failure) => failure.filename).join(', ')}`
+    }
+  }
+
+  if (currentClient) {
+    oscQueryClients.delete(deviceId)
+    currentClient.disconnect()
+  }
+  deviceRegistry.removeManifest(deviceId)
+  clearManagedDeviceRuntimeState(deviceId)
+
+  const elapsed = Number.isFinite(armedAt) ? ` elapsedMs=${Date.now() - armedAt}` : ''
+  console.log(`  [manifest-delete] complete id=${deviceId} cause=${cause} file=${filenames.join(',')}${elapsed} backup=none`)
+  loadManifests()
+  setTimeout(() => { suppressWatcher = false }, 300)
+  return { ok: true }
+}
+
+function migrateManifestEntries(entries) {
+  const migration = deduplicateManifestEntries(entries, {
+    localAddresses: getLocalInterfaceAddresses()
+  })
+  const changed = migration.kept.some((entry) => entry.changed) || migration.duplicates.length > 0
+  if (!changed) return migration.kept
+
+  suppressWatcher = true
+  const archiveDir = migration.duplicates.length > 0
+    ? join(MANIFESTS_DIR, '.deduplicated', new Date().toISOString().replace(/[:.]/g, '-'))
+    : null
+  try {
+    if (archiveDir) mkdirSync(archiveDir, { recursive: true })
+    for (const entry of migration.kept) {
+      if (!entry.changed) continue
+      const target = join(MANIFESTS_DIR, entry.file)
+      const temp = `${target}.migrating-${process.pid}`
+      writeFileSync(temp, JSON.stringify(entry.manifest, null, 2) + '\n', 'utf-8')
+      renameSync(temp, target)
+    }
+    for (const duplicate of migration.duplicates) {
+      renameSync(join(MANIFESTS_DIR, duplicate.file), join(archiveDir, duplicate.file))
+      console.log(`  [manifest-migrate] merged ${duplicate.file} → ${duplicate.keptFile} (canonical ${duplicate.canonicalId})`)
+    }
+    console.log(`  [manifest-migrate] canonicalized ${migration.kept.length} device(s); archived ${migration.duplicates.length} duplicate file(s)`)
+  } finally {
+    setTimeout(() => { suppressWatcher = false }, 300)
+  }
+  return migration.kept
+}
+
 // ─── Manifest loader ──────────────────────────────────────────────────────
 function loadManifests() {
   const before = devices.size
   const oldDevices = new Map(devices)
+  const oldManifestFilenames = new Map(manifestFilenames)
   devices.clear()
   manifestFilenames.clear()
+  manifestFilesByDeviceId.clear()
 
   try {
-    const files = readdirSync(MANIFESTS_DIR).filter((f) => f.endsWith('.json'))
-
+    const files = readdirSync(MANIFESTS_DIR).filter((f) => f.endsWith('.json')).sort()
+    const parsedEntries = []
     for (const file of files) {
       try {
         const content = readFileSync(join(MANIFESTS_DIR, file), 'utf-8')
         const manifest = JSON.parse(content)
+        if (!Number.isInteger(Number(manifest.id)) || !manifest.host || !manifest.oscQueryPort) {
+          throw new Error('manifest requires numeric id, host and oscQueryPort')
+        }
+        manifest.id = Number(manifest.id)
+        manifest.oscQueryPort = Number(manifest.oscQueryPort)
+        parsedEntries.push({ file, manifest })
+      } catch (err) {
+        console.log(`  [manifest] read error (${file}): ${err.message}`)
+      }
+    }
+
+    const migratedEntries = migrateManifestEntries(parsedEntries)
+    for (const { file, manifest } of migratedEntries) {
+      try {
+        manifestFilesByDeviceId.set(manifest.id, [file])
 
         // Status / runtime fields: preserve from the previous load if the
         // device still points at the same host:port AND its OSCQuery client
@@ -151,13 +353,21 @@ function loadManifests() {
           old &&
           old.host === manifest.host &&
           Number(old.oscQueryPort) === Number(manifest.oscQueryPort)
+        manifest.runtimeGeneration =
+          sameTarget && old.runtimeGeneration
+            ? old.runtimeGeneration
+            : nextDeviceRuntimeGeneration++
         if (sameTarget && manifest.enabled && oscQueryClients.has(manifest.id)) {
           manifest.status        = old.status || (manifest.enabled ? 'configured' : 'disabled')
+          manifest.connectionState = old.connectionState || connectionStateFor(old)
           manifest.oscPort       = old.oscPort
           manifest.paramCount    = old.paramCount
           manifest.lastMessageAt = old.lastMessageAt
         } else {
           manifest.status = manifest.enabled ? 'configured' : 'disabled'
+          manifest.connectionState = manifest.enabled
+            ? CONNECTION_STATES.DISCOVERED
+            : CONNECTION_STATES.DISABLED
         }
 
         if (devices.has(manifest.id)) {
@@ -172,21 +382,37 @@ function loadManifests() {
       }
     }
 
-    console.log(`  [manifest] loaded ${devices.size} device(s)  (was ${before})`)
+    rebuildDeviceRegistry()
+    console.log(`  [manifest] loaded ${devices.size} canonical device(s)  (was ${before})`)
 
-    reconcileClients(oldDevices)
+    reconcileClients(oldDevices, oldManifestFilenames)
 
     broadcastHub({
       type: 'DEVICES_RELOADED',
-      devices: Array.from(devices.values())
+      devices: deviceRegistry.snapshot()
     })
+    broadcastRegistry()
   } catch (err) {
     console.log(`  [manifest] could not read ${MANIFESTS_DIR}: ${err.message}`)
   }
 }
 
 // ─── Client lifecycle ─────────────────────────────────────────────────────
-function reconcileClients(oldDevices) {
+function manifestDefinitionKey(dev, filename) {
+  if (!dev) return ''
+  return JSON.stringify([
+    filename || '',
+    dev.id,
+    dev.name,
+    dev.type,
+    dev.host,
+    Number(dev.oscQueryPort),
+    dev.enabled !== false,
+    dev.description || ''
+  ])
+}
+
+function reconcileClients(oldDevices, oldManifestFilenames = manifestFilenames) {
   // Disconnect clients whose target moved or was disabled/removed.
   for (const [id, oldDev] of oldDevices.entries()) {
     const newDev = devices.get(id)
@@ -198,8 +424,8 @@ function reconcileClients(oldDevices) {
 
     if (shouldDisconnect && oscQueryClients.has(id)) {
       const client = oscQueryClients.get(id)
-      client.disconnect()
       oscQueryClients.delete(id)
+      client.disconnect()
       console.log(`  [client] disconnect ${oldDev.name}`)
     }
   }
@@ -224,40 +450,97 @@ function countParams(node) {
 function connectToDevice(dev) {
   console.log(`  [client] connecting ${dev.name} → ${dev.host}:${dev.oscQueryPort}`)
   dev.status = 'connecting'
+  dev.connectionState = CONNECTION_STATES.CONNECTING
+  dev.error = null
   broadcastDeviceUpdate(dev)
 
   const client = new OscQueryClient(dev.host, dev.oscQueryPort, {
     onConnect: () => {
-      dev.status = 'connected'
-      dev.lastMessageAt = Date.now()
-      dev.oscPort = client.oscPort || dev.oscQueryPort
+      if (oscQueryClients.get(dev.id) !== client) return
+      const currentDev = devices.get(dev.id)
+      if (!currentDev) return
+      currentDev.status = 'connected'
+      currentDev.connectionState = CONNECTION_STATES.CONNECTED
+      currentDev.error = null
+      currentDev.lastMessageAt = Date.now()
+      currentDev.oscPort = client.oscPort || currentDev.oscQueryPort
       const ns = client.lastNamespace
       if (ns) {
         const count = countParams(ns)
-        dev.paramCount = count
-        console.log(`  [client] ✓ ${dev.name} connected (${count} params)`)
+        currentDev.paramCount = count
+        console.log(`  [client] ✓ ${currentDev.name} connected (${count} params)`)
       }
-      broadcastDeviceUpdate(dev)
+      broadcastDeviceUpdate(currentDev)
       // Ship the full per-device parameter list (with TYPE / RANGE / ACCESS /
       // DESCRIPTION / UNIT) to every dashboard so it can render real widgets.
       broadcastHub({
         type: 'DEVICE_NAMESPACE',
-        deviceId: dev.id,
-        deviceName: dev.name,
+        deviceId: currentDev.id,
+        deviceName: currentDev.name,
         nodes: client.flatNodes
       })
     },
     onDisconnect: (reason) => {
-      dev.status = 'lost'
-      console.log(`  [client] ✗ ${dev.name} lost: ${reason}`)
-      broadcastDeviceUpdate(dev)
+      if (oscQueryClients.get(dev.id) !== client) return
+      const currentDev = devices.get(dev.id)
+      if (!currentDev) return
+      currentDev.status = 'lost'
+      currentDev.connectionState = CONNECTION_STATES.UNAVAILABLE
+      currentDev.error = reason
+      console.log(`  [client] ✗ ${currentDev.name} lost: ${reason}`)
+      broadcastDeviceUpdate(currentDev)
+    },
+    onAttemptFailed: (reason, details) => {
+      if (oscQueryClients.get(dev.id) !== client) return
+      const currentDev = devices.get(dev.id)
+      if (!currentDev) return
+      currentDev.status = details.timeout ? 'unavailable' : 'error'
+      currentDev.connectionState = details.timeout
+        ? CONNECTION_STATES.UNAVAILABLE
+        : CONNECTION_STATES.ERROR
+      currentDev.error = reason
+      console.log(`  [client] ${details.timeout ? 'timeout' : 'failed'} ${currentDev.name}: ${reason}`)
+      broadcastDeviceUpdate(currentDev)
+    },
+    onHostInfo: (hostInfo) => {
+      if (oscQueryClients.get(dev.id) !== client) return
+      const currentDev = devices.get(dev.id)
+      if (!currentDev) return
+      const previousPersistentId = currentDev.persistentDeviceId
+      const previousCanonicalId = currentDev.canonicalId
+      currentDev.hostInfo = hostInfo
+      const identityRecord = deviceRegistry.upsertManifest({
+        ...registryManifest(currentDev),
+        hostInfo,
+        persistentDeviceId: hostInfo.DEVICE_ID || currentDev.persistentDeviceId,
+        deviceType: hostInfo.DEVICE_TYPE || currentDev.deviceType
+      })
+      applyRegistryIdentity(currentDev, identityRecord)
+      if (
+        identityRecord?.persistentDeviceId &&
+        (identityRecord.persistentDeviceId !== previousPersistentId ||
+          identityRecord.canonicalId !== previousCanonicalId)
+      ) {
+        // Persist an identity first learned from HOST_INFO so manual devices
+        // retain their canonical card across Manager restarts too.
+        saveManifest(currentDev.id, {})
+      } else {
+        broadcastRegistry()
+      }
     },
     onLog: (msg) => {
       console.log(`     [${dev.name}] ${msg}`)
     },
     onValue: (path, value) => {
-      handleClientValue(dev, path, value)
+      if (oscQueryClients.get(dev.id) !== client) return
+      const currentDev = devices.get(dev.id)
+      if (!currentDev) return
+      handleClientValue(currentDev, path, value)
     }
+  }, {
+    reconnectDelayMs: 3000,
+    disconnectReconnectDelayMs: 500,
+    attemptTimeoutMs: CONNECTION_TIMEOUT_MS
   })
 
   oscQueryClients.set(dev.id, client)
@@ -265,8 +548,11 @@ function connectToDevice(dev) {
 }
 
 function handleClientValue(dev, path, value) {
-  dev.lastMessageAt = Date.now()
+  const receivedAt = Date.now()
+  dev.lastMessageAt = receivedAt
   dev.status = 'connected'
+  dev.connectionState = CONNECTION_STATES.CONNECTED
+  dev.error = null
 
   deviceMsgCount.set(dev.id, (deviceMsgCount.get(dev.id) || 0) + 1)
 
@@ -281,7 +567,6 @@ function handleClientValue(dev, path, value) {
       : typeof firstVal === 'boolean'
       ? firstVal ? 'T' : 'F'
       : 's'
-
   if (!namespace.has(hubPath) && namespace.size >= MAX_NAMESPACE) {
     return // hard cap to prevent runaway memory if a device misbehaves
   }
@@ -289,7 +574,7 @@ function handleClientValue(dev, path, value) {
     fullPath: hubPath,
     type,
     value: v,
-    lastUpdate: Date.now(),
+    lastUpdate: receivedAt,
     source: `${dev.host}:${dev.oscQueryPort}`,
     deviceId: dev.id
   })
@@ -303,7 +588,7 @@ function handleClientValue(dev, path, value) {
     deviceId: dev.id,
     deviceName: dev.name,
     isNew: false,
-    timestamp: Date.now()
+    timestamp: receivedAt
   })
 
   if (ABLETON_FORWARD && dev.enabled) {
@@ -312,7 +597,18 @@ function handleClientValue(dev, path, value) {
 }
 
 function broadcastDeviceUpdate(dev) {
-  broadcastHub({ type: 'DEVICE_UPDATED', device: dev })
+  const registryRecord = deviceRegistry.updateConnection(dev.canonicalId, {
+    connectionState: connectionStateFor(dev),
+    error: dev.error || null,
+    enabled: dev.enabled,
+    paramCount: dev.paramCount || 0,
+    runtimeGeneration: dev.runtimeGeneration,
+    lastSeen: dev.lastMessageAt || Date.now(),
+    activeEndpoint: { host: dev.host, port: dev.oscQueryPort }
+  })
+  if (registryRecord) applyRegistryIdentity(dev, registryRecord)
+  broadcastHub({ type: 'DEVICE_UPDATED', device: { ...dev, ...registryRecord } })
+  broadcastRegistry()
 }
 
 // ─── Manifest save ────────────────────────────────────────────────────────
@@ -340,11 +636,26 @@ function saveManifest(deviceId, updates) {
   const updated = {
     id: dev.id,
     name: updates.name ?? dev.name,
-    type: dev.type,
+    type: dev.type || 'oscquery-device',
+    deviceType: dev.deviceType,
+    canonicalId: (updates.host !== undefined || updates.oscQueryPort !== undefined)
+      ? undefined
+      : dev.canonicalId,
+    persistentDeviceId: dev.persistentDeviceId || null,
+    serviceName: dev.serviceName || dev.name,
     host: updates.host ?? dev.host,
     oscQueryPort: updates.oscQueryPort ?? dev.oscQueryPort,
     enabled: updates.enabled ?? dev.enabled,
-    description: updates.description ?? dev.description
+    description: updates.description ?? dev.description,
+    endpoints: (updates.host !== undefined || updates.oscQueryPort !== undefined)
+      ? [{
+          host: updates.host ?? dev.host,
+          port: updates.oscQueryPort ?? dev.oscQueryPort,
+          source: 'manual-update',
+          lastSeen: Date.now()
+        }]
+      : (dev.endpoints || []),
+    legacyIds: dev.legacyIds || []
   }
 
   try {
@@ -354,8 +665,26 @@ function saveManifest(deviceId, updates) {
     writeFileSync(filePath, JSON.stringify(updated, null, 2) + '\n', 'utf-8')
 
     const oldDev = { ...dev }
-    const newDev = { ...updated, status: updated.enabled ? 'configured' : 'disabled' }
+    const lifecycleChanged =
+      updated.host !== dev.host ||
+      Number(updated.oscQueryPort) !== Number(dev.oscQueryPort) ||
+      updated.enabled !== dev.enabled
+    const newDev = {
+      ...updated,
+      runtimeGeneration: lifecycleChanged
+        ? nextDeviceRuntimeGeneration++
+        : (dev.runtimeGeneration || nextDeviceRuntimeGeneration++),
+      status: updated.enabled
+        ? (lifecycleChanged ? 'configured' : dev.status)
+        : 'disabled',
+      connectionState: updated.enabled
+        ? (lifecycleChanged ? CONNECTION_STATES.DISCOVERED : connectionStateFor(dev))
+        : CONNECTION_STATES.DISABLED,
+      error: lifecycleChanged ? null : dev.error
+    }
     devices.set(deviceId, newDev)
+    rebuildDeviceRegistry()
+    applyRegistryIdentity(newDev, deviceRegistry.findByManifestId(deviceId))
 
     console.log(`  [manifest] saved ${dev.name} (id ${deviceId})`)
     if (updates.host !== undefined) console.log(`     host: ${oldDev.host} → ${updated.host}`)
@@ -368,7 +697,7 @@ function saveManifest(deviceId, updates) {
 
     setTimeout(() => { suppressWatcher = false }, 500)
 
-    broadcastHub({ type: 'DEVICE_UPDATED', device: newDev })
+    broadcastDeviceUpdate(newDev)
     return { ok: true }
   } catch (err) {
     suppressWatcher = false
@@ -487,30 +816,22 @@ const udpHubPort = new osc.UDPPort({
 // Boot the rest of the hub (manifest load + watcher). Extracted so it can be
 // called either from the UDP port's 'ready' callback (normal mode) or
 // directly when the UDP listener is disabled.
+let manifestWatcher = null
+let manifestReloadTimer = null
 function bootHub() {
-  // Empty-on-start: by default we wipe the manifests folder on every helper
-  // startup so each fresh session begins with no devices on the dashboard.
-  // Set KEEP_MANIFESTS=1 to disable this and keep the legacy
-  // auto-load-from-disk behaviour.
-  if (process.env.KEEP_MANIFESTS !== '1') {
-    try {
-      const files = readdirSync(MANIFESTS_DIR).filter((f) => f.endsWith('.json'))
-      suppressWatcher = true
-      for (const f of files) {
-        try { unlinkSync(join(MANIFESTS_DIR, f)) } catch {}
-      }
-      setTimeout(() => { suppressWatcher = false }, 300)
-      if (files.length > 0) {
-        console.log(`  [manifest] cleared ${files.length} stale manifest(s) on startup (set KEEP_MANIFESTS=1 to preserve)`)
-      }
-    } catch { /* dir may not exist yet — loadManifests handles that */ }
-  }
+  // Device configuration is durable. Restarting the Manager must never erase
+  // manifests, presets, routing IDs or links.
   loadManifests()
   try {
-    watch(MANIFESTS_DIR, { persistent: false }, () => {
+    manifestWatcher?.close()
+    manifestWatcher = watch(MANIFESTS_DIR, { persistent: false }, () => {
       if (suppressWatcher) return
       console.log('  [manifest] folder changed, reloading…')
-      setTimeout(loadManifests, 100)
+      if (manifestReloadTimer) clearTimeout(manifestReloadTimer)
+      manifestReloadTimer = setTimeout(() => {
+        manifestReloadTimer = null
+        loadManifests()
+      }, 100)
     })
   } catch {
     console.log('  [manifest] watcher could not start')
@@ -616,11 +937,6 @@ if (process.env.OSC_LISTEN_DISABLED === '1') {
 
 // ─── Bonjour: discovery (existing CLM behaviour) + publish (new hub) ─────
 const bonjour = new Bonjour()
-/** @type {Map<string, any>} bonjour-service ServiceInfo by fqdn */
-const services = new Map()
-/** @type {Map<string, {name:string, host:string, port:number, firstSeen:number}>} */
-const discoveredDevices = new Map()
-
 function serializeService(s) {
   const ipv4 = (s.addresses || []).find((a) => /^\d+\.\d+\.\d+\.\d+$/.test(a))
   return {
@@ -644,12 +960,10 @@ function broadcastDiscovery() {
   }
 }
 
-function isAlreadyKnown(host, port) {
-  return Array.from(devices.values()).some((d) => d.host === host && d.oscQueryPort === port)
-}
-
 function broadcastDiscovered() {
-  broadcastHub({ type: 'DISCOVERED_DEVICES', devices: Array.from(discoveredDevices.values()) })
+  const unsaved = deviceRegistry.snapshot().filter((record) => !record.saved)
+  broadcastHub({ type: 'DISCOVERED_DEVICES', devices: unsaved })
+  broadcastRegistry()
 }
 
 // We keep the browser in a `let` (not `const`) so it can be torn down and
@@ -665,18 +979,30 @@ function attachBrowserHandlers(b) {
     console.log('[discovery] up   ', service.name, service.addresses)
     broadcastDiscovery()
 
-    // Mirror into the hub's "discovered" list, skipping ourselves and manifest-known devices.
-    const ipv4 = (service.addresses || []).find((a) => /^\d+\.\d+\.\d+\.\d+$/.test(a))
-    const host = ipv4 || service.host
-    const port = service.port
-    if (port === PORT) return
-    if (isAlreadyKnown(host, port)) return
-    discoveredDevices.set(`${host}:${port}`, {
-      name: service.name,
-      host,
-      port,
-      firstSeen: Date.now()
-    })
+    // Every address is an observation of the same service, never a new card.
+    // DeviceRegistry validates local interfaces before folding LAN aliases into
+    // a local CosmicUnity instance.
+    if (Number(service.port) === PORT) return
+    const record = upsertServiceInRegistry(service)
+    if (record?.saved) {
+      const dev = devices.get(record.manifestId)
+      if (dev) {
+        const previousPersistentId = dev.persistentDeviceId
+        applyRegistryIdentity(dev, record)
+        const endpointChanged = record.persistentDeviceId && record.activeEndpoint && (
+          dev.host !== record.activeEndpoint.host ||
+          Number(dev.oscQueryPort) !== Number(record.activeEndpoint.port)
+        )
+        if (endpointChanged) {
+          saveManifest(dev.id, {
+            host: record.activeEndpoint.host,
+            oscQueryPort: record.activeEndpoint.port
+          })
+        } else if (record.persistentDeviceId && previousPersistentId !== record.persistentDeviceId) {
+          saveManifest(dev.id, {})
+        }
+      }
+    }
     broadcastDiscovered()
   })
   b.on('down', (service) => {
@@ -685,9 +1011,12 @@ function attachBrowserHandlers(b) {
     broadcastDiscovery()
 
     const ipv4 = (service.addresses || []).find((a) => /^\d+\.\d+\.\d+\.\d+$/.test(a))
-    const host = ipv4 || service.host
-    const key = `${host}:${service.port}`
-    if (discoveredDevices.delete(key)) broadcastDiscovered()
+    deviceRegistry.markDiscoveryDown({
+      fqdn: service.fqdn,
+      host: ipv4 || service.host,
+      port: Number(service.port)
+    })
+    broadcastDiscovered()
   })
 }
 
@@ -711,12 +1040,18 @@ function rediscoverNetwork() {
     console.log('[discovery] browser.stop() error:', err.message)
   }
   services.clear()
-  discoveredDevices.clear()
+  rebuildDeviceRegistry()
   broadcastDiscovery()
   broadcastDiscovered()
   console.log('[discovery] rediscover requested — caches cleared, restarting browser')
   startBrowser()
 }
+
+const discoveryStaleTimer = setInterval(() => {
+  const removed = deviceRegistry.pruneStale(DISCOVERY_STALE_TTL_MS)
+  if (removed.length > 0) broadcastDiscovered()
+}, 1000)
+discoveryStaleTimer.unref()
 
 startBrowser()
 
@@ -728,9 +1063,9 @@ function publishBonjour() {
 
 // ─── HTTP routes — Hub OSCQuery ───────────────────────────────────────────
 app.get('/_devices', (_req, res) => {
-  const devs = Array.from(devices.values()).map((d) => ({
+  const devs = deviceRegistry.snapshot().map((d) => ({
     ...d,
-    msgCount: deviceMsgCount.get(d.id) || 0
+    msgCount: d.manifestId == null ? 0 : (deviceMsgCount.get(d.manifestId) || 0)
   }))
   res.json({ devices: devs, self: { name: HUB_NAME, port: PORT, oscPort: OSC_LISTEN_PORT } })
 })
@@ -740,7 +1075,8 @@ app.get('/_status', (_req, res) => {
     namespace_size: namespace.size,
     ws_clients: hubClients.size,
     osc_subscribers: Array.from(oscSubscribers.values()),
-    devices: Array.from(devices.values()),
+    devices: deviceRegistry.snapshot(),
+    registryDevices: deviceRegistry.snapshot(),
     abletonMsgsSent
   })
 })
@@ -868,12 +1204,27 @@ wssHub.on('connection', (ws, req) => {
   ws.send(JSON.stringify({
     type: 'INITIAL_STATE',
     namespace: buildTree(),
-    devices: Array.from(devices.values()),
+    devices: deviceRegistry.snapshot(),
     subscribers: Array.from(oscSubscribers.values()),
-    discoveredDevices: Array.from(discoveredDevices.values()),
+    discoveredDevices: deviceRegistry.snapshot().filter((record) => !record.saved),
+    registryDevices: deviceRegistry.snapshot(),
     hubName: HUB_NAME,
     abletonForward: ABLETON_FORWARD ? { host: ABLETON_HOST, port: ABLETON_PORT } : null
   }))
+
+  // A browser can open long after devices connected. Re-send each currently
+  // known OSCQuery namespace so a page refresh does not show zero/partial
+  // Parameters until the next device reconnect.
+  for (const [deviceId, client] of oscQueryClients.entries()) {
+    if (!Array.isArray(client.flatNodes) || client.flatNodes.length === 0) continue
+    const device = devices.get(deviceId)
+    ws.send(JSON.stringify({
+      type: 'DEVICE_NAMESPACE',
+      deviceId,
+      deviceName: device?.name || '',
+      nodes: client.flatNodes
+    }))
+  }
 
   ws.on('message', (raw) => {
     let msg
@@ -925,8 +1276,9 @@ wssHub.on('connection', (ws, req) => {
       const dev = devices.get(msg.deviceId)
       if (dev && dev.enabled) {
         if (oscQueryClients.has(dev.id)) {
-          oscQueryClients.get(dev.id).disconnect()
+          const client = oscQueryClients.get(dev.id)
           oscQueryClients.delete(dev.id)
+          client.disconnect()
         }
         connectToDevice(dev)
       }
@@ -1033,14 +1385,20 @@ wssHub.on('connection', (ws, req) => {
         id:           d.id,
         name:         d.name,
         type:         d.type || 'oscquery-device',
+        deviceType:   d.deviceType,
+        canonicalId:  d.canonicalId,
+        persistentDeviceId: d.persistentDeviceId || null,
+        serviceName:  d.serviceName || d.name,
         host:         d.host,
         oscQueryPort: d.oscQueryPort,
         enabled:      d.enabled !== false,
-        description:  d.description || ''
+        description:  d.description || '',
+        endpoints:    d.endpoints || [],
+        legacyIds:    d.legacyIds || []
       }))
       ws.send(JSON.stringify({
         type: 'MANIFESTS_EXPORT',
-        version: 1,
+        version: 2,
         exportedAt: new Date().toISOString(),
         manifests: payload
       }))
@@ -1062,93 +1420,142 @@ wssHub.on('connection', (ws, req) => {
         // Disconnect everyone first so reconcileClients doesn't get confused
         // by the in-flight rename.
         for (const [id, client] of oscQueryClients.entries()) {
-          try { client.disconnect() } catch {}
           oscQueryClients.delete(id)
+          try { client.disconnect() } catch {}
+        }
+        // Runtime caches are reset because this is an explicit replace import.
+        for (const id of Array.from(devices.keys())) {
+          clearManagedDeviceRuntimeState(id)
+        }
+        deviceMsgCount.clear()
+        for (const [path, param] of namespace.entries()) {
+          if (param.deviceId !== undefined) namespace.delete(path)
         }
         // Wipe disk
         for (const f of readdirSync(MANIFESTS_DIR).filter((x) => x.endsWith('.json'))) {
-          try { unlinkSync(join(MANIFESTS_DIR, f)) } catch {}
+          try {
+            unlinkSync(join(MANIFESTS_DIR, f))
+          } catch (err) {
+            if (err?.code !== 'ENOENT') {
+              throw new Error(`Could not remove existing manifest ${f}: ${err.message}`)
+            }
+          }
         }
-        // Write fresh manifests with stable, gap-free ids starting at 1.
+        // Preserve valid legacy routing IDs. They are part of the historical
+        // Ableton `deviceN` contract and of older browser-local settings.
+        const usedIds = new Set()
         let nextId = 1
+        let importedCount = 0
         for (const m of msg.manifests) {
           if (!m || !m.name || !m.host || !m.oscQueryPort) continue
           if (!isValidHost(String(m.host))) continue
           if (!isValidOscPort(Number(m.oscQueryPort))) continue
-          const id = nextId++
+          let id = Number.isInteger(Number(m.id)) && Number(m.id) > 0 && !usedIds.has(Number(m.id))
+            ? Number(m.id)
+            : null
+          while (id == null && usedIds.has(nextId)) nextId++
+          if (id == null) id = nextId++
+          usedIds.add(id)
           const manifest = {
             id,
             name:         String(m.name).slice(0, 64),
             type:         m.type || 'oscquery-device',
+            deviceType:   m.deviceType,
+            canonicalId:  m.canonicalId,
+            persistentDeviceId: m.persistentDeviceId || null,
+            serviceName:  m.serviceName || m.name,
             host:         String(m.host),
             oscQueryPort: Number(m.oscQueryPort),
             enabled:      m.enabled !== false,
-            description:  m.description || 'Imported'
+            description:  m.description || 'Imported',
+            endpoints:    Array.isArray(m.endpoints) ? m.endpoints : [],
+            legacyIds:    Array.isArray(m.legacyIds) ? m.legacyIds : []
           }
           const filename = `${manifest.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${id}.json`
           writeFileSync(join(MANIFESTS_DIR, filename), JSON.stringify(manifest, null, 2) + '\n', 'utf-8')
+          importedCount++
         }
-        console.log(`  [hub] imported ${nextId - 1} manifest(s)`)
+        console.log(`  [hub] imported ${importedCount} manifest(s) with stable routing ids`)
       } catch (err) {
         console.log(`  [hub] import failed: ${err.message}`)
         ws.send(JSON.stringify({ type: 'ERROR', message: 'Import failed: ' + err.message }))
       } finally {
         setTimeout(() => { suppressWatcher = false }, 300)
       }
+      // Treat every import result (including a reported partial wipe failure)
+      // as a fresh runtime generation. loadManifests() will rebuild only what
+      // actually remains on disk and create new client/card identities.
+      devices.clear()
+      manifestFilenames.clear()
+      manifestFilesByDeviceId.clear()
       loadManifests()
       return
     }
 
     if (msg.type === 'REMOVE_DEVICE' && typeof msg.deviceId === 'number') {
-      const filename = manifestFilenames.get(msg.deviceId)
-      const dev = devices.get(msg.deviceId)
-      if (!dev || !filename) {
+      const result = removeManagedDevicePermanently(msg.deviceId, { cause: 'manual' })
+      if (!result.ok) {
         ws.send(JSON.stringify({
           type: 'ERROR',
-          message: `Unknown device id ${msg.deviceId}`
+          message: result.error || `Unknown device id ${msg.deviceId}`
         }))
-        return
       }
-      try {
-        // Suppress the watcher reload so we don't race with our own delete:
-        // we'll call loadManifests() explicitly after the unlink.
-        suppressWatcher = true
-        unlinkSync(join(MANIFESTS_DIR, filename))
-        console.log(`  [hub] removed device: ${dev.name} (id ${msg.deviceId})  [${filename}]`)
-      } catch (err) {
-        console.log(`  [hub] remove failed for id ${msg.deviceId}: ${err.message}`)
-        ws.send(JSON.stringify({
-          type: 'ERROR',
-          message: `Could not delete manifest: ${err.message}`
-        }))
-        suppressWatcher = false
-        return
-      }
-      suppressWatcher = false
-      loadManifests()
       return
     }
 
-    if (msg.type === 'ADD_DISCOVERED' && msg.host && msg.port) {
-      if (!isValidHost(String(msg.host))) {
-        ws.send(JSON.stringify({ type: 'ERROR', message: `Invalid host: ${msg.host}` }))
+    if (msg.type === 'ADD_DISCOVERED' || msg.type === 'SAVE_DEVICE') {
+      let registryRecord = msg.canonicalId ? deviceRegistry.get(msg.canonicalId) : null
+      if (!registryRecord && msg.host && msg.port) {
+        registryRecord = deviceRegistry.upsertDiscovery({
+          name: msg.name,
+          serviceName: msg.serviceName || msg.name,
+          host: String(msg.host),
+          port: Number(msg.port),
+          persistentDeviceId: msg.persistentDeviceId,
+          deviceType: msg.deviceType
+        })
+      }
+      const endpoint = registryRecord?.activeEndpoint || (msg.host && msg.port
+        ? { host: String(msg.host), port: Number(msg.port) }
+        : null)
+      if (!endpoint || !isValidHost(String(endpoint.host))) {
+        ws.send(JSON.stringify({ type: 'ERROR', message: `Invalid host: ${endpoint?.host || ''}` }))
         return
       }
-      if (!isValidOscPort(Number(msg.port))) {
-        ws.send(JSON.stringify({ type: 'ERROR', message: `Invalid port: ${msg.port}` }))
+      if (!isValidOscPort(Number(endpoint.port))) {
+        ws.send(JSON.stringify({ type: 'ERROR', message: `Invalid port: ${endpoint.port}` }))
+        return
+      }
+      if (registryRecord?.saved) {
+        if (msg.name && registryRecord.manifestId != null) {
+          saveManifest(registryRecord.manifestId, { name: String(msg.name).trim().slice(0, 64) })
+        }
+        ws.send(JSON.stringify({
+          type: 'ADD_DEVICE_RESULT',
+          ok: true,
+          existing: true,
+          canonicalId: registryRecord.canonicalId,
+          deviceId: registryRecord.manifestId
+        }))
         return
       }
       const nextId = Math.max(0, ...Array.from(devices.keys())) + 1
-      const rawName = (msg.name || `Device${nextId}`).trim().slice(0, 64)
+      const rawName = String(msg.name || registryRecord?.name || `Device${nextId}`).trim().slice(0, 64)
       const name = rawName.length > 0 ? rawName : `Device${nextId}`
       const manifest = {
         id: nextId,
         name,
         type: 'oscquery-device',
-        host: msg.host,
-        oscQueryPort: msg.port,
+        deviceType: registryRecord?.deviceType,
+        canonicalId: registryRecord?.canonicalId,
+        persistentDeviceId: registryRecord?.persistentDeviceId || null,
+        serviceName: registryRecord?.serviceName || name,
+        host: endpoint.host,
+        oscQueryPort: endpoint.port,
         enabled: true,
-        description: 'Discovered via Bonjour'
+        description: msg.type === 'SAVE_DEVICE' ? 'Saved from Device Registry' : 'Discovered via Bonjour',
+        endpoints: registryRecord?.endpoints || [endpoint],
+        legacyIds: []
       }
       const filename = `${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${nextId}.json`
       // Suppress the manifest folder watcher so it doesn't race our explicit
@@ -1164,7 +1571,6 @@ wssHub.on('connection', (ws, req) => {
         // are still picked up.
         setTimeout(() => { suppressWatcher = false }, 300)
       }
-      discoveredDevices.delete(`${msg.host}:${msg.port}`)
       console.log(`  [hub] added device: ${name} (id ${nextId})`)
       loadManifests()
 
@@ -1178,6 +1584,13 @@ wssHub.on('connection', (ws, req) => {
         connectToDevice(newDev)
       }
 
+      ws.send(JSON.stringify({
+        type: 'ADD_DEVICE_RESULT',
+        ok: true,
+        existing: false,
+        canonicalId: manifest.canonicalId,
+        deviceId: nextId
+      }))
       broadcastDiscovered()
     }
   })
@@ -1186,12 +1599,13 @@ wssHub.on('connection', (ws, req) => {
 })
 
 // ─── Periodic broadcast: per-device message counters ──────────────────────
-setInterval(() => {
+const deviceMessageCounterTimer = setInterval(() => {
   if (deviceMsgCount.size === 0) return
   const counts = {}
   for (const [id, c] of deviceMsgCount.entries()) counts[id] = c
   broadcastHub({ type: 'DEVICE_MSG_COUNTS', counts, abletonTotal: abletonMsgsSent })
 }, 500)
+deviceMessageCounterTimer.unref()
 
 // ─── Server startup ───────────────────────────────────────────────────────
 // Bind the HTTP/WS server on all interfaces so LAN clients can reach it.
@@ -1212,17 +1626,43 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  Manifests dir:     ${MANIFESTS_DIR}`)
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   publishBonjour()
+  process.send?.({
+    type: 'ready',
+    ports: { http: PORT, osc: OSC_LISTEN_PORT, ableton: ABLETON_PORT }
+  })
 })
 
 // ─── Shutdown ─────────────────────────────────────────────────────────────
-process.on('SIGINT', () => {
-  console.log('\nShutting down…')
-  for (const client of oscQueryClients.values()) client.disconnect()
+function shutdown(signal = 'SIGTERM') {
+  if (isShuttingDown) return
+  isShuttingDown = true
+  console.log(`\nShutting down (${signal})…`)
+  clearInterval(deviceMessageCounterTimer)
+  clearInterval(discoveryStaleTimer)
+  if (manifestReloadTimer) clearTimeout(manifestReloadTimer)
+  try { manifestWatcher?.close() } catch {}
+  try { browser?.stop() } catch {}
+  for (const [id, client] of oscQueryClients.entries()) {
+    oscQueryClients.delete(id)
+    client.disconnect()
+  }
+  try { udpSender.close() } catch {}
+  try { abletonSocket.close() } catch {}
+  const forceExit = setTimeout(() => process.exit(0), 2500)
+  forceExit.unref()
   bonjour.unpublishAll(() => {
     bonjour.destroy()
     try { udpHubPort.close() } catch {}
     for (const ws of hubClients) try { ws.close() } catch {}
     for (const ws of discoveryClients) try { ws.close() } catch {}
-    server.close(() => process.exit(0))
+    try { wssHub.close() } catch {}
+    try { wssDiscovery.close() } catch {}
+    server.close(() => {
+      clearTimeout(forceExit)
+      process.exit(0)
+    })
   })
-})
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGTERM', () => shutdown('SIGTERM'))

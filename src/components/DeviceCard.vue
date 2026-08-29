@@ -20,7 +20,7 @@ const props = defineProps({
   // Result of the last announce attempt, shown as a hint under the button
   announceResult: { type: Object, default: null }
 })
-const emit = defineEmits(['update', 'reconnect', 'set-param', 'announce', 'remove'])
+const emit = defineEmits(['update', 'reconnect', 'set-param', 'announce', 'remove', 'save'])
 
 function onRemove() {
   // Block accidental clicks — manifest deletion is permanent on disk.
@@ -50,6 +50,7 @@ function isValidPort(s) { const n = parseInt(s, 10); return Number.isInteger(n) 
 function commitName() {
   const v = draftName.value.trim()
   if (v.length === 0) { draftName.value = props.device.name; return }
+  if (!isSaved.value) return
   if (v === props.device.name) return
   emit('update', { name: v })
 }
@@ -67,6 +68,7 @@ function commitPort() {
   emit('update', { oscQueryPort: n })
 }
 function toggleEnabled() { emit('update', { enabled: !props.device.enabled }) }
+const isSaved = computed(() => props.device.saved !== false && props.device.id != null)
 
 // ─── Parameters: group by parent path ────────────────────────────────────
 // Split each path into "parent" +
@@ -136,14 +138,51 @@ function onParamSet(payload) {
 // preset just re-emits 'set-param' with the stored {path, value} — same
 // pipeline as a widget edit, so the optimistic update + Ableton forward +
 // dashboard broadcast all happen identically.
-const deviceIdRef = toRef(() => props.device.id)
+const storageIdentityRef = toRef(() => props.device.canonicalId || props.device.id)
+
+function migrateScopedStorage(prefix) {
+  if (!props.device.canonicalId || props.device.id == null) return
+  try {
+    const canonicalKey = `${prefix}${props.device.canonicalId}`
+    const candidates = [props.device.id, ...(props.device.legacyIds || [])]
+    if (prefix === 'clm:hub-presets:') {
+      const merged = []
+      const seen = new Set()
+      for (const key of [canonicalKey, ...candidates.map((legacyId) => `${prefix}${legacyId}`)]) {
+        const raw = localStorage.getItem(key)
+        if (raw == null) continue
+        let values
+        try { values = JSON.parse(raw) } catch { continue }
+        if (!Array.isArray(values)) continue
+        for (const value of values) {
+          const signature = JSON.stringify([value?.id, value?.name, value?.path, value?.value])
+          if (seen.has(signature)) continue
+          seen.add(signature)
+          merged.push(value)
+        }
+      }
+      if (merged.length > 0) localStorage.setItem(canonicalKey, JSON.stringify(merged))
+      return
+    }
+    if (localStorage.getItem(canonicalKey) != null) return
+    for (const legacyId of candidates) {
+      const value = localStorage.getItem(`${prefix}${legacyId}`)
+      if (value == null) continue
+      localStorage.setItem(canonicalKey, value)
+      return
+    }
+  } catch { /* storage unavailable */ }
+}
+
+migrateScopedStorage('clm:hub-presets:')
+migrateScopedStorage('clm:hub-announce:')
 const {
   presets,
   add: addPreset,
   remove: removePreset,
   update: updatePresetFn,
   reorder: reorderPreset
-} = useHubPresets(deviceIdRef)
+} = useHubPresets(storageIdentityRef)
 
 // ─── Recording / playback panel ───────────────────────────────────────
 // Mounts inside the device card so each device has its own buffer + UI.
@@ -176,6 +215,9 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (msgActiveTimer) clearTimeout(msgActiveTimer)
   if (stopMsgListener) stopMsgListener()
+  for (const timer of flashTimers.values()) clearTimeout(timer)
+  flashTimers.clear()
+  recording.dispose()
 })
 
 // PresetSection wants a flat object { [path]: node }. We have a Map; convert
@@ -201,7 +243,7 @@ function onPresetReorder({ from, to })    { reorderPreset(from, to) }
 // list and emit('announce') so the parent sends ANNOUNCE_DEVICE to the hub.
 
 const announceOpen = ref(false)
-const storageKey = computed(() => `clm:hub-announce:${props.device.id}`)
+const storageKey = computed(() => `clm:hub-announce:${props.device.canonicalId || props.device.id}`)
 
 function loadAnnounce() {
   try {
@@ -252,7 +294,7 @@ const targetCandidates = computed(() => {
 const selectedTarget = computed(() => targetCandidates.value.find((s) => s.fqdn === targetFqdn.value))
 
 const canPush = computed(() =>
-  props.device.status === 'connected' &&
+  (props.device.connectionState === 'Connected' || props.device.status === 'connected') &&
   !!selectedTarget.value &&
   !!peerId.value
 )
@@ -282,15 +324,23 @@ function onResetPeerId() {
 // ─── Status visuals ─────────────────────────────────────────────────────
 const statusClass = computed(() => {
   if (!props.device.enabled) return 'disabled'
-  return props.device.status || 'configured'
+  return String(props.device.connectionState || props.device.status || 'Discovered').toLowerCase()
 })
 const statusLabel = computed(() => {
   const d = props.device
   if (!d.enabled) return 'DISABLED'
-  if (d.status === 'connecting') return 'CONNECTING…'
-  if (d.status === 'connected') return `CONNECTED · ${d.paramCount || 0} params`
-  if (d.status === 'lost') return 'CONNECTION LOST'
-  return 'CONFIGURED'
+  const state = d.connectionState || d.status
+  if (state === 'Connecting' || state === 'connecting') return 'CONNECTING…'
+  if (state === 'Connected' || state === 'connected') return `CONNECTED · ${d.paramCount || 0} params`
+  if (state === 'Unavailable' || state === 'lost' || state === 'unavailable') return 'UNAVAILABLE'
+  if (state === 'Error' || state === 'error') return 'CONNECTION FAILED'
+  if (state === 'Disabled' || state === 'disabled') return 'DISABLED'
+  return 'DISCOVERED'
+})
+const connectionLabel = computed(() => {
+  if (props.device.locationLabel) return props.device.locationLabel
+  const port = props.device.activeEndpoint?.port || props.device.port || props.device.oscQueryPort
+  return `${props.device.serviceName || props.device.name} · Port ${port}`
 })
 const paramCount = computed(() => props.params.size)
 </script>
@@ -298,6 +348,7 @@ const paramCount = computed(() => props.params.size)
 <template>
   <div class="device-card" :class="statusClass">
     <button
+      v-if="isSaved"
       class="device-remove"
       type="button"
       title="Remove this device"
@@ -318,28 +369,40 @@ const paramCount = computed(() => props.params.size)
             spellcheck="false"
           />
         </div>
-        <div class="device-type">{{ device.type }}</div>
+        <div class="device-type">{{ device.deviceType || device.type }}</div>
       </div>
     </div>
 
-    <div class="device-host-row">
-      <span class="host-label">HOST</span>
-      <input
-        class="device-host-input"
-        v-model="draftHost"
-        @blur="commitHost"
-        @keydown.enter.prevent="$event.target.blur()"
-        spellcheck="false"
-      />
-      <span class="host-sep">:</span>
-      <input
-        class="device-port-input"
-        v-model="draftPort"
-        @blur="commitPort"
-        @keydown.enter.prevent="$event.target.blur()"
-        spellcheck="false"
-      />
-    </div>
+    <div class="device-connection-summary">{{ connectionLabel }}</div>
+
+    <details class="device-technical-details">
+      <summary>Details</summary>
+      <div v-if="isSaved" class="device-host-row">
+        <span class="host-label">HOST</span>
+        <input
+          class="device-host-input"
+          v-model="draftHost"
+          @blur="commitHost"
+          @keydown.enter.prevent="$event.target.blur()"
+          spellcheck="false"
+        />
+        <span class="host-sep">:</span>
+        <input
+          class="device-port-input"
+          v-model="draftPort"
+          @blur="commitPort"
+          @keydown.enter.prevent="$event.target.blur()"
+          spellcheck="false"
+        />
+      </div>
+      <div class="device-alias-list">
+        <div v-for="endpoint in device.endpoints || []" :key="`${endpoint.host}:${endpoint.port}`">
+          {{ endpoint.host }}:{{ endpoint.port }}
+          <span>{{ endpoint.available === false ? 'stale' : endpoint.source }}</span>
+        </div>
+      </div>
+      <div class="device-canonical-id">{{ device.canonicalId }}</div>
+    </details>
 
     <div class="device-footer">
       <div class="device-status-row">
@@ -356,6 +419,7 @@ const paramCount = computed(() => props.params.size)
 
       <div class="device-actions">
         <button
+          v-if="isSaved"
           class="hub-btn"
           :class="{ 'hub-btn-primary': device.enabled }"
           @click="toggleEnabled"
@@ -363,15 +427,21 @@ const paramCount = computed(() => props.params.size)
           <span class="hub-btn-icon">{{ device.enabled ? '●' : '○' }}</span>
           {{ device.enabled ? 'Enabled' : 'Enable' }}
         </button>
-        <button class="hub-btn" :disabled="!device.enabled" @click="emit('reconnect')">
-          ⟳ Reconnect
+        <button v-if="isSaved" class="hub-btn" :disabled="!device.enabled" @click="emit('reconnect')">
+          ⟳ Tekrar Dene
+        </button>
+        <button v-else class="hub-btn hub-btn-primary" @click="emit('save', draftName)">
+          + Save Device
         </button>
       </div>
 
+      <div v-if="device.error" class="device-error-text">{{ device.error }}</div>
+
       <div class="save-hint" :class="hint?.type || ''">{{ hint?.text || '' }}</div>
 
+      <template v-if="isSaved">
       <!-- ─── Presets ─── -->
-      <details class="hub-presets-section" open>
+      <details class="hub-presets-section">
         <summary>
           Presets
           <span v-if="presets.length" class="hub-presets-count">{{ presets.length }}</span>
@@ -497,7 +567,7 @@ const paramCount = computed(() => props.params.size)
               class="hub-btn hub-btn-primary"
               :disabled="!canPush"
               @click="onPush"
-              :title="device.status === 'connected'
+              :title="device.connectionState === 'Connected' || device.status === 'connected'
                 ? 'Send /system/peer/* + connect to target'
                 : 'Device must be connected'"
             >
@@ -517,6 +587,7 @@ const paramCount = computed(() => props.params.size)
 
       <!-- ─── Recordings (record / playback per device) ─── -->
       <RecordingPanel :rec="recording" />
+      </template>
 
     </div>
   </div>

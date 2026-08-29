@@ -3,14 +3,14 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useHub } from '../composables/useHub.js'
 import { useDiscovery } from '../composables/useDiscovery.js'
 import { useScenes } from '../composables/useScenes.js'
+import { usePerformancePresets } from '../composables/usePerformancePresets.js'
 import DeviceCard from './DeviceCard.vue'
-import DiscoveredCard from './DiscoveredCard.vue'
 import SceneBar from './SceneBar.vue'
+import ServerControl from './ServerControl.vue'
 
 const {
   connected,
   devices,
-  discovered,
   msgsThisSecond,
   deviceParams,
   deviceMsgCounts,
@@ -21,6 +21,7 @@ const {
   removeDevice,
   rediscover,
   addDiscovered,
+  saveDevice,
   setDeviceParam,
   announceDevice,
   exportManifests,
@@ -38,10 +39,8 @@ function onRediscoverClick() {
 }
 
 // ─── Export / Import manifest preset ─────────────────────────────────────
-// The dashboard starts empty on every helper restart (see server's
-// KEEP_MANIFESTS logic). Export downloads the current set as a JSON file;
-// Import reads a previously saved JSON and replaces the current set on the
-// helper.
+// Export downloads the current manifest set as a JSON file. Import is an
+// explicit bulk replacement; ordinary Manager stop/restart preserves files.
 const importInputRef = ref(null)
 
 async function onExportClick() {
@@ -94,8 +93,15 @@ const {
   remove: removeScene,
   overwrite: overwriteScene,
   reorder: reorderScene,
-  fire: fireScene
+  fire: fireScene,
+  migrateDeviceIds: migrateSceneDeviceIds
 } = useScenes()
+const { migrateDeviceIds: migratePerformanceDeviceIds } = usePerformancePresets()
+
+watch(devices, (current) => {
+  migrateSceneDeviceIds(current)
+  migratePerformanceDeviceIds(current)
+}, { immediate: true })
 
 // Save a scene from the current namespace state. We pass deviceParams (the
 // reactive Map) directly — useScenes reads .VALUE / .ACCESS off each node.
@@ -144,7 +150,8 @@ function onManualAddClick() {
 }
 
 // ─── Custom ordering ────────────────────────────────────────────────────
-// Persisted in localStorage as an array of device.id values. Devices not
+// Persisted in localStorage as canonical IDs. Legacy numeric IDs are accepted
+// once and automatically migrated so presets/order survive the registry move.
 // listed in the order array (because they're newly discovered, added from
 // a manifest, etc.) sort at the end by their id.
 const ORDER_KEY = 'clm:hub-device-order'
@@ -160,37 +167,76 @@ function saveOrder(ids) {
   try { localStorage.setItem(ORDER_KEY, JSON.stringify(ids)) } catch { /* quota */ }
 }
 
-const customOrder = ref(loadOrder()) // Array<number>  (device.id, in user order)
+const customOrder = ref(loadOrder())
+
+function deviceOrderKey(device) {
+  return device.canonicalId || `legacy:${device.id}`
+}
 
 const orderedDevices = computed(() => {
-  const byId = new Map(devices.value.map((d) => [d.id, d]))
+  const byId = new Map(devices.value.map((device) => [deviceOrderKey(device), device]))
   const out = []
-  for (const id of customOrder.value) {
-    if (byId.has(id)) {
-      out.push(byId.get(id))
-      byId.delete(id)
+  for (const rawKey of customOrder.value) {
+    let key = String(rawKey)
+    if (!byId.has(key) && /^\d+$/.test(key)) {
+      const legacy = devices.value.find((device) => Number(device.id) === Number(key))
+      if (legacy) key = deviceOrderKey(legacy)
+    }
+    if (byId.has(key)) {
+      out.push(byId.get(key))
+      byId.delete(key)
     }
   }
-  // Append any device that hasn't been ordered yet (sorted by id)
-  const remaining = Array.from(byId.values()).sort((a, b) => a.id - b.id)
+  const remaining = Array.from(byId.values()).sort((a, b) =>
+    Number(a.port || a.oscQueryPort || 0) - Number(b.port || b.oscQueryPort || 0) ||
+    String(a.name).localeCompare(String(b.name))
+  )
   return [...out, ...remaining]
 })
 
-// Split into two sub-lists for separate rendering: device names that contain
-// "max" (case-insensitive) go in the bottom section, everything else in the
-// top section. The single underlying `orderedDevices` array is preserved so
-// drag-and-drop indexing keeps working across both grids — we just filter
-// what each grid renders.
-function isMaxDevice(d) {
-  return /max/i.test(d?.name || '')
+function isCosmicUnity(d) {
+  return d?.deviceType === 'CosmicUnity' ||
+    (d?.isLocal && Number(d?.port || d?.oscQueryPort) >= 5001 && Number(d?.port || d?.oscQueryPort) <= 5016)
 }
-const generalDevices = computed(() => orderedDevices.value.filter((d) => !isMaxDevice(d)))
-const maxDevices     = computed(() => orderedDevices.value.filter((d) =>  isMaxDevice(d)))
+function isAndroid(d) {
+  return d?.deviceType === 'Android' || /android/i.test(d?.name || '')
+}
+const deviceGroups = computed(() => {
+  const cosmic = orderedDevices.value.filter(isCosmicUnity)
+  const android = orderedDevices.value.filter((device) => !isCosmicUnity(device) && isAndroid(device))
+  const other = orderedDevices.value.filter((device) => !isCosmicUnity(device) && !isAndroid(device))
+  const groups = [
+    {
+      key: 'cosmic',
+      title: 'CosmicUnity / Ableton',
+      hint: 'Her port ayrı bir Ableton kanalı ve VST3 instance’ıdır.',
+      devices: cosmic,
+      empty: 'CosmicUnity instance bulunamadı.'
+    },
+    {
+      key: 'android',
+      title: 'Android Tablets',
+      hint: 'Kalıcı cihaz kimliği varsa IP değişse bile aynı kart korunur.',
+      devices: android,
+      empty: 'Android tablet bulunamadı.'
+    }
+  ]
+  if (other.length > 0) {
+    groups.push({
+      key: 'other',
+      title: 'Other OSCQuery Devices',
+      hint: 'Tür bilgisi yayınlamayan geriye dönük uyumlu cihazlar.',
+      devices: other,
+      empty: ''
+    })
+  }
+  return groups
+})
 
 // Stats
 const statTotal  = computed(() => devices.value.length)
-const statActive = computed(() => devices.value.filter((d) => d.enabled).length)
-const statConn   = computed(() => devices.value.filter((d) => d.status === 'connected').length)
+const statActive = computed(() => devices.value.filter((d) => d.saved && d.enabled).length)
+const statConn   = computed(() => devices.value.filter((d) => d.connectionState === 'Connected' || d.status === 'connected').length)
 const statParams = computed(() => {
   let n = 0
   for (const m of deviceParams.value.values()) n += m.size
@@ -305,7 +351,7 @@ function onWindowPointerUp(_e) {
   pressTimer = null
   if (dragIdx.value >= 0 && dragOverIdx.value >= 0 && dragOverIdx.value !== dragIdx.value) {
     // Compute new id order from current orderedDevices
-    const ids = orderedDevices.value.map((d) => d.id)
+    const ids = orderedDevices.value.map(deviceOrderKey)
     const [moved] = ids.splice(dragIdx.value, 1)
     ids.splice(dragOverIdx.value, 0, moved)
     customOrder.value = ids
@@ -335,11 +381,18 @@ onBeforeUnmount(resetDragState)
 // When the device list shrinks (e.g. manifest deleted), prune the custom
 // order so we don't keep stale ids forever.
 watch(devices, (list) => {
-  const valid = new Set(list.map((d) => d.id))
-  const filtered = customOrder.value.filter((id) => valid.has(id))
-  if (filtered.length !== customOrder.value.length) {
-    customOrder.value = filtered
-    saveOrder(filtered)
+  const valid = new Set(list.map(deviceOrderKey))
+  const migrated = customOrder.value
+    .map((rawKey) => {
+      const key = String(rawKey)
+      if (valid.has(key)) return key
+      const legacy = list.find((device) => Number(device.id) === Number(key))
+      return legacy ? deviceOrderKey(legacy) : null
+    })
+    .filter((key) => key && valid.has(key))
+  if (JSON.stringify(migrated) !== JSON.stringify(customOrder.value)) {
+    customOrder.value = migrated
+    saveOrder(migrated)
   }
 })
 </script>
@@ -395,6 +448,8 @@ watch(devices, (list) => {
     </header>
 
     <main class="hub-main">
+      <ServerControl />
+
       <!-- Stats row -->
       <div class="stats-row">
         <div class="stat-card">
@@ -436,32 +491,11 @@ watch(devices, (list) => {
         @reorder="({ from, to }) => reorderScene(from, to)"
       />
 
-      <!-- Discovered devices (moved above Manifest Devices for visibility — new
-           devices on the LAN are surfaced right under the Scenes bar instead
-           of being buried at the bottom of the page). -->
-      <template v-if="discovered.length > 0">
-        <div class="section-header">
-          <div class="section-title">Discovered on Network</div>
-          <div class="section-hint">Devices not yet in your manifests · click Add to register</div>
-        </div>
-        <div class="discovered-grid">
-          <DiscoveredCard
-            v-for="d in discovered"
-            :key="`${d.host}:${d.port}`"
-            :device="d"
-            @add="(payload) => addDiscovered(payload.host, payload.port, payload.name)"
-          />
-        </div>
-      </template>
-
-      <!-- Manifest devices — General (everything whose name doesn't contain "max").
-           The manual-add form lives inside this header so it stays visible at
-           the top of the section, above any registered manifest cards. -->
       <div class="section-header manifest-header">
         <div class="section-title-group">
-          <div class="section-title">Manifest Devices</div>
+          <div class="section-title">Add Device Manually</div>
           <div class="section-hint">
-            Click host/port to edit · Press &amp; hold a card to drag and reorder · Open Parameters to inspect &amp; control
+            Discovery misses a device only: save it by host and OSCQuery port.
           </div>
         </div>
         <div class="manual-add-row inline" title="Register a device manually by IP + port when discovery misses it. Saved to manifests just like the others.">
@@ -500,50 +534,17 @@ watch(devices, (list) => {
           <span v-if="manualErr" class="manual-add-err">{{ manualErr }}</span>
         </div>
       </div>
-      <div class="devices-grid">
-        <div v-if="generalDevices.length === 0" class="empty">No general devices.</div>
-        <div
-          v-for="dev in generalDevices"
-          :key="dev.id"
-          :data-drag-idx="orderedDevices.indexOf(dev)"
-          class="device-card-wrapper"
-          :class="{
-            'drag-source': dragIdx === orderedDevices.indexOf(dev),
-            'drag-target': dragOverIdx === orderedDevices.indexOf(dev) && dragIdx !== -1,
-          }"
-          :style="dragIdx === orderedDevices.indexOf(dev)
-            ? { transform: `translate(${dragDX}px, ${dragDY}px) scale(1.025)`, zIndex: 50 }
-            : null"
-          @pointerdown="onCardPointerDown($event, orderedDevices.indexOf(dev), $event.currentTarget)"
-        >
-          <DeviceCard
-            :device="dev"
-            :msg-count="deviceMsgCounts.get(dev.id) || 0"
-            :params="deviceParams.get(dev.id) || new Map()"
-            :hint="saveHints.get(dev.id) || null"
-            :services="services"
-            :announce-result="announceResults.get(dev.id) || null"
-            @update="(u) => updateDevice(dev.id, u)"
-            @reconnect="reconnectDevice(dev.id)"
-            @set-param="(payload) => setDeviceParam(dev.id, payload.path, payload.value)"
-            @announce="(payload) => announceDevice(dev.id, payload.target, payload.peerId, payload.udpPortOverride)"
-            @remove="removeDevice(dev.id)"
-          />
-        </div>
-      </div>
 
-      <!-- Manifest devices — Max (anything whose name contains "Max") -->
-      <template v-if="maxDevices.length > 0">
+      <section v-for="group in deviceGroups" :key="group.key" class="device-group">
         <div class="section-header">
-          <div class="section-title">Max Devices</div>
-          <div class="section-hint">
-            Devices whose name contains "Max" — shown separately for easier triage at a glance
-          </div>
+          <div class="section-title">{{ group.title }}</div>
+          <div class="section-hint">{{ group.hint }}</div>
         </div>
         <div class="devices-grid">
+          <div v-if="group.devices.length === 0" class="empty">{{ group.empty }}</div>
           <div
-            v-for="dev in maxDevices"
-            :key="dev.id"
+            v-for="dev in group.devices"
+            :key="`${dev.canonicalId}:${dev.id ?? 'discovered'}:${dev.runtimeGeneration || 0}`"
             :data-drag-idx="orderedDevices.indexOf(dev)"
             class="device-card-wrapper"
             :class="{
@@ -564,13 +565,14 @@ watch(devices, (list) => {
               :announce-result="announceResults.get(dev.id) || null"
               @update="(u) => updateDevice(dev.id, u)"
               @reconnect="reconnectDevice(dev.id)"
+              @save="(name) => saveDevice(dev.canonicalId, name)"
               @set-param="(payload) => setDeviceParam(dev.id, payload.path, payload.value)"
               @announce="(payload) => announceDevice(dev.id, payload.target, payload.peerId, payload.udpPortOverride)"
               @remove="removeDevice(dev.id)"
             />
           </div>
         </div>
-      </template>
+      </section>
 
     </main>
   </div>

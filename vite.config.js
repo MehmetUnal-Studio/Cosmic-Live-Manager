@@ -23,6 +23,10 @@ export default defineConfig({
         target: 'ws://127.0.0.1:7400',
         ws: true,
         changeOrigin: true
+      },
+      '/api/manager': {
+        target: 'http://127.0.0.1:7399',
+        changeOrigin: true
       }
     }
   }

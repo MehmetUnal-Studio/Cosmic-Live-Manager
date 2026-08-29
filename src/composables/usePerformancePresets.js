@@ -130,6 +130,25 @@ function create() {
     presets.value = merge ? [...presets.value, ...incoming] : incoming
   }
 
+  function migrateDeviceIds(devices) {
+    const legacyToPrimary = new Map()
+    for (const device of devices || []) {
+      if (device?.id == null) continue
+      for (const legacyId of device.legacyIds || []) {
+        legacyToPrimary.set(Number(legacyId), Number(device.id))
+      }
+    }
+    if (legacyToPrimary.size === 0) return
+    let changed = false
+    const migrated = presets.value.map((preset) => {
+      const nextId = legacyToPrimary.get(Number(preset.deviceId))
+      if (nextId == null || nextId === Number(preset.deviceId)) return preset
+      changed = true
+      return { ...preset, deviceId: nextId }
+    })
+    if (changed) presets.value = migrated
+  }
+
   return {
     presets,
     add,
@@ -139,6 +158,7 @@ function create() {
     remove,
     exportJSON,
     importJSON,
+    migrateDeviceIds,
     GRID
   }
 }

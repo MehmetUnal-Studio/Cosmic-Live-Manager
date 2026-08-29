@@ -110,6 +110,13 @@ function createHub() {
   function addDiscovered(host, port, name) {
     send({ type: 'ADD_DISCOVERED', host, port, name: (name || '').trim() || undefined })
   }
+  function saveDevice(canonicalId, name) {
+    send({
+      type: 'SAVE_DEVICE',
+      canonicalId,
+      name: (name || '').trim() || undefined
+    })
+  }
   function setDeviceParam(deviceId, relPath, value) {
     send({ type: 'SET_DEVICE_PARAM', deviceId, path: relPath, value })
   }
@@ -141,6 +148,16 @@ function createHub() {
         announceResults.value = cur
       }
     }, 4000)
+  }
+
+  function pruneDeviceCaches(validIds) {
+    const prune = (source) => new Map(
+      Array.from(source.entries()).filter(([deviceId]) => validIds.has(deviceId))
+    )
+    deviceParams.value = prune(deviceParams.value)
+    deviceMsgCounts.value = prune(deviceMsgCounts.value)
+    saveHints.value = prune(saveHints.value)
+    announceResults.value = prune(announceResults.value)
   }
 
   function getDeviceByName(name) {
@@ -181,8 +198,19 @@ function createHub() {
   }
 
   // Apply a single PATH_CHANGED to the per-device node map.
-  function applyValue(absPath, value, paramType) {
-    const resolved = pathToDeviceRel(absPath)
+  function applyValue(absPath, value, paramType, explicitDeviceId) {
+    let resolved = null
+    if (Number.isInteger(explicitDeviceId)) {
+      const dev = devices.value.find((item) => item.id === explicitDeviceId)
+      if (dev) {
+        const prefix = `/${dev.name}`
+        resolved = {
+          deviceId: explicitDeviceId,
+          relPath: absPath.startsWith(prefix) ? (absPath.slice(prefix.length) || '/') : absPath
+        }
+      }
+    }
+    if (!resolved) resolved = pathToDeviceRel(absPath)
     if (!resolved) {
       if (isDebugApply()) {
         // eslint-disable-next-line no-console
@@ -243,15 +271,19 @@ function createHub() {
           hubName: msg.hubName || 'Cosmic Live Manager',
           abletonForward: msg.abletonForward
         }
-        devices.value = msg.devices || []
+        devices.value = msg.registryDevices || msg.devices || []
         discovered.value = msg.discoveredDevices || []
         subscribers.value = msg.subscribers || []
         deviceParams.value = new Map()
+        deviceMsgCounts.value = new Map()
+        saveHints.value = new Map()
+        announceResults.value = new Map()
         if (msg.namespace) walkInitialTree(msg.namespace, '')
       } else if (msg.type === 'PATH_CHANGED') {
-        applyValue(msg.path, msg.value, msg.paramType)
+        applyValue(msg.path, msg.value, msg.paramType, msg.deviceId)
         rateCounter++
       } else if (msg.type === 'DEVICE_NAMESPACE') {
+        if (!devices.value.some((device) => device.id === msg.deviceId)) return
         // Replace this device's parameter map with the freshly-fetched
         // metadata. We keep VALUE from previous entries where possible so
         // mid-stream values aren't blanked out on reconnect.
@@ -269,8 +301,19 @@ function createHub() {
         deviceParams.value = m
       } else if (msg.type === 'DEVICES_RELOADED') {
         devices.value = msg.devices || []
+        pruneDeviceCaches(new Set(devices.value.map((device) => device.id).filter(Number.isInteger)))
+      } else if (msg.type === 'REGISTRY_UPDATED') {
+        devices.value = msg.devices || []
+        discovered.value = devices.value.filter((device) => !device.saved)
+        pruneDeviceCaches(new Set(devices.value.map((device) => device.id).filter(Number.isInteger)))
+      } else if (msg.type === 'DEVICE_REMOVED') {
+        devices.value = devices.value.filter((device) => device.id !== msg.deviceId)
+        pruneDeviceCaches(new Set(devices.value.map((device) => device.id)))
       } else if (msg.type === 'DEVICE_UPDATED') {
-        const i = devices.value.findIndex((d) => d.id === msg.device.id)
+        const i = devices.value.findIndex((d) =>
+          (msg.device.canonicalId && d.canonicalId === msg.device.canonicalId) ||
+          (msg.device.id != null && d.id === msg.device.id)
+        )
         const next = devices.value.slice()
         if (i >= 0) next[i] = msg.device
         else next.push(msg.device)
@@ -280,7 +323,11 @@ function createHub() {
         else setHint(msg.deviceId, '✗ ' + (msg.error || 'Error'), 'err')
       } else if (msg.type === 'DEVICE_MSG_COUNTS') {
         const m = new Map()
-        for (const [id, c] of Object.entries(msg.counts)) m.set(parseInt(id, 10), c)
+        const validIds = new Set(devices.value.map((device) => device.id))
+        for (const [id, c] of Object.entries(msg.counts)) {
+          const deviceId = parseInt(id, 10)
+          if (validIds.has(deviceId)) m.set(deviceId, c)
+        }
         deviceMsgCounts.value = m
         if (typeof msg.abletonTotal === 'number') abletonTotal.value = msg.abletonTotal
       } else if (msg.type === 'DISCOVERED_DEVICES') {
@@ -330,6 +377,7 @@ function createHub() {
     reloadManifests,
     rediscover,
     addDiscovered,
+    saveDevice,
     setDeviceParam,
     announceDevice,
     onPathChange,

@@ -270,6 +270,27 @@ export function useRecording(deviceId, onPathChange, setDeviceParam, getCurrentD
     playbackProgressMs.value = loaded.value ? loaded.value.durationMs : 0
   }
 
+  function dispose() {
+    if (unsubscribe) {
+      try { unsubscribe() } catch {}
+      unsubscribe = null
+    }
+    if (durationTimer) {
+      clearInterval(durationTimer)
+      durationTimer = null
+    }
+    recording.value = false
+    looping.value = false
+    for (const timer of playbackTimers) clearTimeout(timer)
+    playbackTimers = []
+    if (progressTimer) {
+      clearInterval(progressTimer)
+      progressTimer = null
+    }
+    playing.value = false
+    playbackProgressMs.value = 0
+  }
+
   // ─── Public API ───────────────────────────────────────────────────────
   return {
     // record
@@ -294,6 +315,7 @@ export function useRecording(deviceId, onPathChange, setDeviceParam, getCurrentD
     playbackProgressMs,
     looping,
     startPlayback,
-    stopPlayback
+    stopPlayback,
+    dispose
   }
 }

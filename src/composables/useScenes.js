@@ -107,6 +107,41 @@ export function useScenes() {
     persist(scenes.value)
   }
 
+  function migrateDeviceIds(devices) {
+    const legacyToPrimary = new Map()
+    for (const device of devices || []) {
+      if (device?.id == null) continue
+      for (const legacyId of device.legacyIds || []) {
+        legacyToPrimary.set(String(legacyId), String(device.id))
+      }
+    }
+    if (legacyToPrimary.size === 0) return
+
+    let changed = false
+    const nextScenes = scenes.value.map((scene) => {
+      if (!scene?.snapshot) return scene
+      const snapshot = { ...scene.snapshot }
+      let sceneChanged = false
+      for (const [legacyId, primaryId] of legacyToPrimary) {
+        if (!snapshot[legacyId]) continue
+        snapshot[primaryId] = { ...snapshot[legacyId], ...(snapshot[primaryId] || {}) }
+        delete snapshot[legacyId]
+        changed = true
+        sceneChanged = true
+      }
+      if (!sceneChanged) return scene
+      const paramCount = Object.values(snapshot).reduce(
+        (total, params) => total + Object.keys(params || {}).length,
+        0
+      )
+      return { ...scene, snapshot, paramCount }
+    })
+    if (changed) {
+      scenes.value = nextScenes
+      persist(scenes.value)
+    }
+  }
+
   // Fire a scene: re-send every captured (deviceId, path, value) tuple via
   // the provided setDeviceParam callback. The server's SET_DEVICE_PARAM
   // handler then routes each one to the device's OSC port. If a device is
@@ -122,5 +157,5 @@ export function useScenes() {
     }
   }
 
-  return { scenes, add, rename, remove, overwrite, reorder, fire }
+  return { scenes, add, rename, remove, overwrite, reorder, fire, migrateDeviceIds }
 }

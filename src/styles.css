@@ -24,6 +24,8 @@ html, body, #app {
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   font-size: 14px;
   min-height: 100vh;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 .app {
@@ -894,6 +896,81 @@ details.row-section summary {
 
 .hub-main { flex: 1; padding: 1.5rem 2rem 2rem; max-width: 1600px; width: 100%; margin: 0 auto; }
 
+/* The supervisor is the only process controlled from the dashboard. Ableton
+   owns every VST instance, so this panel deliberately describes the Node
+   Manager/OSCQuery bridge instead of pretending to control the plug-ins. */
+.server-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.75rem 1rem;
+  padding: 0.9rem 1rem;
+  margin-bottom: 1rem;
+  border: 1px solid var(--hub-border);
+  border-radius: var(--hub-radius);
+  background: linear-gradient(135deg, rgba(99,102,241,0.08), rgba(6,182,212,0.035));
+  min-width: 0;
+}
+.server-control-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem 0.8rem;
+}
+.server-control-label {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.server-control-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0.55rem;
+  border: 1px solid var(--hub-border);
+  border-radius: 999px;
+  color: var(--hub-ink-mid);
+  font-family: var(--hub-mono);
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.server-control-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--hub-ink-dim);
+}
+.server-control-state.running { color: var(--hub-green); border-color: rgba(16,185,129,0.3); }
+.server-control-state.running .server-control-dot { background: var(--hub-green); box-shadow: 0 0 8px var(--hub-green-glow); }
+.server-control-state.restarting { color: var(--hub-yellow); border-color: rgba(245,158,11,0.3); }
+.server-control-state.restarting .server-control-dot { background: var(--hub-yellow); animation: hub-pulse-dot 1.2s ease-in-out infinite; }
+.server-control-state.error { color: var(--hub-red); border-color: rgba(239,68,68,0.4); }
+.server-control-state.error .server-control-dot { background: var(--hub-red); box-shadow: 0 0 7px var(--hub-red-glow); }
+.server-control-ports {
+  color: var(--hub-ink-dim);
+  font-family: var(--hub-mono);
+  font-size: 0.65rem;
+  overflow-wrap: anywhere;
+}
+.server-control-actions {
+  display: flex;
+  gap: 0.45rem;
+}
+.server-control-actions .hub-btn { min-width: 76px; }
+.server-control-error {
+  grid-column: 1 / -1;
+  color: var(--hub-red);
+  font-family: var(--hub-mono);
+  font-size: 0.67rem;
+  overflow-wrap: anywhere;
+}
+.server-control-note {
+  grid-column: 1 / -1;
+  color: var(--hub-ink-dim);
+  font-size: 0.62rem;
+}
+
 /* Stats row */
 .stats-row {
   display: grid;
@@ -995,7 +1072,7 @@ details.row-section summary {
 /* Device grid */
 .hub-dash .devices-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr));
   gap: 0.875rem;
   margin-bottom: 2rem;
 }
@@ -1042,6 +1119,12 @@ details.row-section summary {
   box-shadow: 0 0 0 1px rgba(16,185,129,0.1), 0 4px 20px rgba(0,0,0,0.2);
 }
 .device-card.connecting { border-color: rgba(245,158,11,0.35); }
+.device-card.discovered { border-color: rgba(245,158,11,0.28); border-style: dashed; }
+.device-card.unavailable,
+.device-card.error {
+  border-color: rgba(239,68,68,0.65);
+  background: linear-gradient(180deg, rgba(239,68,68,0.075), rgba(239,68,68,0.025));
+}
 /* Lost: emphasize hard. A subtle border isn't enough on a glance — make the
    whole card read "broken" with a strong red border, a tinted background,
    and a slow pulse so it draws the eye in a busy dashboard. */
@@ -1066,6 +1149,9 @@ details.row-section summary {
 .device-card.connected::before  { background: linear-gradient(90deg, transparent, var(--hub-green), transparent); opacity: 1; }
 .device-card.connecting::before { background: linear-gradient(90deg, transparent, var(--hub-yellow), transparent); opacity: 1; }
 .device-card.lost::before       { background: linear-gradient(90deg, transparent, var(--hub-red), transparent); opacity: 1; }
+.device-card.unavailable::before,
+.device-card.error::before      { background: linear-gradient(90deg, transparent, var(--hub-red), transparent); opacity: 1; }
+.device-card.discovered::before { background: linear-gradient(90deg, transparent, var(--hub-yellow), transparent); opacity: 0.65; }
 
 /* Top-right "×" remove button. Sits above the card content via z-index so it
    stays clickable when the card body has other absolutely-positioned bits.
@@ -1109,6 +1195,9 @@ details.row-section summary {
 .device-card.connected  .device-status-dot { background: var(--hub-green); box-shadow: 0 0 8px var(--hub-green-glow); }
 .device-card.connecting .device-status-dot { background: var(--hub-yellow); animation: hub-pulse-dot 1.2s ease-in-out infinite; }
 .device-card.lost       .device-status-dot { background: var(--hub-red); box-shadow: 0 0 6px var(--hub-red-glow); }
+.device-card.discovered .device-status-dot { background: var(--hub-yellow); }
+.device-card.unavailable .device-status-dot,
+.device-card.error .device-status-dot { background: var(--hub-red); box-shadow: 0 0 6px var(--hub-red-glow); }
 @keyframes hub-pulse-dot { 0%,100%{opacity:1; box-shadow:0 0 8px var(--hub-yellow-glow);} 50%{opacity:0.3; box-shadow:none;} }
 
 .device-name-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.2rem; }
@@ -1127,6 +1216,51 @@ details.row-section summary {
   font-size: 0.65rem; color: var(--hub-ink-dim);
   text-transform: uppercase; letter-spacing: 0.1em;
   margin-bottom: 0.75rem; font-family: var(--hub-mono);
+}
+
+.device-connection-summary {
+  margin: -0.2rem 0 0.75rem;
+  color: var(--hub-cyan);
+  font-family: var(--hub-mono);
+  font-size: 0.74rem;
+  overflow-wrap: anywhere;
+}
+.device-technical-details {
+  margin-bottom: 0.7rem;
+  border: 1px solid var(--hub-border);
+  border-radius: var(--hub-radius-sm);
+  background: rgba(0,0,0,0.12);
+  min-width: 0;
+}
+.device-technical-details > summary {
+  cursor: pointer;
+  padding: 0.45rem 0.65rem;
+  color: var(--hub-ink-dim);
+  font-size: 0.66rem;
+  user-select: none;
+}
+.device-technical-details[open] > summary { border-bottom: 1px solid var(--hub-border); color: var(--hub-ink-mid); }
+.device-technical-details .device-host-row { margin: 0.55rem; }
+.device-alias-list,
+.device-canonical-id {
+  padding: 0 0.65rem 0.55rem;
+  color: var(--hub-ink-mid);
+  font-family: var(--hub-mono);
+  font-size: 0.62rem;
+  overflow-wrap: anywhere;
+}
+.device-alias-list > div { display: flex; justify-content: space-between; gap: 0.6rem; padding: 0.15rem 0; }
+.device-alias-list span { color: var(--hub-ink-dim); }
+.device-canonical-id { color: var(--hub-ink-dim); }
+.device-error-text {
+  margin: 0.1rem 0 0.45rem;
+  padding: 0.4rem 0.55rem;
+  border-left: 2px solid var(--hub-red);
+  background: rgba(239,68,68,0.08);
+  color: var(--hub-red);
+  font-family: var(--hub-mono);
+  font-size: 0.64rem;
+  overflow-wrap: anywhere;
 }
 
 .device-host-row {
@@ -1181,6 +1315,9 @@ details.row-section summary {
   border: 1px solid rgba(239,68,68,0.45);
 }
 .device-status-text.connecting { color: var(--hub-yellow); }
+.device-status-text.discovered { color: var(--hub-yellow); }
+.device-status-text.unavailable,
+.device-status-text.error { color: var(--hub-red); font-weight: 600; }
 .device-msgs {
   display: inline-flex; align-items: center; gap: 0.4rem;
   font-family: var(--hub-mono); font-size: 0.68rem; color: var(--hub-accent);
@@ -1345,7 +1482,7 @@ details.row-section summary {
 
 /* Discovered grid */
 .hub-dash .discovered-grid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
   gap: 0.875rem; margin-bottom: 2rem;
 }
 .discovered-card {
@@ -1905,4 +2042,71 @@ details.row-section summary {
   background: rgba(255,255,255,0.04);
   padding: 0 4px; border-radius: 3px;
   color: var(--hub-cyan);
+}
+
+/* Stage-safe responsive layout: every control remains reachable without a
+   horizontal page scrollbar, including narrow floating plug-in windows. */
+@media (max-width: 900px) {
+  .hub-topbar {
+    position: relative;
+    height: auto;
+    min-height: 60px;
+    padding: 0.75rem 1rem;
+    flex-wrap: wrap;
+    gap: 0.55rem;
+  }
+  .hub-topbar-spacer { display: none; }
+  .hub-main { padding: 1rem; }
+  .stats-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .hub-dash .section-header { align-items: flex-start; flex-wrap: wrap; }
+  .hub-dash .manifest-header .manual-add-row.inline {
+    width: 100%;
+    margin-left: 0;
+  }
+  .server-control { grid-template-columns: 1fr; }
+  .server-control-actions { grid-column: 1; }
+  .server-control-note,
+  .server-control-error { grid-column: 1; }
+}
+
+@media (max-width: 600px) {
+  .app-nav { flex-wrap: wrap; }
+  .hub-topbar > * { max-width: 100%; }
+  .hub-logo { flex: 1 1 100%; }
+  .hub-rediscover-btn { margin-right: 0; }
+  .hub-main { padding: 0.75rem; }
+  .stats-row { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.5rem; }
+  .stat-card { padding: 0.75rem; }
+  .stat-num { font-size: 1.5rem; }
+  .ableton-banner { align-items: flex-start; flex-direction: column; }
+  .ableton-count { text-align: left; }
+  .server-control-actions { flex-wrap: wrap; }
+  .server-control-actions .hub-btn { min-width: calc(50% - 0.25rem); }
+  .hub-dash .manual-add-row.inline { align-items: stretch; }
+  .hub-dash .manual-add-row.inline .manual-add-input,
+  .hub-dash .manual-add-name,
+  .hub-dash .manual-add-host,
+  .hub-dash .manual-add-port {
+    flex: 1 1 100%;
+    width: 100%;
+    min-width: 0;
+  }
+  .hub-dash .manual-add-btn { width: 100%; }
+  .hub-dash .section-hint { flex-basis: 100%; line-height: 1.45; }
+  .device-card { padding: 0.9rem; }
+  .device-actions { flex-wrap: wrap; }
+  .device-actions .hub-btn { flex: 1 1 100%; }
+  .device-host-row { min-width: 0; flex-wrap: wrap; }
+  .device-host-input { flex: 1 1 calc(100% - 54px); }
+  .device-port-input { width: 76px; }
+  .device-alias-list > div { flex-direction: column; gap: 0.1rem; }
+  .hub-tree { grid-template-columns: minmax(90px, 1fr) minmax(120px, 1.5fr); }
+  .hub-tree-meta { display: none; }
+  .hub-announce-row label { width: 100%; }
+  .hub-dash .preset-form-row { flex-wrap: wrap; }
+  .hub-dash .preset-form-row label { min-width: 100%; }
+  .hub-dash .preset-form-actions,
+  .hub-dash .preset-form-error { margin-left: 0; }
+  .scene-save-input { min-width: 0; width: 100%; }
+  .hub-dash .empty { padding: 2rem 1rem; }
 }
