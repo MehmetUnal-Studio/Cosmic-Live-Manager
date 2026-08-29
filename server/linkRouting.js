@@ -161,6 +161,47 @@ function trustedEndpointForTarget(record, submittedTarget) {
 }
 
 /**
+ * Resolve a generic (CosmicUnity ↔ Android/OSCQuery) LINK target from
+ * server-owned registry state, mirroring the Ring paths' trust boundary: the
+ * browser may *select* a target, but the address, port and deviceType written
+ * into a device always come from the registry. A submitted target that the
+ * registry does not know is rejected instead of being dialed blindly.
+ */
+export function resolveGenericTargetFromRegistry(records, submittedTarget) {
+  const record = findRegistryDeviceForTarget(records, submittedTarget)
+  if (!record) {
+    throw new Error('LINK target must be present in the Device Registry')
+  }
+  if (
+    record.discoveryState !== 'Discovered' &&
+    record.connectionState !== 'Connected'
+  ) {
+    throw new Error('LINK target is unavailable')
+  }
+
+  const endpoint = trustedEndpointForTarget(record, submittedTarget) ||
+    [record.activeEndpoint, ...(record.endpoints || [])].find((candidate) =>
+      candidate?.host && validPort(candidate?.port) && candidate.available !== false
+    )
+  if (!endpoint) {
+    throw new Error('LINK target endpoint is not trusted')
+  }
+  return {
+    record,
+    target: {
+      address: endpoint.host,
+      port: validPort(endpoint.port),
+      fqdn: endpoint.fqdn || submittedTarget?.fqdn || '',
+      name: record.name || record.serviceName || endpoint.serviceName || submittedTarget?.name,
+      serviceName: record.serviceName || endpoint.serviceName || record.name,
+      deviceType: record.deviceType,
+      runtimeKind: record.runtimeKind,
+      linkRole: record.linkRole
+    }
+  }
+}
+
+/**
  * Resolve the Max/Ring peer from server-owned discovery/registry state. A
  * browser payload may identify a target by FQDN, but it never gets to choose
  * the host written into Ableton. This also makes a stale browser address safe

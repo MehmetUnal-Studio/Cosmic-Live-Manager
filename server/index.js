@@ -44,12 +44,15 @@ import {
 } from './cosmicNoiseForwarder.js'
 import {
   findRegistryDeviceForTarget,
+  resolveGenericTargetFromRegistry,
   resolveLinkAnnouncement,
   resolveRingReceiverFromRegistry,
   resolveRingInstrumentTargetFromRegistry,
   resolveRingInstrumentSourceFromRegistry,
   resolveOscUdpPort
 } from './linkRouting.js'
+import { planCollisionHeals } from './collisionHeal.js'
+import { hubBackpressureAction } from './hubBackpressure.js'
 import {
   isMaxRingReceiverDevice,
   isRingInstrumentIdentity
@@ -69,6 +72,16 @@ const HUB_NAME           = process.env.HUB_NAME || 'Cosmic Live Manager'
 const MANIFESTS_DIR      = process.env.MANIFESTS_DIR || './manifests'
 const CONNECTION_TIMEOUT_MS = 3000
 const DISCOVERY_STALE_TTL_MS = Number(process.env.DISCOVERY_STALE_TTL_MS || 15000)
+// WS keepalive toward managed OSCQuery devices (half-open detection).
+const OSCQUERY_KEEPALIVE_MS = Number(process.env.OSCQUERY_KEEPALIVE_MS || 5000)
+const OSCQUERY_KEEPALIVE_MAX_MISSED = Number(process.env.OSCQUERY_KEEPALIVE_MAX_MISSED || 2)
+const OSCQUERY_HOSTINFO_RETRY_MS = Number(process.env.OSCQUERY_HOSTINFO_RETRY_MS || 1000)
+// Discovered records with no goodbye: probe after this silence, prune if dead.
+const NO_GOODBYE_TTL_MS = Number(process.env.NO_GOODBYE_TTL_MS || 60_000)
+const REACHABILITY_PROBE_INTERVAL_MS = Number(process.env.REACHABILITY_PROBE_INTERVAL_MS || 10_000)
+const REACHABILITY_PROBE_TIMEOUT_MS = Number(process.env.REACHABILITY_PROBE_TIMEOUT_MS || 1500)
+// Persistent-id port-collision auto-heal scan interval.
+const COLLISION_HEAL_INTERVAL_MS = Number(process.env.COLLISION_HEAL_INTERVAL_MS || 5000)
 
 // Make sure `MANIFESTS_DIR` actually exists on disk. Fresh clones, Windows
 // machines, or a user who manually deleted the folder would otherwise hit
@@ -176,8 +189,33 @@ const hubClients = new Set()
 function broadcastHub(data) {
   const json = JSON.stringify(data)
   for (const ws of hubClients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(json)
+    if (ws.readyState !== WebSocket.OPEN) continue
+    // Backpressure: never let a sleeping/half-open dashboard socket buffer
+    // the whole show. Skip broadcasts while it lags; drop it when hopeless.
+    const action = hubBackpressureAction(ws.bufferedAmount)
+    if (action === 'drop') {
+      console.log(`[hub-ws] dropping stalled client (bufferedAmount=${ws.bufferedAmount})`)
+      hubClients.delete(ws)
+      try { ws.terminate() } catch {}
+      continue
+    }
+    if (action === 'skip') continue
+    ws.send(json)
   }
+}
+
+// ─── Hub-level status (OSC UDP listener health) ───────────────────────────
+// 'ok' once the UDP OSC listener is bound; 'degraded' while it is not
+// (port busy, bind error, or disabled via env). Manifests and device
+// connections boot regardless — only the raw UDP inbound path is affected.
+let oscListenState = 'degraded'
+function currentHubStatus() {
+  return { type: 'HUB_STATUS', oscListen: oscListenState === 'ok' ? 'ok' : 'degraded' }
+}
+function setOscListenState(next) {
+  if (oscListenState === next) return
+  oscListenState = next
+  broadcastHub(currentHubStatus())
 }
 
 function connectionStateFor(dev) {
@@ -364,9 +402,6 @@ function loadManifests() {
   const before = devices.size
   const oldDevices = new Map(devices)
   const oldManifestFilenames = new Map(manifestFilenames)
-  devices.clear()
-  manifestFilenames.clear()
-  manifestFilesByDeviceId.clear()
 
   try {
     const files = readdirSync(MANIFESTS_DIR).filter((f) => f.endsWith('.json')).sort()
@@ -387,9 +422,21 @@ function loadManifests() {
     }
 
     const migratedEntries = migrateManifestEntries(parsedEntries)
+
+    // Build the next maps completely BEFORE swapping them in. A mid-load
+    // exception must never leave `devices` half-cleared while clients and
+    // dashboards still reference the previous set.
+    const nextDevices = new Map()
+    const nextManifestFilenames = new Map()
+    const nextManifestFiles = new Map()
     for (const { file, manifest } of migratedEntries) {
       try {
-        manifestFilesByDeviceId.set(manifest.id, [file])
+        // Record EVERY parsed file per id — including duplicate-id shadow
+        // files — so a permanent delete removes all of them and none can
+        // resurrect the device on the next reload.
+        const knownFiles = nextManifestFiles.get(manifest.id) || []
+        knownFiles.push(file)
+        nextManifestFiles.set(manifest.id, knownFiles)
 
         // Status / runtime fields: preserve from the previous load if the
         // device still points at the same host:port AND its OSCQuery client
@@ -419,17 +466,25 @@ function loadManifests() {
             : CONNECTION_STATES.DISABLED
         }
 
-        if (devices.has(manifest.id)) {
+        if (nextDevices.has(manifest.id)) {
           console.log(`  [manifest] conflict: id ${manifest.id} already exists, skipping ${file}`)
           continue
         }
 
-        devices.set(manifest.id, manifest)
-        manifestFilenames.set(manifest.id, file)
+        nextDevices.set(manifest.id, manifest)
+        nextManifestFilenames.set(manifest.id, file)
       } catch (err) {
         console.log(`  [manifest] read error (${file}): ${err.message}`)
       }
     }
+
+    // Atomic swap: only now touch the shared maps.
+    devices.clear()
+    for (const [id, manifest] of nextDevices) devices.set(id, manifest)
+    manifestFilenames.clear()
+    for (const [id, file] of nextManifestFilenames) manifestFilenames.set(id, file)
+    manifestFilesByDeviceId.clear()
+    for (const [id, list] of nextManifestFiles) manifestFilesByDeviceId.set(id, list)
 
     rebuildDeviceRegistry()
     console.log(`  [manifest] loaded ${devices.size} canonical device(s)  (was ${before})`)
@@ -513,15 +568,19 @@ function connectToDevice(dev) {
       currentDev.connectionState = CONNECTION_STATES.CONNECTED
       currentDev.error = null
       currentDev.lastMessageAt = Date.now()
+      currentDev.consecutiveConnectFailures = 0
       // Keep only an OSC UDP port actually advertised by HOST_INFO. The
       // OSCQuery HTTP port is not a safe fallback for CosmicUnity: the VST's
       // control UDP listener is intentionally independent.
       currentDev.oscPort = isValidOscPort(Number(client.hostInfo?.OSC_PORT))
         ? Number(client.hostInfo.OSC_PORT)
         : null
-      const ns = client.lastNamespace
-      if (ns) {
-        const count = countParams(ns)
+      if (client.lastNamespace) {
+        // flatNodes is bounded by the client's namespace caps; re-walking
+        // the raw tree here would reintroduce unguarded recursion.
+        const count = Array.isArray(client.flatNodes)
+          ? client.flatNodes.length
+          : countParams(client.lastNamespace)
         currentDev.paramCount = count
         console.log(`  [client] ✓ ${currentDev.name} connected (${count} params)`)
       }
@@ -543,6 +602,9 @@ function connectToDevice(dev) {
       currentDev.status = 'lost'
       currentDev.connectionState = CONNECTION_STATES.UNAVAILABLE
       currentDev.error = reason
+      // The cached OSC UDP port dies with the connection. A restarted device
+      // rebinds a new ephemeral port; writes to the old one silently vanish.
+      currentDev.oscPort = null
       console.log(`  [client] ✗ ${currentDev.name} lost: ${reason}`)
       broadcastDeviceUpdate(currentDev)
     },
@@ -550,6 +612,8 @@ function connectToDevice(dev) {
       if (oscQueryClients.get(dev.id) !== client) return
       const currentDev = devices.get(dev.id)
       if (!currentDev) return
+      currentDev.consecutiveConnectFailures =
+        (Number(currentDev.consecutiveConnectFailures) || 0) + 1
       currentDev.status = details.timeout ? 'unavailable' : 'error'
       currentDev.connectionState = details.timeout
         ? CONNECTION_STATES.UNAVAILABLE
@@ -599,12 +663,17 @@ function connectToDevice(dev) {
   }, {
     reconnectDelayMs: 3000,
     disconnectReconnectDelayMs: 500,
-    attemptTimeoutMs: CONNECTION_TIMEOUT_MS
+    attemptTimeoutMs: CONNECTION_TIMEOUT_MS,
+    keepaliveIntervalMs: OSCQUERY_KEEPALIVE_MS,
+    keepaliveMaxMissed: OSCQUERY_KEEPALIVE_MAX_MISSED,
+    hostInfoRetryBaseMs: OSCQUERY_HOSTINFO_RETRY_MS
   })
 
   oscQueryClients.set(dev.id, client)
   client.connect()
 }
+
+let managedNamespaceCapLogged = false
 
 function handleClientValue(dev, path, value, metadata = {}) {
   const receivedAt = Date.now()
@@ -645,7 +714,13 @@ function handleClientValue(dev, path, value, metadata = {}) {
   }
 
   if (!namespace.has(hubPath) && namespace.size >= MAX_NAMESPACE) {
-    return // hard cap to prevent runaway memory if a device misbehaves
+    // Hard cap to prevent runaway memory if a device misbehaves. Log the
+    // first drop so a filled cap is diagnosable, then stay quiet.
+    if (!managedNamespaceCapLogged) {
+      managedNamespaceCapLogged = true
+      console.log(`  [hub] namespace cap reached (${MAX_NAMESPACE}); new managed paths are being dropped (logged once)`)
+    }
+    return
   }
   namespace.set(hubPath, {
     fullPath: hubPath,
@@ -692,8 +767,10 @@ function broadcastDeviceUpdate(dev) {
 const RUNTIME_ONLY_MANIFEST_FIELDS = new Set([
   'activeEndpoint',
   'connectionState',
+  'consecutiveConnectFailures',
   'discoveryState',
   'error',
+  'reachability',
   'hostInfo',
   'isLocal',
   'lastMessageAt',
@@ -719,7 +796,13 @@ function saveManifest(deviceId, updates) {
     return { ok: false, error: `Device not found: id ${deviceId}` }
   }
 
-  if (updates.host !== undefined && !isValidHost(updates.host)) {
+  // `updates` can arrive verbatim from any /ws/hub client. Validate every
+  // field type defensively — a malformed payload must produce an error
+  // result, never a thrown TypeError that would kill the hub process.
+  if (updates === null || typeof updates !== 'object' || Array.isArray(updates)) {
+    return { ok: false, error: 'Invalid updates payload' }
+  }
+  if (updates.host !== undefined && (typeof updates.host !== 'string' || !isValidHost(updates.host))) {
     return { ok: false, error: `Invalid host: ${updates.host}` }
   }
   if (updates.oscQueryPort !== undefined && !isValidOscPort(updates.oscQueryPort)) {
@@ -727,9 +810,15 @@ function saveManifest(deviceId, updates) {
   }
   if (
     updates.name !== undefined &&
-    (updates.name.trim().length === 0 || updates.name.length > 64)
+    (typeof updates.name !== 'string' || updates.name.trim().length === 0 || updates.name.length > 64)
   ) {
     return { ok: false, error: 'Invalid device name' }
+  }
+  if (updates.enabled !== undefined && typeof updates.enabled !== 'boolean') {
+    return { ok: false, error: 'Invalid enabled flag' }
+  }
+  if (updates.description !== undefined && typeof updates.description !== 'string') {
+    return { ok: false, error: 'Invalid description' }
   }
 
   // Start from every non-runtime field loaded from disk so migrations and
@@ -778,6 +867,17 @@ function saveManifest(deviceId, updates) {
       runtimeGeneration: lifecycleChanged
         ? nextDeviceRuntimeGeneration++
         : (dev.runtimeGeneration || nextDeviceRuntimeGeneration++),
+      // Preserve runtime-only state across a plain settings/identity save.
+      // Losing dev.oscPort here would forget the HOST_INFO-advertised OSC
+      // UDP port and fail-close every subsequent SET_DEVICE_PARAM. A
+      // lifecycle change resets these because the client reconnects.
+      oscPort: lifecycleChanged ? null : (dev.oscPort ?? null),
+      hostInfo: lifecycleChanged ? undefined : dev.hostInfo,
+      paramCount: lifecycleChanged ? undefined : dev.paramCount,
+      lastMessageAt: lifecycleChanged ? undefined : dev.lastMessageAt,
+      consecutiveConnectFailures: lifecycleChanged
+        ? 0
+        : (dev.consecutiveConnectFailures || 0),
       status: updated.enabled
         ? (lifecycleChanged ? 'configured' : dev.status)
         : 'disabled',
@@ -789,6 +889,15 @@ function saveManifest(deviceId, updates) {
     devices.set(deviceId, newDev)
     rebuildDeviceRegistry()
     applyRegistryIdentity(newDev, deviceRegistry.findByManifestId(deviceId))
+
+    // Renaming changes the hub-path prefix (/<name>/...). Drop the old-name
+    // namespace entries so they don't linger as orphans until restart; live
+    // values repopulate immediately under the new prefix.
+    if (updates.name !== undefined && updates.name !== oldDev.name) {
+      for (const [path, param] of namespace.entries()) {
+        if (param.deviceId === deviceId) namespace.delete(path)
+      }
+    }
 
     console.log(`  [manifest] saved ${dev.name} (id ${deviceId})`)
     if (updates.host !== undefined) console.log(`     host: ${oldDev.host} → ${updated.host}`)
@@ -942,16 +1051,66 @@ function bootHub() {
   }
 }
 
+// The hub boot (manifests, watcher, device clients) must never depend on the
+// UDP OSC listener actually binding. When the port is busy the hub runs in a
+// degraded mode (HUB_STATUS oscListen:'degraded') and keeps retrying the bind
+// with backoff.
+let hubBooted = false
+function ensureHubBooted() {
+  if (hubBooted) return
+  hubBooted = true
+  bootHub()
+}
+
+let oscListenBound = false
+let oscRebindTimer = null
+let oscRebindAttempts = 0
+function scheduleOscListenRebind() {
+  if (isShuttingDown || oscRebindTimer || process.env.OSC_LISTEN_DISABLED === '1') return
+  const delay = Math.min(1000 * 2 ** Math.min(oscRebindAttempts, 4), 10_000)
+  oscRebindAttempts++
+  console.log(`[osc-hub] retrying UDP bind on ${OSC_LISTEN_PORT} in ${delay} ms (attempt ${oscRebindAttempts})`)
+  oscRebindTimer = setTimeout(() => {
+    oscRebindTimer = null
+    if (isShuttingDown || oscListenBound) return
+    // osc.UDPPort.open() is a no-op while `socket` is set; discard the
+    // errored socket so a fresh bind attempt can run.
+    try { udpHubPort.socket?.close() } catch {}
+    udpHubPort.socket = null
+    try {
+      udpHubPort.open()
+    } catch (err) {
+      console.error('[osc-hub] rebind attempt failed:', err.message)
+      scheduleOscListenRebind()
+    }
+  }, delay)
+  if (typeof oscRebindTimer.unref === 'function') oscRebindTimer.unref()
+}
+
 udpHubPort.on('ready', () => {
+  oscListenBound = true
+  oscRebindAttempts = 0
   console.log(`[osc-hub] listening for UDP OSC on 0.0.0.0:${OSC_LISTEN_PORT}`)
   for (const ip of lanAddresses()) {
     console.log(`[osc-hub] LAN address: ${ip.address}  (interface ${ip.name})`)
   }
-  bootHub()
+  setOscListenState('ok')
+  ensureHubBooted()
+})
+
+udpHubPort.on('close', () => {
+  oscListenBound = false
 })
 
 udpHubPort.on('error', (err) => {
   console.error('[osc-hub] socket error:', err.message)
+  if (oscListenBound) return // runtime send error — the listener itself is fine
+  // Bind failure (e.g. EADDRINUSE): the hub must still come up with all
+  // manifests and device connections. Surface the degraded OSC listener to
+  // the UI and keep retrying the bind in the background.
+  setOscListenState('degraded')
+  ensureHubBooted()
+  scheduleOscListenRebind()
 })
 
 udpHubPort.on('message', (oscMsg, _timeTag, info) => {
@@ -1034,7 +1193,7 @@ if (process.env.OSC_LISTEN_DISABLED === '1') {
   // The boot logic normally fires inside the UDP 'ready' callback; since
   // we're not opening that socket, run it directly. Defer one tick so the
   // rest of this module finishes setting up handlers first.
-  setImmediate(bootHub)
+  setImmediate(ensureHubBooted)
 } else {
   udpHubPort.open()
 }
@@ -1156,6 +1315,82 @@ const discoveryStaleTimer = setInterval(() => {
   if (removed.length > 0) broadcastDiscovered()
 }, 1000)
 discoveryStaleTimer.unref()
+
+// ─── Reachability prober (no-goodbye ghosts) ─────────────────────────────
+// bonjour-service only emits 'down' on an explicit TTL=0 goodbye packet.
+// Devices that hard-power-off stay 'Discovered' forever without this: after
+// NO_GOODBYE_TTL_MS of silence a record is marked 'silent' and probed over
+// HTTP; a failed probe marks it 'dead' + Stale, which makes it prunable.
+const reachabilityProbesInFlight = new Set()
+
+async function probeEndpointReachability(endpoint) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), REACHABILITY_PROBE_TIMEOUT_MS)
+  try {
+    // Any HTTP response — even an error status — proves the host is alive.
+    await fetch(`http://${endpoint.host}:${endpoint.port}/?HOST_INFO`, {
+      signal: controller.signal
+    })
+    return true
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+const reachabilityTimer = setInterval(() => {
+  const candidates = deviceRegistry.reachabilityProbeCandidates(NO_GOODBYE_TTL_MS)
+  for (const record of candidates) {
+    const endpoint = record.activeEndpoint ||
+      (record.endpoints || []).find((item) => item?.host && item?.port)
+    if (!endpoint?.host || !endpoint?.port) continue
+    if (reachabilityProbesInFlight.has(record.canonicalId)) continue
+    reachabilityProbesInFlight.add(record.canonicalId)
+    probeEndpointReachability(endpoint)
+      .then((ok) => {
+        deviceRegistry.markProbeResult(record.canonicalId, ok)
+        if (!ok) {
+          console.log(`  [registry] no-goodbye ghost pruned to Stale: ${record.canonicalId}`)
+          broadcastDiscovered()
+        }
+      })
+      .catch(() => {})
+      .finally(() => reachabilityProbesInFlight.delete(record.canonicalId))
+  }
+}, REACHABILITY_PROBE_INTERVAL_MS)
+reachabilityTimer.unref()
+
+// ─── Persistent-id port-collision auto-heal ──────────────────────────────
+// A restarted VST that rebinds a fallback OSCQuery port leaves the saved
+// card on a dead port plus an unsaved collision card. Once the old endpoint
+// is confirmed dead (repeated failed connect attempts) migrate the saved
+// manifest to the collision endpoint. Both-alive collisions stay visible.
+const collisionHealTimer = setInterval(() => {
+  try {
+    const plans = planCollisionHeals({
+      snapshot: deviceRegistry.snapshot(),
+      getManagedDevice: (manifestId) => devices.get(manifestId)
+    })
+    for (const plan of plans) {
+      console.log(
+        `  [registry] collision auto-heal: device ${plan.manifestId} → ` +
+        `${plan.host}:${plan.oscQueryPort} (old endpoint dead; ${plan.collisionCanonicalId})`
+      )
+      const result = saveManifest(plan.manifestId, {
+        host: plan.host,
+        oscQueryPort: plan.oscQueryPort
+      })
+      if (!result.ok) {
+        console.log(`  [registry] collision auto-heal failed for device ${plan.manifestId}: ${result.error}`)
+      }
+    }
+    if (plans.length > 0) broadcastDiscovered()
+  } catch (err) {
+    console.log(`  [registry] collision heal error: ${err.message}`)
+  }
+}, COLLISION_HEAL_INTERVAL_MS)
+collisionHealTimer.unref()
 
 startBrowser()
 
@@ -1323,6 +1558,7 @@ wssHub.on('connection', (ws, req) => {
         }
       : null
   }))
+  ws.send(JSON.stringify(currentHubStatus()))
 
   // A browser can open long after devices connected. Re-send each currently
   // known OSCQuery namespace so a page refresh does not show zero/partial
@@ -1341,7 +1577,26 @@ wssHub.on('connection', (ws, req) => {
   ws.on('message', (raw) => {
     let msg
     try { msg = JSON.parse(raw.toString()) } catch { return }
+    // Every payload below comes from an unauthenticated LAN client. A throw
+    // in this handler would propagate to the emitter and kill the hub
+    // process mid-show, so the whole dispatch is fenced.
+    try {
+      handleHubMessage(ws, ip, msg)
+    } catch (err) {
+      console.error(`[hub-ws] message handler error (type=${msg?.type}): ${err?.stack || err}`)
+      try {
+        ws.send(JSON.stringify({
+          type: 'ERROR',
+          message: `Internal error handling ${String(msg?.type || 'message')}`
+        }))
+      } catch {}
+    }
+  })
 
+  ws.on('close', () => hubClients.delete(ws))
+})
+
+function handleHubMessage(ws, ip, msg) {
     // OSCQuery-style SET — write a value into the hub namespace and rebroadcast.
     if (msg.type === 'SET' && msg.path && msg.value !== undefined) {
       if (!OSC_PATH_RE.test(msg.path)) return
@@ -1374,7 +1629,10 @@ wssHub.on('connection', (ws, req) => {
     }
 
     if (msg.type === 'UPDATE_DEVICE' && typeof msg.deviceId === 'number') {
-      const result = saveManifest(msg.deviceId, msg.updates || {})
+      const updates = (msg.updates !== undefined && msg.updates !== null)
+        ? msg.updates
+        : {}
+      const result = saveManifest(msg.deviceId, updates)
       ws.send(JSON.stringify({
         type: 'UPDATE_DEVICE_RESULT',
         deviceId: msg.deviceId,
@@ -1399,20 +1657,60 @@ wssHub.on('connection', (ws, req) => {
     }
 
     // SET_DEVICE_PARAM — write a value back to one of the managed devices.
-    // We send it as a UDP/OSC packet to the device's OSC port (from
-    // HOST_INFO, falling back to the OSCQuery HTTP port). The device should
-    // echo the new value back over its WS, which then re-broadcasts via
-    // PATH_CHANGED so every dashboard sees the update.
+    // The UDP/OSC packet goes to the device's OSC port learned from
+    // HOST_INFO. The OSCQuery HTTP port is NEVER a fallback (CosmicUnity's
+    // control UDP listener is an independent ephemeral port): when the OSC
+    // port is unknown the write fails closed and the failure is surfaced to
+    // the UI via PARAM_RESULT so no dashboard displays a value that was
+    // never applied.
     if (msg.type === 'SET_DEVICE_PARAM' && typeof msg.deviceId === 'number' && msg.path) {
+      const requestId =
+        typeof msg.requestId === 'string' || typeof msg.requestId === 'number'
+          ? msg.requestId
+          : null
+      const reply = (ok, reason) => {
+        ws.send(JSON.stringify({
+          type: 'PARAM_RESULT',
+          requestId,
+          deviceId: msg.deviceId,
+          path: msg.path,
+          ok,
+          ...(reason ? { reason } : {})
+        }))
+      }
       const dev = devices.get(msg.deviceId)
-      if (!dev) return
-      if (!OSC_PATH_RE.test(msg.path)) return
-      const oscPort = Number(dev.oscPort) || Number(dev.oscQueryPort)
+      if (!dev) return reply(false, 'unknown-device')
+      if (typeof msg.path !== 'string' || !OSC_PATH_RE.test(msg.path)) {
+        return reply(false, 'invalid-path')
+      }
+      const oscPort = Number(dev.oscPort)
+      if (!isValidOscPort(oscPort)) {
+        // HOST_INFO has not (re)delivered the device's OSC UDP port yet; the
+        // client retries it with backoff in the background. Fail closed —
+        // sending to the HTTP port number would silently vanish.
+        return reply(false, 'osc-port-unknown')
+      }
+      const hubPath = `/${dev.name}${msg.path}`
+      if (!namespace.has(hubPath)) {
+        // Fail closed on a path the synced tree has never seen: the device
+        // would drop the write while we report ok — a typo or a stale
+        // dashboard 99% of the time. Only enforce once at least one node of
+        // this device's tree has synced, so a mid-sync write to a node the
+        // hub simply hasn't listed yet is not rejected. Dynamically created
+        // nodes are covered: they enter `namespace` via PATH_CHANGED isNew.
+        const treePrefix = `/${dev.name}/`
+        let treeSynced = false
+        for (const key of namespace.keys()) {
+          if (key.startsWith(treePrefix)) { treeSynced = true; break }
+        }
+        if (treeSynced) return reply(false, 'unknown-path')
+      }
       const args = Array.isArray(msg.value) ? msg.value : (msg.value === undefined ? [] : [msg.value])
       sendOscViaSender(dev.host, oscPort, msg.path, args)
+      reply(true)
       // Optimistic local update so other dashboards see the change quickly
-      // even before the device echoes it back.
-      const hubPath = `/${dev.name}${msg.path}`
+      // even before the device echoes it back. Only after a real send: a
+      // failed write must never be broadcast as applied.
       const existing = namespace.get(hubPath)
       if (existing) {
         existing.value = args
@@ -1480,6 +1778,13 @@ wssHub.on('connection', (ws, req) => {
             selectedRegistryDevice = resolved.record
             selectedTarget = resolved.target
           }
+        } else {
+          // Generic (CosmicUnity ↔ Android/OSCQuery) direction: the same
+          // server-owned trust boundary as the Ring paths. The browser only
+          // selects; address, port and deviceType come from the registry.
+          const resolved = resolveGenericTargetFromRegistry(registrySnapshot, target)
+          selectedRegistryDevice = resolved.record
+          selectedTarget = resolved.target
         }
         const selectedManagedDevice = selectedRegistryDevice?.manifestId != null
           ? devices.get(selectedRegistryDevice.manifestId)
@@ -1492,7 +1797,8 @@ wssHub.on('connection', (ws, req) => {
           },
           selectedTarget: {
             ...selectedTarget,
-            deviceType: selectedTarget.deviceType || selectedRegistryDevice?.deviceType,
+            // Registry identity beats any browser-asserted type.
+            deviceType: selectedRegistryDevice?.deviceType || selectedTarget.deviceType,
             runtimeKind: selectedRegistryDevice?.runtimeKind,
             linkRole: selectedRegistryDevice?.linkRole,
             oscPort: selectedManagedDevice?.oscPort || selectedTarget.oscPort
@@ -1758,10 +2064,7 @@ wssHub.on('connection', (ws, req) => {
       }))
       broadcastDiscovered()
     }
-  })
-
-  ws.on('close', () => hubClients.delete(ws))
-})
+}
 
 // ─── Periodic broadcast: per-device message counters ──────────────────────
 const deviceMessageCounterTimer = setInterval(() => {
@@ -1811,6 +2114,9 @@ function shutdown(signal = 'SIGTERM') {
   if (cosmicNoiseSnapshotTimer) clearInterval(cosmicNoiseSnapshotTimer)
   clearInterval(deviceMessageCounterTimer)
   clearInterval(discoveryStaleTimer)
+  clearInterval(reachabilityTimer)
+  clearInterval(collisionHealTimer)
+  if (oscRebindTimer) clearTimeout(oscRebindTimer)
   if (manifestReloadTimer) clearTimeout(manifestReloadTimer)
   try { manifestWatcher?.close() } catch {}
   try { browser?.stop() } catch {}
@@ -1839,3 +2145,18 @@ function shutdown(signal = 'SIGTERM') {
 
 process.on('SIGINT', () => shutdown('SIGINT'))
 process.on('SIGTERM', () => shutdown('SIGTERM'))
+
+// ─── Last-resort process guards ───────────────────────────────────────────
+// Defense in depth behind the per-handler try/catch fences: a bug anywhere
+// must be logged loudly but must NOT take the hub down mid-show — the
+// supervisor does not auto-restart an unexpected exit, so a crash here means
+// every device link stays dark until an operator notices.
+process.on('uncaughtException', (err) => {
+  console.error('[hub] LAST-RESORT uncaughtException (hub kept alive):', err?.stack || err)
+})
+process.on('unhandledRejection', (reason) => {
+  console.error(
+    '[hub] LAST-RESORT unhandledRejection (hub kept alive):',
+    reason?.stack || reason
+  )
+})
