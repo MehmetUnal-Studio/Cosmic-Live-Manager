@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, toRef, watch } from 'vue'
+import { computed, inject, onBeforeUnmount, onMounted, ref, toRef, watch } from 'vue'
 import ParameterControl from './ParameterControl.vue'
 import PresetSection from './PresetSection.vue'
 import RecordingPanel from './RecordingPanel.vue'
@@ -85,13 +85,89 @@ function commitPort() {
   if (n === props.device.oscQueryPort) return
   emit('update', { oscQueryPort: n })
 }
-function toggleEnabled() { emit('update', { enabled: !props.device.enabled }) }
+// ─── Enable/Disable with pending state (F2-7) ───────────────────────────
+// The old handler computed `!props.device.enabled` from props that only
+// refresh after the server round-trip — a quick double-tap re-sent the
+// first tap's value. Route through the state layer's setDeviceEnabled
+// (desired-state semantics + pending tracking) and lock the button while
+// the request is in flight.
+const localEnablePending = ref(false)
+let enableTimer = null
+// The state layer tracks in-flight toggles in `pendingToggles`
+// (Map<deviceId, { desired, requestedAt }>) and clears them on the
+// DEVICE_UPDATED ack or a timeout. Fall back to a local lock if absent.
+const enablePending = computed(() => {
+  const pt = hubApi.pendingToggles?.value
+  if (pt && typeof pt.has === 'function') return pt.has(props.device.id)
+  return localEnablePending.value
+})
+const pendingDesired = computed(() => {
+  const pt = hubApi.pendingToggles?.value
+  const entry = pt && typeof pt.get === 'function' ? pt.get(props.device.id) : null
+  return entry ? entry.desired : null
+})
+function toggleEnabled() {
+  if (enablePending.value) return
+  const desired = !props.device.enabled
+  const fn = hubApi.setDeviceEnabled
+  if (typeof fn === 'function') {
+    fn(props.device.id, desired) // pendingToggles drives the button lock
+    return
+  }
+  // State layer not present — legacy path via the parent, local lock.
+  localEnablePending.value = true
+  clearTimeout(enableTimer)
+  enableTimer = setTimeout(() => { localEnablePending.value = false }, 2500)
+  emit('update', { enabled: desired })
+}
+// Server ack (DEVICE_UPDATED) reflects into props — release the local lock.
+watch(() => props.device.enabled, () => {
+  clearTimeout(enableTimer)
+  localEnablePending.value = false
+})
 const isSaved = computed(() => props.device.saved !== false && props.device.id != null)
+
+// ─── Identity collision surfacing (F2-3) ────────────────────────────────
+// The registry forks a scoped `:port:` identity when two instances share a
+// cloned persistent UUID and marks it via identitySource. The fix path is
+// on the plugin ("Yeni ID"), so tell the operator exactly that.
+const COLLISION_SOURCES = new Set([
+  'persistent-id-port-collision',
+  'persistent-id-remote-collision'
+])
+const identityCollision = computed(() => COLLISION_SOURCES.has(props.device.identitySource))
+const collisionEndpoints = computed(() =>
+  (props.device.endpoints || []).map((ep) => `${ep.host}:${ep.port}`)
+)
+
+// ─── Reachability (server-side liveness probe) ──────────────────────────
+// 'silent' = link is up but the device has gone mute; 'dead' = probe failed.
+const reachability = computed(() => props.device.reachability || null)
+
+// ─── Cheap params reactivity (pairs with the state layer's R9 work) ─────
+// When deviceParams becomes a shallowRef Map mutated in place, props.params
+// keeps its identity across updates. The state layer bumps a per-device
+// deviceParamsVersion instead; depending on it here means only THIS card
+// recomputes when its own params change. Defensive across shapes:
+// Map<id, Ref<number>>, Map<id, number>, or a single counter ref.
+const paramsRev = computed(() => {
+  // Preferred: lazily-created per-device version ref from the state layer.
+  if (typeof hubApi.paramsVersionFor === 'function') {
+    const r = hubApi.paramsVersionFor(props.device.id)
+    return (r && typeof r === 'object' && 'value' in r) ? r.value : (Number(r) || 0)
+  }
+  // Fallback: global counter (coarser, still correct).
+  const dpv = hubApi.deviceParamsVersion
+  if (!dpv) return 0
+  const raw = (typeof dpv === 'object' && 'value' in dpv) ? dpv.value : dpv
+  return Number(raw) || 0
+})
 
 // ─── Parameters: group by parent path ────────────────────────────────────
 // Split each path into "parent" +
 // "leaf" and bucket by parent. Sort alphabetically for stability.
 const grouped = computed(() => {
+  void paramsRev.value // dependency: in-place Map mutations bump this
   const out = new Map()
   for (const node of props.params.values()) {
     const p = node.FULL_PATH || ''
@@ -135,14 +211,10 @@ function flashPath(p) {
     flashed.value = n2
   }, FLASH_MS))
 }
-watch(() => props.params, (m, prev) => {
-  if (!prev) return
-  for (const [path, node] of m.entries()) {
-    const old = prev.get(path)
-    if (!old) continue
-    if (JSON.stringify(old.VALUE) !== JSON.stringify(node.VALUE)) flashPath(path)
-  }
-}, { deep: true })
+// Flash marking now hangs off the exact PATH_CHANGED event (see the
+// onPathChange listener below) instead of a deep JSON.stringify watch over
+// every param per message — zero diffing, and it pauses while the
+// Dashboard page is hidden (v-show'd away during a performance).
 
 function onParamSet(payload) {
   // ParameterControl emits { path, value } where path is the device-RELATIVE
@@ -220,7 +292,8 @@ reloadPresets = reloadPresetStorage
 // We pull `onPathChange` (for capturing) and `setDeviceParam` (for playback
 // dispatch) from useHub. The deviceName getter is intentionally a closure
 // so renames are reflected at save time without re-subscribing.
-const { onPathChange, setDeviceParam } = useHub()
+const hubApi = useHub()
+const { onPathChange, setDeviceParam } = hubApi
 const recording = useRecording(
   props.device.id,
   onPathChange,
@@ -235,12 +308,19 @@ const recording = useRecording(
 const msgActive = ref(false)
 let msgActiveTimer = null
 let stopMsgListener = null
+// Injected from App.vue — false while the operator is on the Performance
+// page. Both pages stay mounted (v-show), so cosmetic per-message work
+// (activity dot, value flashes) must pause when this card isn't on screen.
+const dashboardVisible = inject('dashboardVisible', ref(true))
 onMounted(() => {
-  stopMsgListener = onPathChange((deviceId) => {
+  stopMsgListener = onPathChange((deviceId, relPath) => {
     if (deviceId !== props.device.id) return
+    if (!dashboardVisible.value) return
     msgActive.value = true
     if (msgActiveTimer) clearTimeout(msgActiveTimer)
     msgActiveTimer = setTimeout(() => { msgActive.value = false }, 180)
+    // Value flash — only pay for it while the params list can be seen.
+    if (expanded.value && relPath) flashPath(relPath)
   })
 })
 onBeforeUnmount(() => {
@@ -254,6 +334,7 @@ onBeforeUnmount(() => {
 // PresetSection wants a flat object { [path]: node }. We have a Map; convert
 // once here. Lightweight enough to compute on every params change.
 const flatObj = computed(() => {
+  void paramsRev.value
   const o = {}
   for (const [path, node] of props.params.entries()) o[path] = node
   return o
@@ -520,11 +601,14 @@ const deviceTypeLabel = computed(() => isMaxRingReceiver.value
 const udpOverrideHint = computed(() => usesMaxRingRoute.value
   ? `${MAX_RING_DEFAULT_UDP_PORT} = Max/Ring alım portu`
   : '0 = VST için otomatik benzersiz port')
-const paramCount = computed(() => props.params.size)
+const paramCount = computed(() => {
+  void paramsRev.value
+  return props.params.size
+})
 </script>
 
 <template>
-  <div class="device-card" :class="statusClass">
+  <div class="device-card" :class="[statusClass, { 'identity-collision': identityCollision }]">
     <button
       v-if="isSaved"
       class="device-remove"
@@ -547,7 +631,24 @@ const paramCount = computed(() => props.params.size)
             spellcheck="false"
           />
         </div>
-        <div class="device-type">{{ deviceTypeLabel }}</div>
+        <div class="device-type">
+          {{ deviceTypeLabel }}
+          <span v-if="identityCollision" class="device-collision-badge">Kimlik Çakışması</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Cloned persistent-ID collision: the fix lives on the plugin side
+         ("Yeni ID"), so surface it here loudly instead of hiding a :port:
+         suffix inside the Details block. -->
+    <div v-if="identityCollision" class="device-collision-banner" role="alert">
+      <strong>⚠ KLONLANMIŞ KİMLİK ÇAKIŞMASI</strong>
+      <span>
+        Klonlanmış kimlik çakışması — cihazın editöründeki <strong>YENİ ID</strong>
+        butonuna basın, ardından <strong>Rediscover</strong>'a tıklayın.
+      </span>
+      <div v-if="collisionEndpoints.length" class="dcb-endpoints">
+        <div v-for="ep in collisionEndpoints" :key="ep">{{ ep }}</div>
       </div>
     </div>
 
@@ -585,6 +686,16 @@ const paramCount = computed(() => props.params.size)
     <div class="device-footer">
       <div class="device-status-row">
         <span class="device-status-text" :class="statusClass">{{ statusLabel }}</span>
+        <span
+          v-if="reachability === 'silent'"
+          class="device-reach-badge"
+          title="Bağlantı açık ama cihazdan veri gelmiyor"
+        >SESSİZ</span>
+        <span
+          v-else-if="reachability === 'dead'"
+          class="device-reach-badge dead"
+          title="Cihaz yanıt vermiyor"
+        >YANIT YOK</span>
         <span v-if="msgCount > 0" class="device-msgs">
           <span
             class="msg-activity-dot"
@@ -599,11 +710,14 @@ const paramCount = computed(() => props.params.size)
         <button
           v-if="isSaved"
           class="hub-btn"
-          :class="{ 'hub-btn-primary': device.enabled }"
+          :class="{ 'hub-btn-primary': device.enabled, pending: enablePending }"
+          :disabled="enablePending"
           @click="toggleEnabled"
         >
-          <span class="hub-btn-icon">{{ device.enabled ? '●' : '○' }}</span>
-          {{ device.enabled ? 'Enabled' : 'Enable' }}
+          <span class="hub-btn-icon">{{ enablePending ? '◌' : (device.enabled ? '●' : '○') }}</span>
+          {{ enablePending
+            ? ((pendingDesired ?? !device.enabled) ? 'Açılıyor…' : 'Kapatılıyor…')
+            : (device.enabled ? 'Enabled' : 'Enable') }}
         </button>
         <button v-if="isSaved" class="hub-btn" :disabled="!device.enabled" @click="emit('reconnect')">
           ⟳ Tekrar Dene

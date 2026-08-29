@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import { useHub } from '../composables/useHub.js'
 import { usePerformancePresets } from '../composables/usePerformancePresets.js'
 import PerformancePreset from './PerformancePreset.vue'
@@ -12,7 +12,17 @@ import AddPresetModal from './AddPresetModal.vue'
 // Persistence: usePerformancePresets() auto-saves to localStorage. We also
 // expose Export/Import JSON buttons for backup and sharing.
 
-const { devices, deviceParams, setDeviceParam } = useHub()
+const hub = useHub()
+const { devices, deviceParams, setDeviceParam } = hub
+
+// Hub link state — fire surfaces get an inert/dimmed look while the link is
+// down, and firing reports failure instead of flashing a false success.
+const connState = computed(() => {
+  const cs = hub.connectionState
+  if (cs && typeof cs === 'object' && 'value' in cs) return cs.value
+  return hub.connected?.value ? 'connected' : 'disconnected'
+})
+const isConnected = computed(() => connState.value === 'connected')
 const {
   presets,
   add,
@@ -28,19 +38,62 @@ const {
 const showAdd = ref(false)
 const importInputRef = ref(null)
 const flashedId = ref(null)
+const failedId = ref(null)
 let flashTimer = null
+let failTimer = null
 
-// Fire = send the (path, value) to the device. We also flash the rectangle
-// briefly so the user gets visual confirmation that the click landed.
-function onFire(p) {
-  try {
-    setDeviceParam(p.deviceId, p.path, p.value)
-  } catch (err) {
-    console.warn('[performance] setDeviceParam failed:', err)
-  }
-  flashedId.value = p.id
+// Failure toast (delivery feedback)
+const toastMsg = ref('')
+let toastTimer = null
+function showToast(msg) {
+  toastMsg.value = msg
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => { toastMsg.value = '' }, 2500)
+}
+onBeforeUnmount(() => {
+  clearTimeout(toastTimer)
+  clearTimeout(flashTimer)
+  clearTimeout(failTimer)
+})
+
+function flashOk(id) {
+  flashedId.value = id
   clearTimeout(flashTimer)
   flashTimer = setTimeout(() => { flashedId.value = null }, 220)
+}
+function flashFail(id) {
+  failedId.value = id
+  clearTimeout(failTimer)
+  failTimer = setTimeout(() => { failedId.value = null }, 600)
+}
+
+// Fire = send the (path, value) to the device. Delivery-true feedback:
+// setDeviceParam resolves {ok, reason} from the state layer — the green
+// flash appears ONLY when the command was actually handed to the hub
+// socket; otherwise the rect flashes red and a toast explains why.
+async function onFire(p) {
+  if (!isConnected.value) {
+    flashFail(p.id)
+    showToast('Hub bağlantısı yok — gönderilemedi')
+    return
+  }
+  let result = null
+  try {
+    result = await setDeviceParam(p.deviceId, p.path, p.value)
+  } catch (err) {
+    result = { ok: false, reason: err?.message || String(err) }
+  }
+  // Legacy state layer returns undefined — treat as sent (old behavior),
+  // the connectivity gate above already covers the silent-drop case.
+  const ok = result == null ? true : result.ok !== false
+  if (ok) {
+    flashOk(p.id)
+  } else {
+    flashFail(p.id)
+    showToast(result?.reason
+      ? `Gönderilemedi — ${result.reason}`
+      : 'Gönderilemedi — hub bağlantısını kontrol edin')
+  }
 }
 
 function onMove(p, { x, y }) {
@@ -124,6 +177,7 @@ async function onImportChosen(e) {
          can see where their drags will land. -->
     <div
       class="pm-canvas"
+      :class="{ 'pm-offline': !isConnected }"
       :style="{
         backgroundImage: `linear-gradient(to right, rgba(255,255,255,0.04) 1px, transparent 1px),
                           linear-gradient(to bottom, rgba(255,255,255,0.04) 1px, transparent 1px)`,
@@ -133,7 +187,7 @@ async function onImportChosen(e) {
       <div
         v-for="p in presets"
         :key="p.id"
-        :class="{ 'pm-fire-flash': flashedId === p.id }"
+        :class="{ 'pm-fire-flash': flashedId === p.id, 'pm-fire-fail': failedId === p.id }"
         style="position: absolute; left: 0; top: 0;"
       >
         <PerformancePreset
@@ -164,15 +218,20 @@ async function onImportChosen(e) {
       @close="showAdd = false"
       @save="onAddSave"
     />
+
+    <div v-if="toastMsg" class="hub-toast err" role="status">{{ toastMsg }}</div>
   </div>
 </template>
 
 <style scoped>
 .pm-page {
   display: flex; flex-direction: column;
-  height: 100vh;
-  background: var(--hub-bg, #0a0a0a);
-  color: var(--hub-ink, #ddd);
+  /* 100% of .app-page (tabs + status bar live above us) — 100vh would
+     push the canvas bottom off-screen. */
+  height: 100%;
+  min-height: 480px;
+  background: var(--hub-bg, #0a0c12);
+  color: var(--hub-ink, #dfe4ee);
 }
 .pm-header {
   display: flex; align-items: center; gap: 12px;
@@ -204,8 +263,8 @@ async function onImportChosen(e) {
 .pm-header-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .pm-header-btn-primary {
   color: var(--hub-bg, #111);
-  background: var(--hub-cyan, #06b6d4);
-  border-color: var(--hub-cyan, #06b6d4);
+  background: var(--hub-cyan, #5bb8ff);
+  border-color: var(--hub-cyan, #5bb8ff);
   font-weight: 600;
 }
 .pm-header-btn-primary:hover:not(:disabled) {
@@ -219,14 +278,8 @@ async function onImportChosen(e) {
   /* Background grid set inline via :style so it scales with GRID */
 }
 
-/* Fire flash — brief glow on the wrapper div around a preset that was
-   just clicked. Applied as outline so the rectangle's own dimensions
-   don't shift. */
-.pm-fire-flash > :deep(.pm-preset) {
-  outline: 2px solid var(--hub-cyan, #06b6d4);
-  outline-offset: 2px;
-  transition: outline-color 0.2s;
-}
+/* Fire flash styling lives in styles.css (.pm-fire-flash = green success,
+   .pm-fire-fail = red failure) — delivery-true feedback, shared tokens. */
 
 .pm-empty {
   position: absolute; inset: 0;
@@ -249,5 +302,5 @@ async function onImportChosen(e) {
 .pm-empty-hint {
   font-size: 0.8rem; max-width: 360px; line-height: 1.5;
 }
-.pm-empty-hint strong { color: var(--hub-cyan, #06b6d4); }
+.pm-empty-hint strong { color: var(--hub-cyan, #5bb8ff); }
 </style>

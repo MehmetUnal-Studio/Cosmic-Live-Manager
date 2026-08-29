@@ -253,8 +253,8 @@ const progressPct = computed(() => {
   display: inline-flex; align-items: center; gap: 0.4rem;
 }
 .rec-dot { font-size: 0.7rem; }
-.rec-dot.recording { color: var(--hub-red, #ef4444); animation: rec-pulse 1.1s ease-in-out infinite; }
-.rec-dot.playing   { color: var(--hub-green, #10b981); }
+.rec-dot.recording { color: var(--hub-red, #ff7a6e); animation: rec-pulse 1.1s ease-in-out infinite; }
+.rec-dot.playing   { color: var(--hub-green, #3ddc84); }
 .rec-dot.loaded    { color: var(--hub-ink-dim, #777); }
 .rec-empty { color: var(--hub-ink-dim, #777); font-style: italic; }
 @keyframes rec-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
@@ -285,11 +285,11 @@ const progressPct = computed(() => {
   border-color: var(--hub-border-2, #444);
 }
 .rec-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.rec-btn-record { color: var(--hub-red, #ef4444); border-color: rgba(239,68,68,0.4); }
-.rec-btn-record:hover:not(:disabled) { background: rgba(239,68,68,0.1); }
-.rec-btn-stop   { color: var(--hub-red, #ef4444); border-color: rgba(239,68,68,0.4); }
-.rec-btn-play   { color: var(--hub-green, #10b981); border-color: rgba(16,185,129,0.4); }
-.rec-btn-play:hover:not(:disabled) { background: rgba(16,185,129,0.1); }
+.rec-btn-record { color: var(--hub-red, #ff7a6e); border-color: rgba(255,122,110,0.4); }
+.rec-btn-record:hover:not(:disabled) { background: rgba(255,122,110,0.1); }
+.rec-btn-stop   { color: var(--hub-red, #ff7a6e); border-color: rgba(255,122,110,0.4); }
+.rec-btn-play   { color: var(--hub-green, #3ddc84); border-color: rgba(61,220,132,0.4); }
+.rec-btn-play:hover:not(:disabled) { background: rgba(61,220,132,0.1); }
 .rec-icon { font-size: 10px; line-height: 1; }
 
 .rec-info { font-size: 12px; color: var(--hub-ink-mid, #999); }
@@ -337,7 +337,7 @@ const progressPct = computed(() => {
 }
 .rec-progress-bar {
   height: 100%;
-  background: var(--hub-green, #10b981);
+  background: var(--hub-green, #3ddc84);
   transition: width 50ms linear;
 }
 </style>

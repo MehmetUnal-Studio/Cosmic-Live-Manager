@@ -92,10 +92,42 @@ function onToggle() {
   commit([!currentBool.value])
 }
 
+// ─── Numeric editing guard (F2-5) ────────────────────────────────────────
+// Mirror of the string branch: while the numbox is focused, incoming remote
+// PATH_CHANGED re-renders must NOT clobber the operator's half-typed value.
+// `numDraft` echoes keystrokes so the :value binding is a no-op re-patch.
+const numEditing = ref(false)
+const numDraft = ref('')
+function onNumberFocus(e) {
+  numEditing.value = true
+  numDraft.value = e.target.value
+}
+function onNumberKeyInput(e) {
+  numDraft.value = e.target.value
+}
+function onNumberBlur() {
+  numEditing.value = false
+}
 function onNumberInput(e) {
   const v = Number(e.target.value)
+  if (!Number.isFinite(v)) return
   draft.value = [v]
+  numDraft.value = e.target.value
   commit([v])
+}
+
+// Same guard for multi-component vectors — track which slot has focus.
+const multiEditingIdx = ref(-1)
+const multiDraft = ref('')
+function onMultiFocus(idx, e) {
+  multiEditingIdx.value = idx
+  multiDraft.value = e.target.value
+}
+function onMultiKeyInput(e) {
+  multiDraft.value = e.target.value
+}
+function onMultiBlur() {
+  multiEditingIdx.value = -1
 }
 
 function onMultiComponentInput(idx, val, ch) {
@@ -153,15 +185,19 @@ function bumpNumber(delta) {
 }
 
 // Vertical-drag knob behaviour for the numbox:
-//   - mousedown without movement → input keeps default behaviour (focus + type)
-//   - mousedown + vertical drag > threshold → input is blurred and value
+//   - pointerdown without movement → input keeps default behaviour (focus + type)
+//   - pointerdown + vertical drag > threshold → input is blurred and value
 //     follows the drag (up = increase, down = decrease)
 //   - Shift = 10× faster, Alt = 10× finer
+// Pointer events so touch tablets can scrub too. Commits are throttled to
+// ~30 Hz trailing-edge (F2-14) — every raw move used to produce a WS send
+// plus a server-side optimistic broadcast to every open dashboard.
 const DRAG_THRESHOLD = 4 // pixels before drag kicks in (lets click-to-type work)
+const DRAG_COMMIT_MS = 33 // ~30 Hz
 
 function startNumberDrag(e) {
   if (!writable.value) return
-  if (e.button !== 0) return
+  if (e.button != null && e.button !== 0) return
 
   const inputEl = e.currentTarget
   const startY = e.clientY
@@ -185,6 +221,28 @@ function startNumberDrag(e) {
   }
 
   let dragging = false
+  let lastCommitAt = 0
+  let pendingValue = null
+  let trailingTimer = null
+
+  function throttledCommit(v) {
+    pendingValue = v
+    const now = Date.now()
+    if (now - lastCommitAt >= DRAG_COMMIT_MS) {
+      lastCommitAt = now
+      commit([pendingValue])
+      pendingValue = null
+    } else if (!trailingTimer) {
+      trailingTimer = setTimeout(() => {
+        trailingTimer = null
+        if (pendingValue != null) {
+          lastCommitAt = Date.now()
+          commit([pendingValue])
+          pendingValue = null
+        }
+      }, DRAG_COMMIT_MS - (now - lastCommitAt))
+    }
+  }
 
   function onMove(ev) {
     const dy = startY - ev.clientY  // up = positive
@@ -201,18 +259,26 @@ function startNumberDrag(e) {
     let newValue = startValue + dy * baseStep * multiplier
     if (ch === 'i') newValue = Math.round(newValue)
     if (hasMinMax) newValue = Math.max(min, Math.min(max, newValue))
-    commit([newValue])
+    throttledCommit(newValue)
   }
 
   function onUp() {
-    window.removeEventListener('mousemove', onMove)
-    window.removeEventListener('mouseup', onUp)
+    window.removeEventListener('pointermove', onMove)
+    window.removeEventListener('pointerup', onUp)
+    window.removeEventListener('pointercancel', onUp)
     document.body.style.cursor = ''
     inputEl.classList.remove('dragging')
+    // Final exact value on release — never leave the trailing edge unsent.
+    if (trailingTimer) { clearTimeout(trailingTimer); trailingTimer = null }
+    if (pendingValue != null) {
+      commit([pendingValue])
+      pendingValue = null
+    }
   }
 
-  window.addEventListener('mousemove', onMove)
-  window.addEventListener('mouseup', onUp)
+  window.addEventListener('pointermove', onMove)
+  window.addEventListener('pointerup', onUp)
+  window.addEventListener('pointercancel', onUp)
 }
 </script>
 
@@ -259,9 +325,12 @@ function startNumberDrag(e) {
           :key="idx"
           type="number"
           :step="ch === 'i' ? 1 : 'any'"
-          :value="formatDisplay(node.VALUE?.[idx], ch)"
+          :value="multiEditingIdx === idx ? multiDraft : formatDisplay(node.VALUE?.[idx], ch)"
           :disabled="!writable"
           :title="['x', 'y', 'z', 'w'][idx] || `[${idx}]`"
+          @focus="(e) => onMultiFocus(idx, e)"
+          @input="onMultiKeyInput"
+          @blur="onMultiBlur"
           @change="(e) => onMultiComponentInput(idx, e.target.value, ch)"
         />
       </div>
@@ -296,11 +365,14 @@ function startNumberDrag(e) {
           :min="hasRange ? range.MIN : undefined"
           :max="hasRange ? range.MAX : undefined"
           :step="primaryType === 'i' ? 1 : 'any'"
-          :value="formatDisplay(node.VALUE?.[0], primaryType)"
+          :value="numEditing ? numDraft : formatDisplay(node.VALUE?.[0], primaryType)"
           :disabled="!writable"
           :title="hasRange ? `drag · type · ${range.MIN}…${range.MAX}` : 'drag · type'"
+          @focus="onNumberFocus"
+          @input="onNumberKeyInput"
+          @blur="onNumberBlur"
           @change="onNumberInput"
-          @mousedown="startNumberDrag"
+          @pointerdown="startNumberDrag"
         />
       </div>
     </template>
@@ -352,10 +424,11 @@ function startNumberDrag(e) {
   width: 96px;
   flex: 0 0 auto;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 13px;
   text-align: right;
   padding: 2px 6px;
   cursor: ns-resize;
+  touch-action: none; /* let pointermove drive the scrub on touch */
 }
 .num-input:focus {
   cursor: text;

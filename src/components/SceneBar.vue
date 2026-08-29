@@ -66,6 +66,12 @@ function onDrop(e, toIdx) {
   emit('reorder', { from: fromIdx, to: toIdx })
 }
 function onDragEnd() { dragIdx.value = null; overIdx.value = null }
+
+// Destructive: the × sits close to the fire surface, so a near-miss must
+// not silently delete a scene mid-show.
+function onRemove(s) {
+  if (window.confirm(`"${s.name}" sahnesi silinsin mi?`)) emit('remove', s.id)
+}
 </script>
 
 <template>
@@ -105,7 +111,7 @@ function onDragEnd() { dragIdx.value = null; overIdx.value = null }
             @click.stop="emit('overwrite', s.id)"
             title="Overwrite this scene with current state"
           >⟳</span>
-          <span class="preset-del" @click.stop="emit('remove', s.id)" title="Delete scene">×</span>
+          <span class="preset-del" @click.stop="onRemove(s)" title="Delete scene">×</span>
         </button>
       </template>
 

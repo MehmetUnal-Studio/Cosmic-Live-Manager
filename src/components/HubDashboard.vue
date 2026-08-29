@@ -109,13 +109,45 @@ watch(devices, (current) => {
   migratePerformanceDeviceIds(current)
 }, { immediate: true })
 
+// ─── Toast (delivery feedback for scenes) ───────────────────────────────
+const toastMsg = ref('')
+const toastType = ref('err')
+let toastTimer = null
+function showToast(msg, type = 'err') {
+  toastMsg.value = msg
+  toastType.value = type
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => { toastMsg.value = '' }, 3500)
+}
+onBeforeUnmount(() => clearTimeout(toastTimer))
+
 // Save a scene from the current namespace state. We pass deviceParams (the
 // reactive Map) directly — useScenes reads .VALUE / .ACCESS off each node.
 function onSceneSave(name) {
   addScene(name, deviceParams.value)
 }
-function onSceneFire(scene) {
-  fireScene(scene, setDeviceParam)
+// Scene fire now reports a delivery summary from the state layer
+// ({ sent, failed, skippedOffline } — shape defensive while it lands).
+// Failures/skips surface as a toast instead of vanishing silently.
+async function onSceneFire(scene) {
+  let summary = null
+  try {
+    summary = await fireScene(scene, setDeviceParam)
+  } catch { /* fire itself must never throw into the UI */ }
+  if (summary && typeof summary === 'object') {
+    const failed = Number(summary.failed ?? summary.failedParams ?? 0)
+    const skipped = Number(summary.skippedOffline ?? summary.skippedDevices ?? summary.skipped ?? 0)
+    if (failed > 0 || skipped > 0) {
+      const bits = []
+      if (failed > 0) bits.push(`${failed} parametre gönderilemedi`)
+      if (skipped > 0) bits.push(`${skipped} cihaz çevrimdışı (atlandı)`)
+      showToast(`"${scene.name}" → ${bits.join(' · ')}`, 'err')
+      return
+    }
+  }
+  if (!connected.value) {
+    showToast('Hub bağlantısı yok — sahne gönderilemedi', 'err')
+  }
 }
 function onSceneOverwrite(id) {
   overwriteScene(id, deviceParams.value)
@@ -269,20 +301,23 @@ const statParams = computed(() => {
 
 const PRESS_MS = 350           // long-press threshold
 const PRE_MOVE_TOLERANCE = 6   // px the pointer may wander before we cancel pre-arm
-const dragIdx = ref(-1)        // index in orderedDevices being dragged (-1 = none)
-const dragOverIdx = ref(-1)    // index hovered as drop target
+// Drag state is keyed by DEVICE ID (canonical order key), not by index into
+// orderedDevices (F2-8): a REGISTRY_UPDATED mid-drag reshuffles the live
+// list, and stale indices would then splice the wrong cards on release.
+const dragKey = ref(null)      // order key of the card being dragged
+const dragOverKey = ref(null)  // order key hovered as drop target
 const dragDX = ref(0)
 const dragDY = ref(0)
 
 let pressTimer = null
-let pressStart = null          // { x, y, idx, pointerId, cardEl }
+let pressStart = null          // { x, y, key, pointerId, cardEl }
 
 function isPrimary(e) {
   // Treat plain mouse left, touch, and pen as primary
   return e.button == null || e.button === 0
 }
 
-function onCardPointerDown(e, idx, cardEl) {
+function onCardPointerDown(e, key, cardEl) {
   if (!isPrimary(e)) return
   // Ignore presses originating from interactive controls so editing fields,
   // toggling buttons, scrubbing sliders etc. don't accidentally start a drag.
@@ -291,7 +326,7 @@ function onCardPointerDown(e, idx, cardEl) {
 
   pressStart = {
     x: e.clientX, y: e.clientY,
-    idx, pointerId: e.pointerId, cardEl
+    key, pointerId: e.pointerId, cardEl
   }
   pressTimer = setTimeout(() => {
     pressTimer = null
@@ -301,7 +336,7 @@ function onCardPointerDown(e, idx, cardEl) {
     // matter where the pointer is, and pointer capture has been observed to
     // interact badly with the pointer-events:none we apply to the source
     // card via CSS (needed so elementFromPoint can see the cards below).
-    dragIdx.value = idx
+    dragKey.value = key
     dragDX.value = 0
     dragDY.value = 0
   }, PRESS_MS)
@@ -314,7 +349,7 @@ function onCardPointerDown(e, idx, cardEl) {
 function onWindowPointerMove(e) {
   if (!pressStart) return
   // Phase 1: waiting for press timer to fire — cancel if moved too far
-  if (pressTimer && dragIdx.value < 0) {
+  if (pressTimer && dragKey.value == null) {
     const dx = e.clientX - pressStart.x
     const dy = e.clientY - pressStart.y
     if (dx * dx + dy * dy > PRE_MOVE_TOLERANCE * PRE_MOVE_TOLERANCE) {
@@ -322,7 +357,7 @@ function onWindowPointerMove(e) {
     }
     return
   }
-  if (dragIdx.value < 0) return
+  if (dragKey.value == null) return
   // Phase 2: actively dragging
   dragDX.value = e.clientX - pressStart.x
   dragDY.value = e.clientY - pressStart.y
@@ -336,17 +371,17 @@ function onWindowPointerMove(e) {
   //     even with pointer-events: none in some edge cases.
   // We iterate the rendered card wrappers, skip the source, and pick the
   // first one whose rect contains the cursor.
-  const cards = document.querySelectorAll('.device-card-wrapper[data-drag-idx]')
-  let hit = -1
+  const cards = document.querySelectorAll('.device-card-wrapper[data-drag-key]')
+  let hit = null
   for (const c of cards) {
-    const idx = Number(c.dataset.dragIdx)
-    if (idx === dragIdx.value) continue
+    const key = c.dataset.dragKey
+    if (key === dragKey.value) continue
     const r = c.getBoundingClientRect()
     if (
       e.clientX >= r.left && e.clientX <= r.right &&
       e.clientY >= r.top && e.clientY <= r.bottom
     ) {
-      hit = idx
+      hit = key
       break
     }
   }
@@ -354,19 +389,24 @@ function onWindowPointerMove(e) {
   // previous target rather than clearing it — that way the highlight stays
   // stable while the user wiggles between cards, and a release in a gap
   // still drops onto the last-hovered card (matches the user's intent).
-  if (hit !== -1) dragOverIdx.value = hit
+  if (hit != null) dragOverKey.value = hit
 }
 
 function onWindowPointerUp(_e) {
   if (pressTimer) clearTimeout(pressTimer)
   pressTimer = null
-  if (dragIdx.value >= 0 && dragOverIdx.value >= 0 && dragOverIdx.value !== dragIdx.value) {
-    // Compute new id order from current orderedDevices
+  if (dragKey.value != null && dragOverKey.value != null && dragOverKey.value !== dragKey.value) {
+    // Resolve BOTH ids against the CURRENT list at release time — the list
+    // may have reshuffled mid-drag (new device discovered, group change).
     const ids = orderedDevices.value.map(deviceOrderKey)
-    const [moved] = ids.splice(dragIdx.value, 1)
-    ids.splice(dragOverIdx.value, 0, moved)
-    customOrder.value = ids
-    saveOrder(ids)
+    const fromIdx = ids.indexOf(dragKey.value)
+    const toIdx = ids.indexOf(dragOverKey.value)
+    if (fromIdx !== -1 && toIdx !== -1) {
+      const [moved] = ids.splice(fromIdx, 1)
+      ids.splice(ids.indexOf(dragOverKey.value), 0, moved)
+      customOrder.value = ids
+      saveOrder(ids)
+    }
   }
   resetDragState()
 }
@@ -378,14 +418,18 @@ function cancelDrag() {
 }
 function resetDragState() {
   pressStart = null
-  dragIdx.value = -1
-  dragOverIdx.value = -1
+  dragKey.value = null
+  dragOverKey.value = null
   dragDX.value = 0
   dragDY.value = 0
   window.removeEventListener('pointermove', onWindowPointerMove)
   window.removeEventListener('pointerup', onWindowPointerUp)
   window.removeEventListener('pointercancel', onWindowPointerUp)
 }
+
+// Stable empty Map for cards with no params yet — a fresh `new Map()` per
+// render made every empty card's props "change" on each top-level update.
+const EMPTY_MAP = new Map()
 
 onBeforeUnmount(resetDragState)
 
@@ -458,7 +502,9 @@ watch(devices, (list) => {
       </div>
     </header>
 
-    <main class="hub-main">
+    <!-- While the hub link is down everything below is last-known data:
+         desaturate + dim so a frozen green grid can't pass as healthy. -->
+    <main class="hub-main" :class="{ 'hub-stale': !connected }">
       <ServerControl />
 
       <!-- Stats row -->
@@ -471,9 +517,9 @@ watch(devices, (list) => {
           <div class="stat-num">{{ statActive }}</div>
           <div class="stat-label">Active</div>
         </div>
-        <div class="stat-card">
-          <div class="stat-num">{{ statConn }}</div>
-          <div class="stat-label">Connected</div>
+        <div class="stat-card" :class="statTotal > 0 ? (statConn === statActive ? 'stat-ok' : 'stat-warn') : ''">
+          <div class="stat-num">{{ statConn }}<span class="stat-of">/{{ statActive }}</span></div>
+          <div class="stat-label">Connected / Active</div>
         </div>
         <div class="stat-card">
           <div class="stat-num">{{ statParams }}</div>
@@ -553,24 +599,27 @@ watch(devices, (list) => {
         </div>
         <div class="devices-grid">
           <div v-if="group.devices.length === 0" class="empty">{{ group.empty }}</div>
+          <!-- Key deliberately excludes runtimeGeneration (F2-4): a helper-side
+               lifecycle bump used to remount the card, silently destroying an
+               in-progress recording and all expand state mid-show. -->
           <div
             v-for="dev in group.devices"
-            :key="`${dev.canonicalId}:${dev.id ?? 'discovered'}:${dev.runtimeGeneration || 0}`"
-            :data-drag-idx="orderedDevices.indexOf(dev)"
+            :key="`${dev.canonicalId}:${dev.id ?? 'discovered'}`"
+            :data-drag-key="deviceOrderKey(dev)"
             class="device-card-wrapper"
             :class="{
-              'drag-source': dragIdx === orderedDevices.indexOf(dev),
-              'drag-target': dragOverIdx === orderedDevices.indexOf(dev) && dragIdx !== -1,
+              'drag-source': dragKey === deviceOrderKey(dev),
+              'drag-target': dragOverKey === deviceOrderKey(dev) && dragKey != null,
             }"
-            :style="dragIdx === orderedDevices.indexOf(dev)
+            :style="dragKey === deviceOrderKey(dev)
               ? { transform: `translate(${dragDX}px, ${dragDY}px) scale(1.025)`, zIndex: 50 }
               : null"
-            @pointerdown="onCardPointerDown($event, orderedDevices.indexOf(dev), $event.currentTarget)"
+            @pointerdown="onCardPointerDown($event, deviceOrderKey(dev), $event.currentTarget)"
           >
             <DeviceCard
               :device="dev"
               :msg-count="deviceMsgCounts.get(dev.id) || 0"
-              :params="deviceParams.get(dev.id) || new Map()"
+              :params="deviceParams.get(dev.id) || EMPTY_MAP"
               :hint="saveHints.get(dev.id) || null"
               :services="linkTargetServices(dev)"
               :disallowed-target-fqdns="disallowedLinkTargetFqdns(dev)"
@@ -587,5 +636,9 @@ watch(devices, (list) => {
       </section>
 
     </main>
+
+    <div v-if="toastMsg" class="hub-toast" :class="toastType" role="status">
+      {{ toastMsg }}
+    </div>
   </div>
 </template>

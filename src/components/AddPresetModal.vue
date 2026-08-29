@@ -16,13 +16,13 @@ const props = defineProps({
 const emit = defineEmits(['close', 'save'])
 
 const PALETTE = [
-  '#6366f1', // indigo
-  '#06b6d4', // cyan
-  '#10b981', // green
-  '#f59e0b', // amber
-  '#ef4444', // red
-  '#ec4899', // pink
+  '#5bb8ff', // cosmic accent blue
+  '#3ddc84', // success green
+  '#ffb02e', // warn amber
+  '#ff7a6e', // danger coral
+  '#8fd0ff', // accent hover (light blue)
   '#8b5cf6', // violet
+  '#2c9c8f', // teal
   '#64748b'  // slate
 ]
 
@@ -70,10 +70,18 @@ const canSave = computed(() =>
 )
 
 function parseValue(raw) {
-  // Heuristic: try number, then boolean, then fall back to string. Same
-  // approach used by other preset/form bits in the codebase.
+  // Heuristic: JSON array first (multi-component params like ff/fff are
+  // pre-filled as "[0.1,0.25]" and MUST go back out as real arrays — a
+  // string arg would reach the device as one 's' instead of two floats),
+  // then number, then boolean, then fall back to string.
   if (typeof raw === 'number') return raw
   const s = String(raw).trim()
+  if (s.startsWith('[') && s.endsWith(']')) {
+    try {
+      const arr = JSON.parse(s)
+      if (Array.isArray(arr)) return arr
+    } catch { /* fall through to scalar parsing */ }
+  }
   if (s === 'true') return true
   if (s === 'false') return false
   const n = Number(s)
@@ -248,11 +256,11 @@ function onSave() {
   background: rgba(255,255,255,0.04);
 }
 .pm-btn-primary {
-  color: var(--hub-bg, #111); background: var(--hub-cyan, #06b6d4);
-  border-color: var(--hub-cyan, #06b6d4); font-weight: 600;
+  color: var(--hub-bg, #111); background: var(--hub-cyan, #5bb8ff);
+  border-color: var(--hub-cyan, #5bb8ff); font-weight: 600;
 }
 .pm-btn-primary:hover:not(:disabled) {
-  background: var(--hub-cyan, #06b6d4); filter: brightness(1.1);
+  background: var(--hub-cyan, #5bb8ff); filter: brightness(1.1);
 }
 .pm-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>

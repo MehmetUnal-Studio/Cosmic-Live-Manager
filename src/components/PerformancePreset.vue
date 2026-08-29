@@ -42,7 +42,7 @@ const style = computed(() => ({
   top:    (liveY.value ?? props.preset.y) + 'px',
   width:  (liveW.value ?? props.preset.w) + 'px',
   height: (liveH.value ?? props.preset.h) + 'px',
-  background: props.preset.color || '#6366f1'
+  background: props.preset.color || '#5bb8ff'
 }))
 
 const valueLabel = computed(() => {
@@ -56,7 +56,7 @@ const valueLabel = computed(() => {
 // Pick a contrasting text color (white on dark backgrounds, dark on light).
 // Simple luminance check on the hex/rgb color value.
 const textColor = computed(() => {
-  const hex = String(props.preset.color || '#6366f1').replace('#', '')
+  const hex = String(props.preset.color || '#5bb8ff').replace('#', '')
   if (hex.length < 6) return '#fff'
   const r = parseInt(hex.slice(0, 2), 16)
   const g = parseInt(hex.slice(2, 4), 16)
@@ -97,22 +97,32 @@ function cursorForEdge(edge) {
 // Track hover position so the cursor changes to the appropriate
 // resize handle BEFORE the user clicks. Pure CSS can't do this with the
 // invisible-margin approach, so we update inline style on the element.
-function onMouseMove(e) {
+function onHoverMove(e) {
+  if (e.pointerType && e.pointerType !== 'mouse') return
   if (liveX.value !== null) return // currently dragging — leave it
   const el = e.currentTarget
   const t = hitTest(e, el)
   el.style.cursor = t.kind === 'body' ? 'grab' : cursorForEdge(t)
 }
 
-function onMouseDown(e) {
+// ─── Unified pointer interaction (mouse + touch + pen, F2-10) ────────────
+//   - edge press          → resize drag (all pointer types, immediately)
+//   - body, mouse         → quick click = FIRE, drag past CLICK_TOL = move
+//   - body, touch/pen     → tap = FIRE, long-press (PRESS_MS) then drag = move
+//     (movement before the long-press arms cancels the gesture — no
+//      accidental fire, no accidental move)
+const PRESS_MS = 350
+
+function onPointerDown(e) {
   if (editingName.value) return
-  if (e.button !== 0) return
-  // Skip if click originated on the inner controls (delete button, name input)
+  if (e.button != null && e.button !== 0) return
+  // Skip if press originated on the inner controls (delete button, name input)
   const tag = e.target.tagName
   if (tag === 'BUTTON' || tag === 'INPUT') return
 
   const el = e.currentTarget
   const t = hitTest(e, el)
+  const isTouch = e.pointerType && e.pointerType !== 'mouse'
   const startX = e.clientX
   const startY = e.clientY
   const start = {
@@ -120,11 +130,34 @@ function onMouseDown(e) {
     w: props.preset.w, h: props.preset.h
   }
   let moved = false
+  // Resize is armed immediately; body-move is armed immediately for mouse,
+  // and only after a long-press for touch (so a tap stays a clean FIRE).
+  let armed = t.kind === 'resize' || !isTouch
+  let cancelled = false
+  let pressTimer = null
+  if (!armed) {
+    pressTimer = setTimeout(() => {
+      pressTimer = null
+      armed = true
+    }, PRESS_MS)
+  }
 
   function onMove(ev) {
     const dx = ev.clientX - startX
     const dy = ev.clientY - startY
-    if (!moved && Math.hypot(dx, dy) > CLICK_TOL) moved = true
+    const past = Math.hypot(dx, dy) > CLICK_TOL
+    if (!armed) {
+      // Touch body-press not yet armed: wandering means this is neither a
+      // tap nor a deliberate long-press-drag — cancel the whole gesture.
+      if (past) {
+        cancelled = true
+        cleanup()
+      }
+      return
+    }
+    if (!moved && past) moved = true
+    if (!moved) return
+    ev.preventDefault()
 
     if (t.kind === 'body') {
       liveX.value = start.x + dx
@@ -139,11 +172,25 @@ function onMouseDown(e) {
     }
   }
 
+  function cleanup() {
+    if (pressTimer) { clearTimeout(pressTimer); pressTimer = null }
+    window.removeEventListener('pointermove', onMove)
+    window.removeEventListener('pointerup', onUp)
+    window.removeEventListener('pointercancel', onCancel)
+    if (cancelled) resetLive()
+  }
+
+  function onCancel() {
+    cancelled = true
+    cleanup()
+  }
+
   function onUp() {
-    window.removeEventListener('mousemove', onMove)
-    window.removeEventListener('mouseup', onUp)
-    if (!moved) {
-      // Treat as a click → fire
+    const wasMoved = moved
+    cleanup()
+    if (cancelled) return
+    if (!wasMoved) {
+      // Tap / quick click → fire
       resetLive()
       emit('fire')
       return
@@ -157,8 +204,9 @@ function onMouseDown(e) {
     resetLive()
   }
 
-  window.addEventListener('mousemove', onMove)
-  window.addEventListener('mouseup', onUp)
+  window.addEventListener('pointermove', onMove)
+  window.addEventListener('pointerup', onUp)
+  window.addEventListener('pointercancel', onCancel)
 }
 
 function resetLive() {
@@ -184,18 +232,20 @@ function onRemove() {
   <div
     class="pm-preset"
     :style="style"
-    @mousemove="onMouseMove"
-    @mousedown="onMouseDown"
-    @mouseenter="hovered = true"
-    @mouseleave="hovered = false"
+    @pointermove="onHoverMove"
+    @pointerdown="onPointerDown"
+    @pointerenter="hovered = true"
+    @pointerleave="hovered = false"
     :title="`${preset.deviceName || ''} ${preset.path} = ${valueLabel}`"
   >
+    <!-- Always rendered: touch tablets have no hover, so the remove
+         affordance stays visible (dimmed) instead of v-if="hovered". -->
     <button
-      v-if="hovered"
       class="pm-preset-remove"
+      :class="{ hovered }"
       :style="{ color: textColor }"
       @click.stop="onRemove"
-      @mousedown.stop
+      @pointerdown.stop
       aria-label="Remove preset"
     >×</button>
 
@@ -232,6 +282,8 @@ function onRemove() {
   border-radius: 8px;
   box-shadow: 0 2px 12px rgba(0,0,0,0.3);
   user-select: none;
+  -webkit-user-select: none;
+  touch-action: none; /* our pointer handlers own move/resize on touch */
   transition: box-shadow 0.15s, transform 0.05s;
   overflow: hidden;
 }
@@ -276,12 +328,15 @@ function onRemove() {
 .pm-preset-value { font-weight: 600; }
 
 .pm-preset-remove {
-  position: absolute; top: 4px; right: 6px;
+  position: absolute; top: 2px; right: 2px;
   background: transparent; border: none;
   font-size: 18px; line-height: 1; padding: 0;
-  width: 18px; height: 18px;
-  cursor: pointer; opacity: 0.7;
+  width: 28px; height: 28px; /* stage-friendly hit box */
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; opacity: 0.4;
   z-index: 2;
 }
-.pm-preset-remove:hover { opacity: 1; }
+.pm-preset-remove.hovered,
+.pm-preset-remove:hover,
+.pm-preset-remove:focus-visible { opacity: 1; }
 </style>
