@@ -144,17 +144,42 @@ export function useScenes() {
 
   // Fire a scene: re-send every captured (deviceId, path, value) tuple via
   // the provided setDeviceParam callback. The server's SET_DEVICE_PARAM
-  // handler then routes each one to the device's OSC port. If a device is
-  // currently disconnected the message just drops into the void — that's
-  // fine and matches what the user expects (it'll snap when reconnected).
-  function fire(scene, setDeviceParam) {
-    if (!scene || !scene.snapshot) return
+  // handler then routes each one to the device's OSC port.
+  //
+  // Fix F2-17: params are sent SEQUENTIALLY (each awaited before the next,
+  // so N params no longer flood the socket in one synchronous burst) and the
+  // per-param results are aggregated into a completion summary:
+  //   { applied, failed, total, failures: [{ deviceId, path, reason }] }
+  // Works with both the new ack-returning setDeviceParam (Promise of
+  // { ok, reason }) and any legacy void-returning callback (counted as
+  // applied, reason 'no-ack'). The returned promise never rejects; legacy
+  // callers that ignore the return value keep working unchanged.
+  async function fire(scene, setDeviceParam) {
+    const summary = { applied: 0, failed: 0, total: 0, failures: [] }
+    if (!scene || !scene.snapshot) return summary
     for (const [deviceIdStr, params] of Object.entries(scene.snapshot)) {
       const deviceId = Number(deviceIdStr)
       for (const [path, value] of Object.entries(params)) {
-        setDeviceParam(deviceId, path, value)
+        summary.total++
+        let result
+        try {
+          result = await Promise.resolve(setDeviceParam(deviceId, path, value))
+        } catch (err) {
+          result = { ok: false, reason: (err && err.message) || 'error' }
+        }
+        if (result === undefined || result === null) {
+          // Legacy fire-and-forget callback — no delivery information.
+          summary.applied++
+          continue
+        }
+        if (result.ok) summary.applied++
+        else {
+          summary.failed++
+          summary.failures.push({ deviceId, path, reason: result.reason || 'error' })
+        }
       }
     }
+    return summary
   }
 
   return { scenes, add, rename, remove, overwrite, reorder, fire, migrateDeviceIds }

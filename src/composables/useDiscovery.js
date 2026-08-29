@@ -7,14 +7,27 @@ export function useDiscovery() {
   const connected = ref(false)
   let ws = null
   let retryTimer = null
+  // Fix F2-12: unmount used to clear the CURRENT retry timer and close the
+  // socket — but close() fires onclose asynchronously, which scheduled a
+  // FRESH timer nobody cleared → zombie socket reconnecting forever after
+  // the component was gone. `disposed` guards every (re)open path.
+  let disposed = false
 
   function open() {
+    if (disposed) return
     ws = new WebSocket(`ws://${location.host}/ws/discovery`)
-    ws.onopen = () => (connected.value = true)
     ws.onclose = () => {
       connected.value = false
       ws = null
-      retryTimer = setTimeout(open, 1500)
+      if (!disposed) retryTimer = setTimeout(open, 1500)
+    }
+    ws.onopen = () => {
+      // The socket may have been disposed while connecting.
+      if (disposed) {
+        try { ws && ws.close() } catch {}
+        return
+      }
+      connected.value = true
     }
     ws.onmessage = (ev) => {
       try {
@@ -24,11 +37,23 @@ export function useDiscovery() {
     }
   }
 
-  onMounted(open)
-  onBeforeUnmount(() => {
+  function dispose() {
+    disposed = true
     clearTimeout(retryTimer)
-    if (ws) ws.close()
+    retryTimer = null
+    if (ws) {
+      const socket = ws
+      ws = null
+      try { socket.close() } catch {}
+    }
+    connected.value = false
+  }
+
+  onMounted(() => {
+    disposed = false
+    open()
   })
+  onBeforeUnmount(dispose)
 
   return { services, connected }
 }
