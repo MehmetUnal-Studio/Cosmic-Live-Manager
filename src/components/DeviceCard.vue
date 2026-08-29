@@ -38,7 +38,7 @@ const props = defineProps({
   // Result of the last announce attempt, shown as a hint under the button
   announceResult: { type: Object, default: null }
 })
-const emit = defineEmits(['update', 'reconnect', 'set-param', 'announce', 'remove', 'save'])
+const emit = defineEmits(['update', 'reconnect', 'set-param', 'announce', 'clear-link', 'remove', 'save'])
 
 function onRemove() {
   // Block accidental clicks — manifest deletion is permanent on disk.
@@ -328,6 +328,7 @@ onBeforeUnmount(() => {
   if (stopMsgListener) stopMsgListener()
   for (const timer of flashTimers.values()) clearTimeout(timer)
   flashTimers.clear()
+  clearInterval(nowTimer)
   recording.dispose()
 })
 
@@ -383,13 +384,40 @@ function persistAnnounce() {
   } catch { /* quota / disabled */ }
 }
 
-const _initial = loadAnnounce()
+// The manifest-saved link (written by the hub on a successful announce) is
+// the authoritative selection; localStorage stays as the legacy fallback for
+// cards that never pushed since the hub learned to persist pairings.
+const savedLink = computed(() => {
+  const link = props.device.link
+  if (!link || (!link.targetFqdn && !link.targetName)) return null
+  return link
+})
+function announceInitialState() {
+  const link = savedLink.value
+  if (link) {
+    return {
+      targetFqdn: link.targetFqdn || '',
+      peerId: link.peerId || '',
+      udpOverride: Number.isInteger(link.udpPortOverride) && link.udpPortOverride > 0
+        ? link.udpPortOverride
+        : defaultUdpOverride()
+    }
+  }
+  const legacy = loadAnnounce()
+  return {
+    targetFqdn: legacy.targetFqdn,
+    peerId: legacy.peerId || '',
+    // VST receivers choose a unique ephemeral port from zero. The current
+    // Node-for-Max bridge cannot publish the actual ephemeral bind, so
+    // Max/Ring uses its own stable, non-Manager receive port.
+    udpOverride: defaultUdpOverride()
+  }
+}
+
+const _initial = announceInitialState()
 const targetFqdn         = ref(_initial.targetFqdn)
-const peerId             = ref(_initial.peerId || '')
-// VST receivers choose a unique ephemeral port from zero. The current
-// Node-for-Max bridge cannot publish the actual ephemeral bind, so Max/Ring
-// uses its own stable, non-Manager receive port.
-const udpOverride        = ref(defaultUdpOverride())
+const peerId             = ref(_initial.peerId)
+const udpOverride        = ref(_initial.udpOverride)
 
 // Reload after the earlier migration watcher has handled identity changes.
 watch([
@@ -399,10 +427,23 @@ watch([
   () => JSON.stringify(props.device.legacyCanonicalIds || []),
   () => JSON.stringify(props.device.legacyIds || [])
 ], () => {
-  const fresh = loadAnnounce()
+  const fresh = announceInitialState()
   targetFqdn.value  = fresh.targetFqdn
-  peerId.value      = fresh.peerId || ''
-  udpOverride.value = defaultUdpOverride()
+  peerId.value      = fresh.peerId
+  udpOverride.value = fresh.udpOverride
+})
+
+// A NEW saved link landing from the hub (this or another dashboard pushed)
+// re-syncs the fields. Stringify-compare so unrelated DEVICE_UPDATED
+// broadcasts (autoLink status ticks) cannot stomp in-progress edits.
+watch(() => JSON.stringify(props.device.link || null), (raw) => {
+  const link = raw ? JSON.parse(raw) : null
+  if (!link || (!link.targetFqdn && !link.targetName)) return
+  if (link.targetFqdn) targetFqdn.value = link.targetFqdn
+  if (link.peerId) peerId.value = link.peerId
+  if (Number.isInteger(link.udpPortOverride) && link.udpPortOverride > 0) {
+    udpOverride.value = link.udpPortOverride
+  }
 })
 
 // Persist only the sticky fields. udpOverride is in-session-only — see
@@ -569,8 +610,49 @@ function onPush() {
 function onResetPeerId() {
   peerId.value = automaticPeerId.value
 }
-// Note: auto-push-on-connect was intentionally removed — the user wants
-// LINK pushes to stay manual. The Push button is the only trigger.
+// The hub re-announces saved links on its own; the Push button remains the
+// explicit way to create or change a pairing.
+
+// ─── Saved-link chip + live auto-link status ────────────────────────────
+const savedLinkTargetLabel = computed(() =>
+  savedLink.value ? (savedLink.value.targetName || savedLink.value.targetFqdn || '') : ''
+)
+// Relative-time tick for the "N sn önce" copy — only while the panel is open.
+const nowTick = ref(Date.now())
+let nowTimer = null
+watch(announceOpen, (open) => {
+  clearInterval(nowTimer)
+  nowTimer = null
+  if (open) {
+    nowTick.value = Date.now()
+    nowTimer = setInterval(() => { nowTick.value = Date.now() }, 5000)
+  }
+}, { immediate: true })
+function relTime(ts) {
+  if (!ts) return ''
+  const s = Math.max(0, Math.round((nowTick.value - ts) / 1000))
+  if (s < 5) return 'şimdi'
+  if (s < 60) return `${s} sn önce`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m} dk önce`
+  return `${Math.floor(m / 60)} sa önce`
+}
+// dev.autoLink is runtime-only status broadcast by the hub's auto-announce
+// engine: 'ok' | 'pending' | 'failed'. A saved link without status yet reads
+// as pending (engine has not evaluated it since the manifests loaded).
+const autoLinkStatus = computed(() => {
+  if (!savedLink.value) return null
+  const a = props.device.autoLink
+  if (!a || a.state === 'pending') return { cls: 'pending', text: '⋯ hedef bekleniyor' }
+  if (a.state === 'ok') {
+    const when = a.at ? ` · ${relTime(a.at)}` : ''
+    return { cls: 'ok', text: `✓ ${a.summary || 'Otomatik bağlandı'}${when}` }
+  }
+  return { cls: 'err', text: `✗ ${a.error || 'Otomatik bağlantı başarısız'}` }
+})
+function onClearLink() {
+  emit('clear-link')
+}
 
 // ─── Status visuals ─────────────────────────────────────────────────────
 const statusClass = computed(() => {
@@ -810,13 +892,23 @@ const paramCount = computed(() => {
           :class="{ open: announceOpen }"
           @click="announceOpen = !announceOpen"
         >
-          <span style="display:flex;align-items:center;gap:0.5rem">
+          <span style="display:flex;align-items:center;gap:0.5rem;min-width:0">
             <span class="hub-chevron">▶</span>
             LINK
+            <span v-if="savedLink" class="hub-link-chip">OTOMATİK</span>
+            <span v-if="savedLink" class="hub-link-chip-target" :title="savedLink.targetFqdn">
+              {{ savedLinkTargetLabel }}
+            </span>
           </span>
           <span class="announce-summary">{{ announceSummary }}</span>
         </button>
         <div v-show="announceOpen" class="hub-announce-body">
+          <div
+            v-if="savedLink && autoLinkStatus"
+            class="hub-autolink-status"
+            :class="autoLinkStatus.cls"
+            :title="autoLinkStatus.text"
+          >{{ autoLinkStatus.text }}</div>
           <div class="hub-announce-row">
             <label>Target</label>
             <select
@@ -869,6 +961,14 @@ const paramCount = computed(() => {
             >
               Push
             </button>
+            <button
+              v-if="savedLink"
+              class="hub-btn hub-link-remove"
+              @click="onClearLink"
+              title="Kayıtlı eşleşmeyi manifestten siler — otomatik yeniden bağlama durur"
+            >
+              Kaldır
+            </button>
             <span class="announce-result" :class="announceResult?.ok ? 'ok' : (announceResult ? 'err' : '')">
               <template v-if="announceResult?.ok">✓ {{ announceResult.summary }}</template>
               <template v-else-if="announceResult">✗ {{ announceResult.error }}</template>
@@ -879,6 +979,7 @@ const paramCount = computed(() => {
               ? 'Ring-Instrument peer bilgisini Ableton Ring alıcısına yazar, ardından'
               : 'Android/OSCQuery peer bilgisini CosmicUnity cihazına yazar, ardından' }}
             <code>/system/peer/connect</code> gönderir.
+            Push bir kez yeter — hub eşleşmeyi kaydeder ve kopan taraf geri geldiğinde otomatik yeniden bağlar.
           </div>
         </div>
       </div>

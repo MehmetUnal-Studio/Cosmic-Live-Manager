@@ -2065,6 +2065,52 @@ details.row-section summary {
   color: var(--hub-cyan);
 }
 
+/* Saved-link chip in the LINK accordion header — the hub holds a persisted
+   pairing for this device and re-announces it automatically. */
+.hub-link-chip {
+  display: inline-flex; align-items: center;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--hub-green);
+  background: rgba(61,220,132,0.12);
+  border: 1px solid rgba(61,220,132,0.45);
+  padding: 1px 7px; border-radius: 999px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.hub-link-chip-target {
+  font-family: var(--hub-mono); font-size: 10px;
+  color: var(--hub-ink-dim);
+  max-width: 140px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Live auto-link status line inside the LINK panel (runtime dev.autoLink). */
+.hub-autolink-status {
+  font-family: var(--hub-mono); font-size: 0.65rem;
+  color: var(--hub-ink-dim);
+  padding: 4px 8px;
+  border: 1px dashed var(--hub-border);
+  border-radius: 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.hub-autolink-status.ok {
+  color: var(--hub-green);
+  border-color: rgba(61,220,132,0.35);
+  background: rgba(61,220,132,0.06);
+}
+.hub-autolink-status.err {
+  color: var(--hub-red);
+  border-color: rgba(255,122,110,0.4);
+  background: rgba(255,122,110,0.07);
+}
+
+/* "Kaldır" — drops the persisted pairing; quiet red hover, not a primary. */
+.hub-link-remove:hover {
+  border-color: rgba(255,122,110,0.55);
+  color: var(--hub-red);
+}
+
 /* Stage-safe responsive layout: every control remains reachable without a
    horizontal page scrollbar, including narrow floating plug-in windows. */
 @media (max-width: 900px) {

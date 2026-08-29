@@ -298,6 +298,15 @@ function createHub() {
     })
   }
 
+  // Drop the manifest-saved link pairing; the hub stops auto re-announcing.
+  // Reply arrives as CLEAR_LINK_RESULT and surfaces through the hint slot.
+  function clearDeviceLink(deviceId) {
+    const { sent } = send({ type: 'CLEAR_DEVICE_LINK', deviceId })
+    if (sent) setHint(deviceId, 'Eşleşme kaldırılıyor…', '', { escalateText: '✗ Yanıt yok' })
+    else setHint(deviceId, '✗ Hub bağlantısı yok', 'err')
+    return { sent }
+  }
+
   // ── Hints (fix F2-9: hints now actually expire via `until`) ─────────────
   // type 'ok'  → expires after 1.5 s
   // type 'err' → expires after 4 s
@@ -635,6 +644,9 @@ function createHub() {
         subscribers.value = msg.subscribers || []
       } else if (msg.type === 'ANNOUNCE_RESULT') {
         setAnnounceResult(msg.deviceId, { ok: msg.ok, error: msg.error, summary: msg.summary })
+      } else if (msg.type === 'CLEAR_LINK_RESULT') {
+        if (msg.ok) setHint(msg.deviceId, '✓ Eşleşme kaldırıldı', 'ok')
+        else setHint(msg.deviceId, '✗ ' + (msg.error || 'Eşleşme kaldırılamadı'), 'err')
       } else if (msg.type === 'MANIFESTS_EXPORT') {
         // Settle the oldest pending exportManifests() request (FIFO — the
         // protocol carries no correlation id for this reply).
@@ -720,6 +732,7 @@ function createHub() {
     saveDevice,
     setDeviceParam,
     announceDevice,
+    clearDeviceLink,
     onPathChange,
     exportManifests,
     importManifests,

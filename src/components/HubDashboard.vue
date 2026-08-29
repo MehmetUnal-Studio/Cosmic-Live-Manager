@@ -30,6 +30,7 @@ const {
   saveDevice,
   setDeviceParam,
   announceDevice,
+  clearDeviceLink,
   exportManifests,
   importManifests
 } = useHub()
@@ -629,6 +630,7 @@ watch(devices, (list) => {
               @save="(name) => saveDevice(dev.canonicalId, name)"
               @set-param="(payload) => setDeviceParam(dev.id, payload.path, payload.value)"
               @announce="(payload) => announceDevice(dev.id, payload.target, payload.peerId, payload.udpPortOverride)"
+              @clear-link="clearDeviceLink(dev.id)"
               @remove="removeDevice(dev.id)"
             />
           </div>
