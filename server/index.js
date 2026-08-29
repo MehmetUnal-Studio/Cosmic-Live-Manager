@@ -52,6 +52,7 @@ import {
   resolveOscUdpPort
 } from './linkRouting.js'
 import { planCollisionHeals } from './collisionHeal.js'
+import { createAutoLinkEngine } from './autoLink.js'
 import { hubBackpressureAction } from './hubBackpressure.js'
 import {
   isMaxRingReceiverDevice,
@@ -291,12 +292,34 @@ function rebuildDeviceRegistry() {
   }
 }
 
+// Registry snapshots sent to dashboards must carry the managed device's
+// persisted link and live autoLink status: publicRecord() enumerates only
+// registry fields, and REGISTRY_UPDATED wholesale-replaces the dashboard's
+// device list — without this merge the fields would flicker for one
+// DEVICE_UPDATED frame and then vanish. Internal consumers (engine, heal,
+// announce resolution) keep the raw snapshot.
+function clientRegistrySnapshot() {
+  return deviceRegistry.snapshot().map((record) => {
+    if (record.manifestId == null) return record
+    const managed = devices.get(record.manifestId)
+    if (!managed || (!managed.link && !managed.autoLink)) return record
+    return {
+      ...record,
+      ...(managed.link ? { link: managed.link } : {}),
+      ...(managed.autoLink ? { autoLink: managed.autoLink } : {})
+    }
+  })
+}
+
 function broadcastRegistry() {
-  broadcastHub({ type: 'REGISTRY_UPDATED', devices: deviceRegistry.snapshot() })
+  broadcastHub({ type: 'REGISTRY_UPDATED', devices: clientRegistrySnapshot() })
+  // Registry state feeds link-target resolution; every publish is a poke.
+  autoLinkEngine.poke('registry')
 }
 
 function clearManagedDeviceRuntimeState(deviceId) {
   cosmicNoiseForwarder.clearDeviceSnapshots(deviceId)
+  autoLinkEngine.forgetDevice(deviceId)
   deviceMsgCount.delete(deviceId)
   for (const [path, param] of namespace.entries()) {
     if (param.deviceId === deviceId) namespace.delete(path)
@@ -493,9 +516,10 @@ function loadManifests() {
 
     broadcastHub({
       type: 'DEVICES_RELOADED',
-      devices: deviceRegistry.snapshot()
+      devices: clientRegistrySnapshot()
     })
     broadcastRegistry()
+    autoLinkEngine.poke('manifests-loaded')
   } catch (err) {
     console.log(`  [manifest] could not read ${MANIFESTS_DIR}: ${err.message}`)
   }
@@ -593,6 +617,9 @@ function connectToDevice(dev) {
         deviceName: currentDev.name,
         nodes: client.flatNodes
       })
+      // A (re)connected client forgot its peers: drop the applied-link
+      // signature so the auto-link engine announces again.
+      autoLinkEngine.noteDeviceConnected(currentDev.id)
     },
     onDisconnect: (reason) => {
       if (oscQueryClients.get(dev.id) !== client) return
@@ -650,6 +677,8 @@ function connectToDevice(dev) {
       } else {
         broadcastRegistry()
       }
+      // HOST_INFO delivers the OSC UDP ports both sides of a link need.
+      autoLinkEngine.poke('host-info')
     },
     onLog: (msg) => {
       console.log(`     [${dev.name}] ${msg}`)
@@ -763,9 +792,30 @@ function broadcastDeviceUpdate(dev) {
   broadcastRegistry()
 }
 
+// ─── Auto-link engine ─────────────────────────────────────────────────────
+// Re-applies persisted `link` manifests through the exact same resolution +
+// announce core the WS ANNOUNCE_DEVICE handler uses (performAnnounce below).
+// Poke-driven only; every timer it creates is unref'd and close() runs in
+// shutdown().
+const autoLinkEngine = createAutoLinkEngine({
+  resolveAndAnnounce: (args) => performAnnounce(args),
+  getDevicesWithLinks: () =>
+    Array.from(devices.values()).filter((dev) => dev.link && typeof dev.link === 'object'),
+  getRegistrySnapshot: () => deviceRegistry.snapshot(),
+  getManagedDevice: (deviceId) => devices.get(Number(deviceId)),
+  onStatus: (deviceId, status) => {
+    const dev = devices.get(deviceId)
+    if (!dev) return
+    dev.autoLink = status
+    broadcastDeviceUpdate(dev)
+  },
+  log: (line) => console.log(`  [autolink] ${line}`)
+})
+
 // ─── Manifest save ────────────────────────────────────────────────────────
 const RUNTIME_ONLY_MANIFEST_FIELDS = new Set([
   'activeEndpoint',
+  'autoLink',
   'connectionState',
   'consecutiveConnectFailures',
   'discoveryState',
@@ -786,6 +836,35 @@ function persistentManifestFields(dev) {
   return Object.fromEntries(
     Object.entries(dev || {}).filter(([key]) => !RUNTIME_ONLY_MANIFEST_FIELDS.has(key))
   )
+}
+
+// Shared shape gate for the persisted auto-link field: saveManifest and
+// IMPORT_MANIFESTS both accept payloads verbatim from /ws/hub clients, so
+// both must run the same bounded validation before anything reaches disk.
+function validateLinkField(link) {
+  if (typeof link !== 'object' || link === null || Array.isArray(link)) {
+    return { ok: false, error: 'Invalid link payload' }
+  }
+  const targetFqdn = link.targetFqdn ?? ''
+  const targetName = link.targetName ?? ''
+  const peerId = link.peerId ?? ''
+  const udpPortOverride = link.udpPortOverride ?? 0
+  if (typeof targetFqdn !== 'string' || targetFqdn.length > 128) {
+    return { ok: false, error: 'Invalid link targetFqdn' }
+  }
+  if (typeof targetName !== 'string' || targetName.length > 128) {
+    return { ok: false, error: 'Invalid link targetName' }
+  }
+  if (targetFqdn.trim().length === 0 && targetName.trim().length === 0) {
+    return { ok: false, error: 'Link requires a targetFqdn or targetName' }
+  }
+  if (typeof peerId !== 'string' || peerId.length > 128) {
+    return { ok: false, error: 'Invalid link peerId' }
+  }
+  if (!Number.isInteger(udpPortOverride) || udpPortOverride < 0 || udpPortOverride > 65535) {
+    return { ok: false, error: 'Invalid link udpPortOverride' }
+  }
+  return { ok: true, value: { targetFqdn, targetName, peerId, udpPortOverride } }
 }
 
 function saveManifest(deviceId, updates) {
@@ -820,6 +899,15 @@ function saveManifest(deviceId, updates) {
   if (updates.description !== undefined && typeof updates.description !== 'string') {
     return { ok: false, error: 'Invalid description' }
   }
+  // Persisted auto-link target. `null` removes the link; anything else must
+  // match the documented shape exactly — bounded strings and a real port
+  // range — because this payload also arrives verbatim from /ws/hub clients.
+  let validatedLink
+  if (updates.link !== undefined && updates.link !== null) {
+    const linkCheck = validateLinkField(updates.link)
+    if (!linkCheck.ok) return { ok: false, error: linkCheck.error }
+    validatedLink = linkCheck.value
+  }
 
   // Start from every non-runtime field loaded from disk so migrations and
   // identity refreshes cannot silently erase future/extension settings (for
@@ -839,6 +927,8 @@ function saveManifest(deviceId, updates) {
     oscQueryPort: updates.oscQueryPort ?? dev.oscQueryPort,
     enabled: updates.enabled ?? dev.enabled,
     description: updates.description ?? dev.description,
+    // `link: undefined` (explicit null update) drops the key on serialization.
+    link: updates.link !== undefined ? validatedLink : dev.link,
     endpoints: (updates.host !== undefined || updates.oscQueryPort !== undefined)
       ? [{
           host: updates.host ?? dev.host,
@@ -872,6 +962,7 @@ function saveManifest(deviceId, updates) {
       // UDP port and fail-close every subsequent SET_DEVICE_PARAM. A
       // lifecycle change resets these because the client reconnects.
       oscPort: lifecycleChanged ? null : (dev.oscPort ?? null),
+      autoLink: lifecycleChanged ? undefined : dev.autoLink,
       hostInfo: lifecycleChanged ? undefined : dev.hostInfo,
       paramCount: lifecycleChanged ? undefined : dev.paramCount,
       lastMessageAt: lifecycleChanged ? undefined : dev.lastMessageAt,
@@ -1224,9 +1315,10 @@ function broadcastDiscovery() {
 }
 
 function broadcastDiscovered() {
-  const unsaved = deviceRegistry.snapshot().filter((record) => !record.saved)
+  const unsaved = clientRegistrySnapshot().filter((record) => !record.saved)
   broadcastHub({ type: 'DISCOVERED_DEVICES', devices: unsaved })
   broadcastRegistry()
+  autoLinkEngine.poke('discovery')
 }
 
 // We keep the browser in a `let` (not `const`) so it can be torn down and
@@ -1402,7 +1494,7 @@ function publishBonjour() {
 
 // ─── HTTP routes — Hub OSCQuery ───────────────────────────────────────────
 app.get('/_devices', (_req, res) => {
-  const devs = deviceRegistry.snapshot().map((d) => ({
+  const devs = clientRegistrySnapshot().map((d) => ({
     ...d,
     msgCount: d.manifestId == null ? 0 : (deviceMsgCount.get(d.manifestId) || 0)
   }))
@@ -1414,8 +1506,8 @@ app.get('/_status', (_req, res) => {
     namespace_size: namespace.size,
     ws_clients: hubClients.size,
     osc_subscribers: Array.from(oscSubscribers.values()),
-    devices: deviceRegistry.snapshot(),
-    registryDevices: deviceRegistry.snapshot(),
+    devices: clientRegistrySnapshot(),
+    registryDevices: clientRegistrySnapshot(),
     abletonMsgsSent,
     cosmicNoise: {
       enabled: cosmicNoiseForwarder.enabled,
@@ -1535,19 +1627,84 @@ function sendOscViaSender(host, port, address, args) {
   }
 }
 
+/**
+ * Shared resolution + announce core used by BOTH the WS ANNOUNCE_DEVICE
+ * handler and the auto-link engine, so the two paths cannot drift. The
+ * registry trust boundary is unchanged: the caller only *selects* a target;
+ * address, port and deviceType always come from server-owned registry state.
+ *
+ * @param {{ dev: any, target: any, peerId: string, udpPortOverride?: number }} args
+ * @returns {Promise<{ announcement: any, selectedRegistryDevice: any, selectedTarget: any, selectedManagedDevice: any }>}
+ */
+async function performAnnounce({ dev, target, peerId, udpPortOverride }) {
+  const sourceRegistryDevice = deviceRegistry.findByManifestId(dev.id)
+  const registrySnapshot = deviceRegistry.snapshot()
+  let selectedRegistryDevice = findRegistryDeviceForTarget(
+    registrySnapshot,
+    target
+  )
+  let selectedTarget = target
+  let routedSourceDevice = dev
+  if (isAbletonRingReceiverDevice(sourceRegistryDevice)) {
+    const resolved = resolveRingInstrumentTargetFromRegistry(registrySnapshot, target)
+    selectedRegistryDevice = resolved.record
+    selectedTarget = resolved.target
+  } else if (isRingInstrumentIdentity(sourceRegistryDevice)) {
+    routedSourceDevice = {
+      ...dev,
+      ...resolveRingInstrumentSourceFromRegistry(sourceRegistryDevice)
+    }
+    if (isAbletonRingReceiverDevice(selectedRegistryDevice)) {
+      const resolved = resolveRingReceiverFromRegistry(registrySnapshot, target)
+      selectedRegistryDevice = resolved.record
+      selectedTarget = resolved.target
+    }
+  } else {
+    // Generic (CosmicUnity ↔ Android/OSCQuery) direction: the same
+    // server-owned trust boundary as the Ring paths. The caller only
+    // selects; address, port and deviceType come from the registry.
+    const resolved = resolveGenericTargetFromRegistry(registrySnapshot, target)
+    selectedRegistryDevice = resolved.record
+    selectedTarget = resolved.target
+  }
+  const selectedManagedDevice = selectedRegistryDevice?.manifestId != null
+    ? devices.get(selectedRegistryDevice.manifestId)
+    : null
+  const announcement = resolveLinkAnnouncement({
+    sourceDevice: {
+      ...routedSourceDevice,
+      runtimeKind: sourceRegistryDevice?.runtimeKind,
+      linkRole: sourceRegistryDevice?.linkRole
+    },
+    selectedTarget: {
+      ...selectedTarget,
+      // Registry identity beats any caller-asserted type.
+      deviceType: selectedRegistryDevice?.deviceType || selectedTarget.deviceType,
+      runtimeKind: selectedRegistryDevice?.runtimeKind,
+      linkRole: selectedRegistryDevice?.linkRole,
+      oscPort: selectedManagedDevice?.oscPort || selectedTarget.oscPort
+    },
+    peerId,
+    udpPortOverride
+  })
+  await announceToTarget(announcement)
+  return { announcement, selectedRegistryDevice, selectedTarget, selectedManagedDevice }
+}
+
 // /ws/hub (and /) — dashboard control channel for the OQH-style UI
 wssHub.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress
   console.log(`[hub-ws] connection from ${ip}`)
   hubClients.add(ws)
 
+  const initialSnapshot = clientRegistrySnapshot()
   ws.send(JSON.stringify({
     type: 'INITIAL_STATE',
     namespace: buildTree(),
-    devices: deviceRegistry.snapshot(),
+    devices: initialSnapshot,
     subscribers: Array.from(oscSubscribers.values()),
-    discoveredDevices: deviceRegistry.snapshot().filter((record) => !record.saved),
-    registryDevices: deviceRegistry.snapshot(),
+    discoveredDevices: initialSnapshot.filter((record) => !record.saved),
+    registryDevices: initialSnapshot,
     hubName: HUB_NAME,
     abletonForward: ABLETON_FORWARD ? { host: ABLETON_HOST, port: ABLETON_PORT } : null,
     cosmicNoiseForward: cosmicNoiseForwarder.enabled
@@ -1633,6 +1790,22 @@ function handleHubMessage(ws, ip, msg) {
         ? msg.updates
         : {}
       const result = saveManifest(msg.deviceId, updates)
+      if (result.ok && updates && typeof updates === 'object' && 'link' in updates) {
+        // Keep both link-removal paths equivalent: clearing via
+        // UPDATE_DEVICE {link:null} must drop engine state and the runtime
+        // status exactly like CLEAR_DEVICE_LINK, and a changed link must be
+        // re-evaluated promptly instead of waiting for an unrelated poke.
+        if (updates.link === null) {
+          autoLinkEngine.forgetDevice(msg.deviceId)
+          const current = devices.get(msg.deviceId)
+          if (current && current.autoLink) {
+            delete current.autoLink
+            broadcastDeviceUpdate(current)
+          }
+        } else {
+          autoLinkEngine.poke('link-updated')
+        }
+      }
       ws.send(JSON.stringify({
         type: 'UPDATE_DEVICE_RESULT',
         deviceId: msg.deviceId,
@@ -1754,81 +1927,88 @@ function handleHubMessage(ws, ip, msg) {
       // external instrument. Falling back to target.name here is wrong for an
       // external-device card because that card's selected target is the VST.
       const peerId = String(msg.peerId || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '_')
-      let announcement
-      try {
-        const sourceRegistryDevice = deviceRegistry.findByManifestId(dev.id)
-        const registrySnapshot = deviceRegistry.snapshot()
-        let selectedRegistryDevice = findRegistryDeviceForTarget(
-          registrySnapshot,
-          target
-        )
-        let selectedTarget = target
-        let routedSourceDevice = dev
-        if (isAbletonRingReceiverDevice(sourceRegistryDevice)) {
-          const resolved = resolveRingInstrumentTargetFromRegistry(registrySnapshot, target)
-          selectedRegistryDevice = resolved.record
-          selectedTarget = resolved.target
-        } else if (isRingInstrumentIdentity(sourceRegistryDevice)) {
-          routedSourceDevice = {
-            ...dev,
-            ...resolveRingInstrumentSourceFromRegistry(sourceRegistryDevice)
+      performAnnounce({ dev, target, peerId, udpPortOverride: msg.udpPortOverride })
+        .then(({ announcement, selectedTarget, selectedManagedDevice }) => {
+          const summary = `${announcement.peerName} → ${announcement.receiverName}`
+          // Persist the link so the auto-link engine can re-apply it after a
+          // VST restart — unless the browser explicitly asked not to.
+          if (msg.remember !== false) {
+            const overridePort = Number(msg.udpPortOverride)
+            const link = {
+              targetFqdn: String(selectedTarget.fqdn || target.fqdn || '').slice(0, 128),
+              targetName: String(selectedTarget.name || target.name || '').slice(0, 128),
+              peerId: peerId.slice(0, 128),
+              udpPortOverride:
+                Number.isInteger(overridePort) && overridePort >= 0 && overridePort <= 65535
+                  ? overridePort
+                  : 0
+            }
+            const saved = saveManifest(dev.id, { link })
+            if (!saved.ok) {
+              console.log(`  [autolink] link persist failed for device ${dev.id}: ${saved.error}`)
+            } else {
+              // These exact coordinates were just applied — record them so
+              // the engine's next pass does not announce a duplicate.
+              autoLinkEngine.recordApplied(dev.id, {
+                targetAddress: selectedTarget.address,
+                targetPort: Number(selectedTarget.port),
+                targetOscPort: isValidOscPort(Number(selectedManagedDevice?.oscPort))
+                  ? Number(selectedManagedDevice.oscPort)
+                  : '',
+                // Must byte-match what the engine will compute from the
+                // persisted link: the sanitized peer id as given, possibly
+                // empty — resolveLinkAnnouncement owns the name fallback on
+                // both paths, so neither side may bake a derived name in.
+                peerId: link.peerId,
+                udpPortOverride: link.udpPortOverride,
+                summary
+              })
+            }
           }
-          if (isAbletonRingReceiverDevice(selectedRegistryDevice)) {
-            const resolved = resolveRingReceiverFromRegistry(registrySnapshot, target)
-            selectedRegistryDevice = resolved.record
-            selectedTarget = resolved.target
-          }
-        } else {
-          // Generic (CosmicUnity ↔ Android/OSCQuery) direction: the same
-          // server-owned trust boundary as the Ring paths. The browser only
-          // selects; address, port and deviceType come from the registry.
-          const resolved = resolveGenericTargetFromRegistry(registrySnapshot, target)
-          selectedRegistryDevice = resolved.record
-          selectedTarget = resolved.target
-        }
-        const selectedManagedDevice = selectedRegistryDevice?.manifestId != null
-          ? devices.get(selectedRegistryDevice.manifestId)
-          : null
-        announcement = resolveLinkAnnouncement({
-          sourceDevice: {
-            ...routedSourceDevice,
-            runtimeKind: sourceRegistryDevice?.runtimeKind,
-            linkRole: sourceRegistryDevice?.linkRole
-          },
-          selectedTarget: {
-            ...selectedTarget,
-            // Registry identity beats any browser-asserted type.
-            deviceType: selectedRegistryDevice?.deviceType || selectedTarget.deviceType,
-            runtimeKind: selectedRegistryDevice?.runtimeKind,
-            linkRole: selectedRegistryDevice?.linkRole,
-            oscPort: selectedManagedDevice?.oscPort || selectedTarget.oscPort
-          },
-          peerId,
-          udpPortOverride: msg.udpPortOverride
+          ws.send(JSON.stringify({
+            type: 'ANNOUNCE_RESULT',
+            deviceId: dev.id,
+            ok: true,
+            summary
+          }))
         })
-      } catch (err) {
-        ws.send(JSON.stringify({
-          type: 'ANNOUNCE_RESULT',
-          deviceId: dev.id,
-          ok: false,
-          error: err.message
-        }))
-        return
-      }
-
-      announceToTarget(announcement)
-        .then(() => ws.send(JSON.stringify({
-          type: 'ANNOUNCE_RESULT',
-          deviceId: dev.id,
-          ok: true,
-          summary: `${announcement.peerName} → ${announcement.receiverName}`
-        })))
         .catch((err) => ws.send(JSON.stringify({
           type: 'ANNOUNCE_RESULT',
           deviceId: dev.id,
           ok: false,
           error: err.message
         })))
+      return
+    }
+
+    // CLEAR_DEVICE_LINK — remove the persisted link and the runtime status.
+    if (msg.type === 'CLEAR_DEVICE_LINK' && typeof msg.deviceId === 'number') {
+      const dev = devices.get(msg.deviceId)
+      if (!dev) {
+        ws.send(JSON.stringify({
+          type: 'CLEAR_LINK_RESULT',
+          deviceId: msg.deviceId,
+          ok: false,
+          error: `Device not found: id ${msg.deviceId}`
+        }))
+        return
+      }
+      const result = saveManifest(msg.deviceId, { link: null })
+      if (result.ok) {
+        autoLinkEngine.forgetDevice(msg.deviceId)
+        const current = devices.get(msg.deviceId)
+        if (current && current.autoLink) {
+          delete current.autoLink
+          broadcastDeviceUpdate(current)
+        }
+        console.log(`  [autolink] link cleared for device ${msg.deviceId}`)
+      }
+      ws.send(JSON.stringify({
+        type: 'CLEAR_LINK_RESULT',
+        deviceId: msg.deviceId,
+        ok: result.ok,
+        ...(result.error ? { error: result.error } : {})
+      }))
       return
     }
 
@@ -1940,6 +2120,19 @@ function handleHubMessage(ws, ip, msg) {
             endpoints:    Array.isArray(m.endpoints) ? m.endpoints : [],
             legacyIds:    Array.isArray(m.legacyIds) ? m.legacyIds : [],
             legacyCanonicalIds: Array.isArray(m.legacyCanonicalIds) ? m.legacyCanonicalIds : []
+          }
+          // The persistentManifestFields spread carries `link` verbatim from
+          // an arbitrary /ws/hub client — run it through the same shape gate
+          // as saveManifest. A bad link drops silently (the device itself is
+          // still worth importing); nothing unbounded may reach disk.
+          if (manifest.link !== undefined) {
+            const linkCheck = validateLinkField(manifest.link)
+            if (linkCheck.ok) {
+              manifest.link = linkCheck.value
+            } else {
+              console.log(`  [hub] import: dropped invalid link on "${manifest.name}": ${linkCheck.error}`)
+              delete manifest.link
+            }
           }
           const filename = `${manifest.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${id}.json`
           writeFileSync(join(MANIFESTS_DIR, filename), JSON.stringify(manifest, null, 2) + '\n', 'utf-8')
@@ -2118,6 +2311,7 @@ function shutdown(signal = 'SIGTERM') {
   clearInterval(collisionHealTimer)
   if (oscRebindTimer) clearTimeout(oscRebindTimer)
   if (manifestReloadTimer) clearTimeout(manifestReloadTimer)
+  autoLinkEngine.close()
   try { manifestWatcher?.close() } catch {}
   try { browser?.stop() } catch {}
   for (const [id, client] of oscQueryClients.entries()) {
