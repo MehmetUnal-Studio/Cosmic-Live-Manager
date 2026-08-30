@@ -551,6 +551,9 @@ function reconcileClients(oldDevices, oldManifestFilenames = manifestFilenames) 
       newDev.oscQueryPort !== oldDev.oscQueryPort
 
     if (shouldDisconnect) cosmicNoiseForwarder.clearDeviceSnapshots(id)
+    // A device dropped by a manifest reload must also leave the auto-link
+    // engine, or its per-device retry timers/state leak until process exit.
+    if (!newDev) autoLinkEngine.forgetDevice(id)
     if (shouldDisconnect && oscQueryClients.has(id)) {
       const client = oscQueryClients.get(id)
       oscQueryClients.delete(id)
@@ -1076,7 +1079,9 @@ function forwardToAbleton(deviceId, paramPath, value, type) {
   const address = `device${deviceId}`
   const vals = Array.isArray(value) ? value : [value]
   const v = vals[0]
-  const isInt = type === 'i' && Number.isInteger(v)
+  // Out-of-int32 integers fall through to the ,sf float encoding —
+  // writeInt32BE would throw a RangeError and kill the forward path.
+  const isInt = type === 'i' && Number.isInteger(v) && v >= -2147483648 && v <= 2147483647
   const packet = buildAbletonPacket(address, paramPath, typeof v === 'number' ? v : 0, isInt)
   abletonSocket.send(packet, ABLETON_PORT, ABLETON_HOST)
   abletonMsgsSent++
@@ -1658,6 +1663,13 @@ async function performAnnounce({ dev, target, peerId, udpPortOverride }) {
       const resolved = resolveRingReceiverFromRegistry(registrySnapshot, target)
       selectedRegistryDevice = resolved.record
       selectedTarget = resolved.target
+    } else {
+      // Ring-Instrument → CosmicUnity/other: same trust boundary as the
+      // generic direction — address/port must come from the registry, never
+      // from the caller's payload.
+      const resolved = resolveGenericTargetFromRegistry(registrySnapshot, target)
+      selectedRegistryDevice = resolved.record
+      selectedTarget = resolved.target
     }
   } else {
     // Generic (CosmicUnity ↔ Android/OSCQuery) direction: the same
@@ -1756,7 +1768,10 @@ wssHub.on('connection', (ws, req) => {
 function handleHubMessage(ws, ip, msg) {
     // OSCQuery-style SET — write a value into the hub namespace and rebroadcast.
     if (msg.type === 'SET' && msg.path && msg.value !== undefined) {
-      if (!OSC_PATH_RE.test(msg.path)) return
+      // RegExp.test() coerces — an array like ["/evil"] would pass the regex
+      // and poison the namespace Map with a non-string key, crashing
+      // buildTree() for every later GET / and INITIAL_STATE until restart.
+      if (typeof msg.path !== 'string' || !OSC_PATH_RE.test(msg.path)) return
       if (!namespace.has(msg.path) && namespace.size >= MAX_NAMESPACE) return
       const newValue = Array.isArray(msg.value) ? msg.value : [msg.value]
       const existing = namespace.get(msg.path)

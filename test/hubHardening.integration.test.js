@@ -203,6 +203,10 @@ test('malformed /ws/hub payloads produce error results and never kill the hub; d
   hub.ws.send(JSON.stringify({ type: 'ANNOUNCE_DEVICE', deviceId: 7, target: { address: {}, port: 'x' } }))
   hub.ws.send(JSON.stringify({ type: 'ADD_DISCOVERED', host: {}, port: 'x' }))
   hub.ws.send(JSON.stringify({ type: 'SET', path: '../../etc/passwd', value: 1 }))
+  // Regression: RegExp.test() coerces, so an ARRAY path like ["/evil"] used
+  // to pass the guard and poison the namespace Map with a non-string key —
+  // buildTree() then threw for every GET / and INITIAL_STATE until restart.
+  hub.ws.send(JSON.stringify({ type: 'SET', path: ['/evil'], value: 1 }))
 
   const failures = await waitFor(() => {
     const results = hub.messages.filter((message) =>
@@ -227,6 +231,20 @@ test('malformed /ws/hub payloads produce error results and never kill the hub; d
   await waitFor(() => hub.messages.some((message) =>
     message.type === 'UPDATE_DEVICE_RESULT' && message.ok === true
   ), 'valid UPDATE_DEVICE still works')
+
+  // The array SET path must not have poisoned buildTree(): the OSCQuery
+  // tree keeps serving and a brand-new dashboard still gets INITIAL_STATE.
+  const treeResponse = await fetch(`http://${LOOPBACK}:${managerPort}/`)
+  assert.equal(treeResponse.ok, true, 'hub OSCQuery tree must survive an array SET path')
+  const hubAfterPoison = await openHub(managerPort)
+  try {
+    await waitFor(
+      () => hubAfterPoison.messages.some((message) => message.type === 'INITIAL_STATE'),
+      'new dashboard still receives INITIAL_STATE after the array SET path'
+    )
+  } finally {
+    try { hubAfterPoison.ws.terminate() } catch {}
+  }
 
   // F0-10: deleting the device must unlink every shadow file, so a reload
   // cannot resurrect it from a middle duplicate.

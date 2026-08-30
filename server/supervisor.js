@@ -76,6 +76,12 @@ async function stopHub({ restarting = false } = {}) {
 }
 
 async function startHub({ restarting = false } = {}) {
+  // A serialized start/restart that dequeues after SIGTERM must not fork a
+  // hub the dying supervisor will orphan.
+  if (supervisorStopping) {
+    state = 'Stopped'
+    return snapshot()
+  }
   if (child && state === 'Running') return snapshot()
   const currentGeneration = ++generation
   state = 'Restarting'
@@ -161,7 +167,9 @@ async function shutdown(signal) {
   supervisorStopping = true
   generation++
   console.log(`[supervisor] shutting down (${signal})`)
-  await stopHub()
+  // Order the final stop behind any in-flight serialized operation; its
+  // startHub now no-ops via the supervisorStopping guard above.
+  await serialize(() => stopHub())
   controlServer.close(() => process.exit(0))
   setTimeout(() => process.exit(0), STOP_TIMEOUT_MS + 500).unref()
 }

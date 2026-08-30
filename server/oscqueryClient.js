@@ -20,6 +20,29 @@ import osc from 'osc'
 // hostile OSCQuery server on the LAN must not be able to balloon hub memory
 // or blow the stack with a pathological tree.
 export const MAX_NAMESPACE_BYTES = 2 * 1024 * 1024 // 2 MB
+export const MAX_HOSTINFO_BYTES = 64 * 1024 // 64 KB
+
+// Read a fetch response body with a hard byte cap enforced WHILE streaming —
+// a hostile or buggy LAN server must not balloon hub memory before a
+// post-hoc size check ever runs. Throwing mid-iteration cancels the stream.
+async function readBodyCapped(res, maxBytes, label) {
+  if (!res.body) {
+    const text = await res.text()
+    if (Buffer.byteLength(text, 'utf-8') > maxBytes) {
+      throw new Error(`${label} too large (> ${maxBytes} bytes)`)
+    }
+    return text
+  }
+  const chunks = []
+  let total = 0
+  for await (const chunk of res.body) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    total += buf.length
+    if (total > maxBytes) throw new Error(`${label} too large (> ${maxBytes} bytes)`)
+    chunks.push(buf)
+  }
+  return Buffer.concat(chunks).toString('utf-8')
+}
 export const MAX_NAMESPACE_DEPTH = 12
 export const MAX_NAMESPACE_NODES = 10_000
 
@@ -75,7 +98,6 @@ export class OscQueryClient {
     this.fetchControllers = new Set()
     this.attemptTimer = null
     this.failedAttempt = 0
-    this.listenedPaths = new Set()
     this.debugCount = 0
     this.lastNamespace = null
     // Flat node table built from lastNamespace. One entry per writable/readable
@@ -116,16 +138,13 @@ export class OscQueryClient {
 
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       // Enforce the byte cap BEFORE parsing. Content-Length lets us reject
-      // early; the decoded text length is the authoritative check.
+      // early; the streaming reader below is the authoritative check.
       const contentLength = Number(res.headers?.get?.('content-length'))
       if (Number.isFinite(contentLength) && contentLength > MAX_NAMESPACE_BYTES) {
         throw new Error(`Namespace JSON too large (${contentLength} bytes > ${MAX_NAMESPACE_BYTES})`)
       }
-      const text = await res.text()
+      const text = await readBodyCapped(res, MAX_NAMESPACE_BYTES, 'Namespace JSON')
       if (!this._isCurrentAttempt(attempt)) return
-      if (Buffer.byteLength(text, 'utf-8') > MAX_NAMESPACE_BYTES) {
-        throw new Error(`Namespace JSON too large (> ${MAX_NAMESPACE_BYTES} bytes)`)
-      }
       const tree = JSON.parse(text)
       this.lastNamespace = tree
 
@@ -156,7 +175,7 @@ export class OscQueryClient {
       const infoRes = await fetch(infoUrl, { signal: controller.signal })
       if (!this._isCurrentAttempt(attempt)) return
       if (infoRes.ok) {
-        const info = await infoRes.json()
+        const info = JSON.parse(await readBodyCapped(infoRes, MAX_HOSTINFO_BYTES, 'HOST_INFO JSON'))
         if (!this._isCurrentAttempt(attempt)) return
         if (info && (info.OSC_PORT || info.OSC_TRANSPORT || info.NAME)) {
           received = true
@@ -337,6 +356,11 @@ export class OscQueryClient {
       const wsUrl = `ws://${this.host}:${this.port}`
       const ws = new WebSocket(wsUrl)
       this.ws = ws
+      // Per-attempt flag: 'close' must distinguish "this socket was open and
+      // dropped" from "the handshake never completed". Branching on
+      // everConnected alone turns a dead-but-mDNS-visible device into a ~2 Hz
+      // no-backoff reconnect loop that spams onDisconnect.
+      let opened = false
 
       ws.on('open', () => {
         if (this.ws !== ws || !this._isCurrentAttempt(attempt)) {
@@ -344,6 +368,7 @@ export class OscQueryClient {
           return
         }
         this._clearAttemptTimer()
+        opened = true
         this.connected = true
         this.everConnected = true
         this.consecutiveRetryFailures = 0
@@ -392,7 +417,7 @@ export class OscQueryClient {
         // device usually rebinds a new ephemeral OSC UDP port, and writing to
         // the old one would silently vanish.
         this.hostInfo = null
-        if (this.everConnected) {
+        if (opened) {
           this._clearAttemptTimer()
           this.events.onDisconnect(`WS closed (code ${code})`)
           this._scheduleReconnect(this._nextReconnectDelay())
@@ -490,7 +515,6 @@ export class OscQueryClient {
 
   _listen(path) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
-    this.listenedPaths.add(path)
     try {
       this.ws.send(JSON.stringify({ COMMAND: 'LISTEN', DATA: path }))
     } catch {

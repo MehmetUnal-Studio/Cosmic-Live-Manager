@@ -923,9 +923,15 @@ export class DeviceRegistry {
     for (const [canonicalId, record] of this.records) {
       if (record.saved || record.discoveryState !== 'Stale' || record.lastSeen > cutoff) continue
       this.records.delete(canonicalId)
+      // Only drop index entries this record still owns — an endpoint/fqdn key
+      // may have been re-pointed at a newer live record since (same guard as
+      // removeManifest below).
       for (const endpoint of record.endpoints.values()) {
-        this.endpointIndex.delete(endpointKey(endpoint.host, endpoint.port))
-        if (endpoint.fqdn) this.fqdnIndex.delete(endpoint.fqdn)
+        const key = endpointKey(endpoint.host, endpoint.port)
+        if (this.endpointIndex.get(key) === canonicalId) this.endpointIndex.delete(key)
+        if (endpoint.fqdn && this.fqdnIndex.get(endpoint.fqdn) === canonicalId) {
+          this.fqdnIndex.delete(endpoint.fqdn)
+        }
       }
       removed.push(canonicalId)
     }
