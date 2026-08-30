@@ -76,8 +76,12 @@ const currentEnumValue = computed(() => {
 function onEnumChange(e) {
   const label = e.target.value
   if (primaryType.value === 'i') {
-    const idx = enumValues.value.indexOf(label)
-    commit([idx >= 0 ? idx : 0])
+    // e.target.value is ALWAYS a string; numeric VALS need a coerced compare
+    // or every pick maps to index 0. An unmatched label is a no-op, never a
+    // silent commit of 0.
+    const idx = enumValues.value.findIndex((v) => String(v) === label)
+    if (idx === -1) return
+    commit([idx])
   } else {
     commit([label])
   }
@@ -109,10 +113,17 @@ function onNumberBlur() {
   numEditing.value = false
 }
 function onNumberInput(e) {
-  const v = Number(e.target.value)
+  // A cleared (or unparseable, e.g. "1e") number input reads as '' and
+  // Number('') === 0 — revert the display instead of committing 0.
+  const raw = String(e.target.value ?? '')
+  if (raw.trim() === '') {
+    numDraft.value = formatDisplay(props.node.VALUE?.[0], primaryType.value)
+    return
+  }
+  const v = Number(raw)
   if (!Number.isFinite(v)) return
   draft.value = [v]
-  numDraft.value = e.target.value
+  numDraft.value = raw
   commit([v])
 }
 
@@ -131,10 +142,15 @@ function onMultiBlur() {
 }
 
 function onMultiComponentInput(idx, val, ch) {
+  // Same empty/NaN guard as onNumberInput — a cleared slot must not write 0.
+  const raw = String(val ?? '')
+  if (raw.trim() === '') return
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return
   // Build the full vector from the current node value, replacing one slot.
   const current = Array.isArray(props.node.VALUE) ? [...props.node.VALUE] : []
   while (current.length < typeStr.value.length) current.push(0)
-  current[idx] = ch === 'i' ? Math.round(Number(val)) : Number(val)
+  current[idx] = ch === 'i' ? Math.round(n) : n
   commit(current)
 }
 

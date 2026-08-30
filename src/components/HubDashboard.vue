@@ -326,6 +326,9 @@ function onCardPointerDown(e, key, cardEl) {
   // toggling buttons, scrubbing sliders etc. don't accidentally start a drag.
   const t = e.target
   if (t && t.closest('input, select, textarea, button, [contenteditable], .param-control')) return
+  // One gesture at a time: a second finger landing mid-press/drag must not
+  // re-arm the timer (orphaning the first) or hijack the drag state.
+  if (pressStart) return
 
   pressStart = {
     x: e.clientX, y: e.clientY,
@@ -351,6 +354,7 @@ function onCardPointerDown(e, key, cardEl) {
 
 function onWindowPointerMove(e) {
   if (!pressStart) return
+  if (e.pointerId !== pressStart.pointerId) return
   // Phase 1: waiting for press timer to fire — cancel if moved too far
   if (pressTimer && dragKey.value == null) {
     const dx = e.clientX - pressStart.x
@@ -395,7 +399,10 @@ function onWindowPointerMove(e) {
   if (hit != null) dragOverKey.value = hit
 }
 
-function onWindowPointerUp(_e) {
+function onWindowPointerUp(e) {
+  // pointercancel routes through here too and carries pointerId — only the
+  // gesture's own pointer may end it.
+  if (pressStart && e.pointerId !== pressStart.pointerId) return
   if (pressTimer) clearTimeout(pressTimer)
   pressTimer = null
   if (dragKey.value != null && dragOverKey.value != null && dragOverKey.value !== dragKey.value) {

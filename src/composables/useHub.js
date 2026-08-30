@@ -101,8 +101,9 @@ function createHub() {
   //   pendingToggles: shallowRef<Map<deviceId, { desired, requestedAt }>>
   // While a device has an entry here, the UI should render the button
   // pending/locked and treat `desired` (not the stale prop) as the truth of
-  // what the operator asked for. Cleared on DEVICE_UPDATED /
-  // UPDATE_DEVICE_RESULT for that device, or after TOGGLE_TIMEOUT_MS.
+  // what the operator asked for. Cleared on a DEVICE_UPDATED that MATCHES the
+  // desired state, on a failed UPDATE_DEVICE_RESULT, or after
+  // TOGGLE_TIMEOUT_MS.
   const pendingToggles = shallowRef(new Map())
   const toggleTimers = new Map()
 
@@ -456,7 +457,7 @@ function createHub() {
   // Route a single PATH_CHANGED: resolve the device, fan out to exact-timing
   // listeners immediately, and queue the reactive-map update for the next
   // frame flush.
-  function applyValue(absPath, value, paramType, explicitDeviceId) {
+  function applyValue(absPath, value, paramType, explicitDeviceId, fromSnapshot = false) {
     let resolved = null
     if (Number.isInteger(explicitDeviceId)) {
       const dev = devices.value.find((item) => item.id === explicitDeviceId)
@@ -482,11 +483,15 @@ function createHub() {
     const { deviceId, relPath } = resolved
 
     // Fan out to recording / observer subscribers FIRST (pre-coalesce, exact
-    // timing). Errors in one listener must not break the others.
-    for (const fn of pathChangeListeners) {
-      try { fn(deviceId, relPath, value, paramType) } catch (err) {
-        // Best-effort: log and keep going
-        console.warn('[useHub] pathChange listener threw:', err)
+    // timing). Errors in one listener must not break the others. Snapshot
+    // seeding (INITIAL_STATE walk) must NOT fan out — a reconnect would
+    // pollute active recordings and blink every activity dot.
+    if (!fromSnapshot) {
+      for (const fn of pathChangeListeners) {
+        try { fn(deviceId, relPath, value, paramType) } catch (err) {
+          // Best-effort: log and keep going
+          console.warn('[useHub] pathChange listener threw:', err)
+        }
       }
     }
 
@@ -496,7 +501,7 @@ function createHub() {
   // Walk an initial OSCQuery tree (from INITIAL_STATE.namespace) to seed
   // deviceParams. Each path is "/<deviceName>/<rel>".
   function walkInitialTree(node, path) {
-    if (node.TYPE !== undefined) applyValue(path, node.VALUE, node.TYPE)
+    if (node.TYPE !== undefined) applyValue(path, node.VALUE, node.TYPE, undefined, true)
     if (node.CONTENTS) {
       for (const [k, child] of Object.entries(node.CONTENTS)) walkInitialTree(child, path + '/' + k)
     }
@@ -525,22 +530,30 @@ function createHub() {
 
   function open() {
     if (suspended) return
-    ws = new WebSocket(`ws://${location.host}/ws/hub`)
-    ws.onopen = () => {
+    // Identity-guard every handler (same pattern as useDiscovery): a close
+    // event from an ABANDONED socket delivered after suspend→resume must not
+    // null the live socket, mark the UI disconnected, or fork a third
+    // connection whose duplicate onmessage doubles every broadcast.
+    const socket = new WebSocket(`ws://${location.host}/ws/hub`)
+    ws = socket
+    socket.onopen = () => {
+      if (ws !== socket) { try { socket.close() } catch { /* already closing */ } ; return }
       connected.value = true
       connectionState.value = 'connected'
       clearTimeout(downTimer)
       downTimer = null
     }
-    ws.onclose = () => {
+    socket.onclose = () => {
+      if (ws !== socket) return
       ws = null
       markDisconnected()
       // Fix F2-12 pattern: never schedule a reconnect once suspended.
       if (!suspended) retry = setTimeout(open, RETRY_MS)
     }
-    ws.onerror = () => { /* surfaced via onclose */ }
+    socket.onerror = () => { /* surfaced via onclose */ }
 
-    ws.onmessage = (ev) => {
+    socket.onmessage = (ev) => {
+      if (ws !== socket) return
       let msg
       try { msg = JSON.parse(ev.data) } catch { return }
 
@@ -623,12 +636,20 @@ function createHub() {
         if (i >= 0) next[i] = msg.device
         else next.push(msg.device)
         devices.value = next
-        // Server state landed → any in-flight toggle intent is resolved.
-        if (msg.device.id != null) clearPendingToggle(msg.device.id)
+        // Only an echo CONFIRMING the desired enabled state resolves the
+        // toggle intent — unrelated DEVICE_UPDATED broadcasts (reconnect
+        // retries, autoLink status ticks) must not unlock the button early
+        // and re-expose the stale value mid-flight.
+        if (msg.device.id != null) {
+          const entry = pendingToggles.value.get(msg.device.id)
+          if (entry && !!msg.device.enabled === entry.desired) clearPendingToggle(msg.device.id)
+        }
       } else if (msg.type === 'UPDATE_DEVICE_RESULT') {
         if (msg.ok) setHint(msg.deviceId, '✓ Saved', 'ok')
         else setHint(msg.deviceId, '✗ ' + (msg.error || 'Error'), 'err')
-        clearPendingToggle(msg.deviceId)
+        // Success is cleared by the matching DEVICE_UPDATED echo; a failure
+        // ends the intent here (the timeout stays as the last-resort unlock).
+        if (!msg.ok) clearPendingToggle(msg.deviceId)
       } else if (msg.type === 'DEVICE_MSG_COUNTS') {
         const m = new Map()
         const validIds = new Set(devices.value.map((device) => device.id))
@@ -676,6 +697,9 @@ function createHub() {
     if (ws) {
       const socket = ws
       ws = null
+      // Belt-and-braces on top of the identity guards in open(): a stale
+      // close can never fire once the handlers are detached.
+      socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null
       try { socket.close() } catch {}
       markDisconnected()
     }
