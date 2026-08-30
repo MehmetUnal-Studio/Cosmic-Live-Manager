@@ -2355,6 +2355,8 @@ details.row-section summary {
 /* Enable button pending state */
 .hub-btn.pending { opacity: 0.6; cursor: progress; }
 .hub-btn.pending .hub-btn-icon { animation: hub-rediscover-spin 0.8s linear infinite; }
+/* One-shot spin feedback (Manager Bridge Rediscover) */
+.hub-btn.spinning .hub-btn-icon { animation: hub-rediscover-spin 0.6s linear; }
 
 /* ═══════════════════════════════════════════════════════════════════════
    Minimal mode — compact cards + slim chrome. Only identity, status and
