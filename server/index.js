@@ -52,6 +52,7 @@ import {
   resolveOscUdpPort
 } from './linkRouting.js'
 import { planCollisionHeals } from './collisionHeal.js'
+import { planHostFollowHeals } from './hostFollowHeal.js'
 import { createAutoLinkEngine } from './autoLink.js'
 import { hubBackpressureAction } from './hubBackpressure.js'
 import {
@@ -83,6 +84,8 @@ const REACHABILITY_PROBE_INTERVAL_MS = Number(process.env.REACHABILITY_PROBE_INT
 const REACHABILITY_PROBE_TIMEOUT_MS = Number(process.env.REACHABILITY_PROBE_TIMEOUT_MS || 1500)
 // Persistent-id port-collision auto-heal scan interval.
 const COLLISION_HEAL_INTERVAL_MS = Number(process.env.COLLISION_HEAL_INTERVAL_MS || 5000)
+// Saved-device fqdn host-follow auto-heal scan interval (DHCP moves).
+const HOST_FOLLOW_HEAL_INTERVAL_MS = Number(process.env.HOST_FOLLOW_HEAL_INTERVAL_MS || 5000)
 
 // Make sure `MANIFESTS_DIR` actually exists on disk. Fresh clones, Windows
 // machines, or a user who manually deleted the folder would otherwise hit
@@ -1489,6 +1492,39 @@ const collisionHealTimer = setInterval(() => {
 }, COLLISION_HEAL_INTERVAL_MS)
 collisionHealTimer.unref()
 
+// ─── Saved-device fqdn host-follow auto-heal ─────────────────────────────
+// A DHCP lease change moves a device to a new address under the same mDNS
+// fqdn. Discovery folds the fresh endpoint into the saved record immediately,
+// but the connection loop keeps dialing the manifest's dead host:port. Once
+// that endpoint has failed repeatedly, migrate the manifest to the freshest
+// same-fqdn discovery endpoint and reconnect. fqdn identity is mandatory —
+// planHostFollowHeals never follows a mere name lookalike.
+const hostFollowHealTimer = setInterval(() => {
+  try {
+    const plans = planHostFollowHeals({
+      snapshot: deviceRegistry.snapshot(),
+      getManagedDevice: (manifestId) => devices.get(manifestId)
+    })
+    for (const plan of plans) {
+      console.log(
+        `  [heal] host follow: device ${plan.manifestId} ` +
+        `${plan.fromHost}:${plan.fromPort} → ${plan.host}:${plan.oscQueryPort} (fqdn ${plan.fqdn})`
+      )
+      const result = saveManifest(plan.manifestId, {
+        host: plan.host,
+        oscQueryPort: plan.oscQueryPort
+      })
+      if (!result.ok) {
+        console.log(`  [heal] host follow failed for device ${plan.manifestId}: ${result.error}`)
+      }
+    }
+    if (plans.length > 0) broadcastDiscovered()
+  } catch (err) {
+    console.log(`  [heal] host follow error: ${err.message}`)
+  }
+}, HOST_FOLLOW_HEAL_INTERVAL_MS)
+hostFollowHealTimer.unref()
+
 startBrowser()
 
 function publishBonjour() {
@@ -2324,6 +2360,7 @@ function shutdown(signal = 'SIGTERM') {
   clearInterval(discoveryStaleTimer)
   clearInterval(reachabilityTimer)
   clearInterval(collisionHealTimer)
+  clearInterval(hostFollowHealTimer)
   if (oscRebindTimer) clearTimeout(oscRebindTimer)
   if (manifestReloadTimer) clearTimeout(manifestReloadTimer)
   autoLinkEngine.close()
