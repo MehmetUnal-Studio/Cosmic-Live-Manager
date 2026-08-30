@@ -342,12 +342,31 @@ export function createAutoLinkEngine({
     // signature via the nonce so the next pass always re-announces.
     noteDeviceConnected(deviceId) {
       if (closed) return
-      const state = stateFor(Number(deviceId))
+      const id = Number(deviceId)
+      const state = stateFor(id)
       state.nonce += 1
       state.lastApplied = null
       state.appliedGen += 1
       state.retryIndex = 0
       cancelRetry(state)
+      // A restart also wipes peer state when this device is the TARGET of
+      // someone else's saved link (external-card shape: the bootstrap was
+      // written INTO this device). The signature components don't change on
+      // a same-port restart, so invalidate those sources explicitly.
+      let snapshot = null
+      for (const dev of getDevicesWithLinks() || []) {
+        if (!dev || dev.id === id || !dev.link || typeof dev.link !== 'object') continue
+        const other = states.get(dev.id)
+        if (!other || other.lastApplied == null) continue
+        if (!snapshot) snapshot = getRegistrySnapshot() || []
+        const record = resolveLinkTargetRecord(snapshot, dev.link)
+        if (record?.manifestId != null && Number(record.manifestId) === id) {
+          other.lastApplied = null
+          other.appliedGen += 1
+          other.retryIndex = 0
+          cancelRetry(other)
+        }
+      }
       poke('device-connected')
     },
 

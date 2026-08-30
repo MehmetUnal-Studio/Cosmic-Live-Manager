@@ -394,3 +394,37 @@ test('poke debounces to a single evaluation pass and close leaves no timer runni
   assert.equal(fx.pendingTimers().length, 0, 'a closed engine must not schedule again')
   assert.equal(fx.announces.length, 2, 'a closed engine must not evaluate again')
 })
+
+test('a target restart invalidates the applied signature of sources linked to it', async () => {
+  const fx = makeFixture()
+  // The link target is itself a managed device (external-card shape): the
+  // peer bootstrap was written INTO it, so its restart wipes that state
+  // even though host/ports — the signature components — stay identical.
+  fx.record.manifestId = 2
+  fx.world.devices.set(2, {
+    id: 2,
+    name: 'Tablet',
+    enabled: true,
+    connectionState: 'Connected',
+    oscPort: 42000
+  })
+
+  fx.engine.evaluateNow('manifests-loaded')
+  await settle()
+  assert.equal(fx.announces.length, 1, 'initial pass announces the saved link')
+
+  fx.engine.evaluateNow('poke')
+  await settle()
+  assert.equal(fx.announces.length, 1, 'unchanged signature stays quiet')
+
+  fx.engine.noteDeviceConnected(2)
+  fx.engine.evaluateNow('device-connected')
+  await settle()
+  assert.equal(fx.announces.length, 2, 'target restart must re-announce the source link')
+
+  // An unrelated device reconnecting must NOT invalidate the pairing.
+  fx.engine.noteDeviceConnected(99)
+  fx.engine.evaluateNow('device-connected')
+  await settle()
+  assert.equal(fx.announces.length, 2, 'unrelated reconnects leave the applied signature intact')
+})
