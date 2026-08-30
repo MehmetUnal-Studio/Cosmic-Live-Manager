@@ -506,6 +506,16 @@ watch(devices, (list) => {
       >
         <span class="hub-rediscover-icon">⟳</span>
       </button>
+      <button
+        class="hub-rediscover-btn icon-only"
+        :class="{ active: showManualAdd }"
+        type="button"
+        title="Manuel cihaz ekle — discovery bir cihazı kaçırırsa host + OSCQuery portu ile kaydet"
+        aria-label="Add device manually"
+        @click="showManualAdd = !showManualAdd"
+      >
+        <span class="hub-rediscover-icon">＋</span>
+      </button>
       <div class="ws-badge" :class="{ connected }">
         <span class="dot"></span>
         <span>{{ connected ? 'Connected' : 'Reconnecting…' }}</span>
@@ -533,13 +543,7 @@ watch(devices, (list) => {
         <span class="ss-item"><b>{{ msgsThisSecond }}</b> msg/s</span>
       </div>
 
-      <!-- Scenes (global snapshot recall) -->
-      <div class="section-header">
-        <div
-          class="section-title"
-          title="Tüm cihazların anlık durumunu kaydeder · çipe tıkla: geri çağır · ⟳ üstüne yaz · ✎ yeniden adlandır · × sil"
-        >Scenes</div>
-      </div>
+      <!-- Scenes (global snapshot recall) — label lives inside the slim bar -->
       <SceneBar
         :scenes="scenes"
         @save="onSceneSave"
@@ -550,20 +554,7 @@ watch(devices, (list) => {
         @reorder="({ from, to }) => reorderScene(from, to)"
       />
 
-      <!-- Manual add — rare on the fixed rig, folded behind a toggle. -->
-      <div class="section-header manifest-header">
-        <div
-          class="section-title"
-          title="Discovery bir cihazı kaçırırsa: host + OSCQuery portu ile elle kaydet. Manifest'e diğerleri gibi yazılır."
-        >Devices</div>
-        <button
-          type="button"
-          class="manual-add-toggle"
-          :class="{ active: showManualAdd }"
-          title="Discovery bir cihazı kaçırırsa: host + OSCQuery portu ile elle kaydet"
-          @click="showManualAdd = !showManualAdd"
-        >{{ showManualAdd ? '× Kapat' : '+ Manuel Ekle' }}</button>
-      </div>
+      <!-- Manual add — toggled from the topbar "+" icon; no header row. -->
       <div v-show="showManualAdd" class="manual-add-row">
         <input
           v-model="manualName"

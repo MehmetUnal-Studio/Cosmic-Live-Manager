@@ -77,6 +77,10 @@ function onRemove(s) {
 <template>
   <div class="scene-bar">
     <div class="preset-chips">
+      <span
+        class="scene-bar-label"
+        title="Tüm cihazların anlık durumunu kaydeder · çipe tıkla: geri çağır · ⟳ üstüne yaz · ✎ yeniden adlandır · × sil"
+      >Scenes</span>
       <template v-for="(s, idx) in scenes" :key="s.id">
         <input
           v-if="editingId === s.id"
