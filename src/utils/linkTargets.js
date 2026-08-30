@@ -35,6 +35,16 @@ export function isCosmicUnityOrAbletonDevice(device) {
   return isCosmicUnityDevice(device) || isAbletonRingReceiverDevice(device)
 }
 
+// Cosmic Leap VST (Ableton-side gesture→MIDI instance; TXT device_type
+// "CosmicLeap", default service name "MaxLeap"). Used for dashboard
+// grouping only — it deliberately takes no part in the LINK topology rules.
+export function isCosmicLeapDevice(device) {
+  const declared = normalized(device?.deviceType)
+  if (declared === 'cosmicleap') return true
+  if (declared === 'android') return false
+  return /leap/i.test(device?.name || '') || /leap/i.test(device?.serviceName || '')
+}
+
 export function isAbletonRingReceiverDevice(device) {
   return isMaxRingReceiverDevice(device) || isCosmicRingReceiverDevice(device)
 }

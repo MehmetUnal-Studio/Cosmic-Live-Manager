@@ -747,3 +747,16 @@ test('legacy name heuristic does not destructively clear a sticky target before 
     []
   )
 })
+
+test('isCosmicLeapDevice groups the Leap VST on the Ableton side', async () => {
+  const { isCosmicLeapDevice } = await import('../src/utils/linkTargets.js')
+  // Declared identity from the VST's mDNS TXT record.
+  assert.equal(isCosmicLeapDevice({ deviceType: 'CosmicLeap', name: 'Live-Leap' }), true)
+  // Name heuristics for manifests that predate the TXT type.
+  assert.equal(isCosmicLeapDevice({ name: 'MaxLeap' }), true)
+  assert.equal(isCosmicLeapDevice({ name: 'Live-Leap', serviceName: 'MaxLeap' }), true)
+  // A declared Android device never lands in the Ableton column by name.
+  assert.equal(isCosmicLeapDevice({ deviceType: 'Android', name: 'LeapTablet' }), false)
+  assert.equal(isCosmicLeapDevice({ deviceType: 'Android', name: 'Android_Tablet01' }), false)
+  assert.equal(isCosmicLeapDevice({ name: 'Ring-Instrument' }), false)
+})

@@ -10,6 +10,7 @@ import ServerControl from './ServerControl.vue'
 import {
   filterLinkTargetServices,
   isAndroidDevice,
+  isCosmicLeapDevice,
   isCosmicUnityOrAbletonDevice,
   knownDisallowedLinkTargetFqdns
 } from '../utils/linkTargets.js'
@@ -236,7 +237,9 @@ const orderedDevices = computed(() => {
 })
 
 function isCosmicUnity(d) {
-  return isCosmicUnityOrAbletonDevice(d)
+  // Ableton-side column: CosmicUnity instances, Ring receivers and the
+  // Cosmic Leap VST — everything that lives inside the Live set.
+  return isCosmicUnityOrAbletonDevice(d) || isCosmicLeapDevice(d)
 }
 function isAndroid(d) {
   return isAndroidDevice(d)
