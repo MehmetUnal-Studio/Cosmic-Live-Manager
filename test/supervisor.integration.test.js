@@ -352,3 +352,72 @@ test('supervisor repeatedly stop/starts/restarts one hub without losing manifest
     await assertManifestAndDevice(stableSettings)
   }
 })
+
+test('supervisor revives a hub that died on its own, and an operator Stop outranks the revival', {
+  timeout: 60_000
+}, async (t) => {
+  const supervisorPort = await freeTcpPort()
+  const managerPort = await freeTcpPort(new Set([supervisorPort]))
+  const managerOscPort = await freeUdpPort()
+  const manifestsDir = await mkdtemp(join(os.tmpdir(), 'cosmic-manager-supervisor-revive-'))
+
+  let logs = ''
+  const knownHubPids = new Set()
+  const supervisor = spawn(process.execPath, ['server/supervisor.js'], {
+    cwd: REPO_DIR,
+    env: {
+      ...process.env,
+      SUPERVISOR_PORT: String(supervisorPort),
+      PORT: String(managerPort),
+      OSC_LISTEN_PORT: String(managerOscPort),
+      HUB_START_TIMEOUT_MS: '7000',
+      HUB_STOP_TIMEOUT_MS: '3500',
+      HUB_REVIVE_DELAY_MS: '300',
+      ABLETON_FORWARD: '0',
+      COSMICNOISE_FORWARD: '0',
+      COSMICNOISE_SNAPSHOT_MS: '0',
+      HUB_NAME: `Supervisor Revive Integration ${process.pid} ${Date.now()}`,
+      MANIFESTS_DIR: manifestsDir
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  })
+  const captureLog = (chunk) => { logs = `${logs}${chunk.toString()}`.slice(-150_000) }
+  supervisor.stdout.on('data', captureLog)
+  supervisor.stderr.on('data', captureLog)
+
+  const controlUrl = `http://${LOOPBACK}:${supervisorPort}/api/manager`
+  t.after(async () => {
+    await stopProcess(supervisor)
+    for (const pid of knownHubPids) {
+      if (isPidAlive(pid)) { try { process.kill(pid, 'SIGTERM') } catch {} }
+    }
+    await rm(manifestsDir, { recursive: true, force: true })
+  })
+
+  const firstPid = (await waitFor(async () => {
+    const status = await requestJson(`${controlUrl}/status`)
+    return status.state === 'Running' && status.pid ? status.pid : false
+  }, `initial hub start\n${logs}`)).valueOf()
+  knownHubPids.add(firstPid)
+
+  // A hub killed outright (crash, OOM, external kill) must come back by
+  // itself — before this fix the supervisor parked in Error and waited for
+  // an operator to press Restart.
+  process.kill(firstPid, 'SIGKILL')
+  const secondPid = await waitFor(async () => {
+    const status = await requestJson(`${controlUrl}/status`)
+    return status.state === 'Running' && status.pid && status.pid !== firstPid ? status.pid : false
+  }, `hub revived after SIGKILL\n${logs}`, 20_000)
+  knownHubPids.add(secondPid)
+  assert.notEqual(secondPid, firstPid, 'revived hub must be a new process')
+  assert.equal(isPidAlive(secondPid), true)
+
+  // An operator asking for Stop must stay stopped: the revival path may not
+  // resurrect a hub the operator deliberately shut down.
+  const stopped = await requestJson(`${controlUrl}/stop`, 'POST')
+  assert.equal(stopped.state, 'Stopped')
+  await delay(1500)
+  const afterStop = await requestJson(`${controlUrl}/status`)
+  assert.equal(afterStop.state, 'Stopped', `Stop must outrank revival\n${logs}`)
+  assert.equal(afterStop.pid, null)
+})

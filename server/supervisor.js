@@ -7,6 +7,12 @@ const HUB_PORT = Number(process.env.PORT || 7400)
 const OSC_PORT = Number(process.env.OSC_LISTEN_PORT || 9001)
 const START_TIMEOUT_MS = Number(process.env.HUB_START_TIMEOUT_MS || 7000)
 const STOP_TIMEOUT_MS = Number(process.env.HUB_STOP_TIMEOUT_MS || 3500)
+// Crash recovery: how long to wait before reviving a hub that died on its
+// own, and how many revivals to allow inside one window before giving up
+// (a hub that cannot bind its ports must not be respawned forever).
+const REVIVE_DELAY_MS = Number(process.env.HUB_REVIVE_DELAY_MS || 1500)
+const REVIVE_MAX_ATTEMPTS = Number(process.env.HUB_REVIVE_MAX_ATTEMPTS || 5)
+const REVIVE_WINDOW_MS = Number(process.env.HUB_REVIVE_WINDOW_MS || 60_000)
 const HUB_ENTRY = fileURLToPath(new URL('./index.js', import.meta.url))
 
 const app = express()
@@ -20,6 +26,9 @@ let startedAt = null
 let operation = Promise.resolve()
 let supervisorStopping = false
 const expectedExits = new WeakSet()
+// Crash-revival bookkeeping: timestamps of recent unexpected hub exits.
+let reviveTimes = []
+let reviveTimer = null
 
 function snapshot() {
   return {
@@ -58,6 +67,8 @@ function waitForExit(target, timeoutMs) {
 }
 
 async function stopHub({ restarting = false } = {}) {
+  // An operator asking for Stop outranks a pending crash revival.
+  if (reviveTimer) { clearTimeout(reviveTimer); reviveTimer = null }
   const target = child
   if (!target) {
     if (!restarting) state = 'Stopped'
@@ -127,6 +138,12 @@ async function startHub({ restarting = false } = {}) {
         state = 'Error'
         lastError = error
         startedAt = null
+        // A hub that dies mid-show (crash, OOM, external kill) must come
+        // back on its own — an operator should not have to find a laptop
+        // and press Restart. Only a hub that had actually started counts:
+        // a start that never bound falls through to finish('Error') below
+        // and is the caller's problem, not a crash to revive.
+        scheduleRevive(error)
       } else {
         finish('Error', error)
       }
@@ -137,6 +154,32 @@ async function startHub({ restarting = false } = {}) {
 function serialize(action) {
   operation = operation.then(action, action)
   return operation
+}
+
+/**
+ * Revive a hub that exited on its own, rate-limited so a hub which cannot
+ * start (port already taken, bad build) is not respawned forever. The
+ * revival goes through serialize() so it can never race an operator's
+ * Start/Stop/Restart, and it re-checks the state at fire time: if someone
+ * already brought a hub back, the revival is dropped.
+ */
+function scheduleRevive(reason) {
+  if (supervisorStopping || reviveTimer) return
+  const now = Date.now()
+  reviveTimes = reviveTimes.filter((t) => now - t < REVIVE_WINDOW_MS)
+  if (reviveTimes.length >= REVIVE_MAX_ATTEMPTS) {
+    lastError = `${reason} — ${REVIVE_MAX_ATTEMPTS} kez üst üste ayağa kalkamadı, otomatik deneme durduruldu`
+    console.log(`[supervisor] revive giving up: ${lastError}`)
+    return
+  }
+  reviveTimes.push(now)
+  console.log(`[supervisor] hub died (${reason}) — reviving in ${REVIVE_DELAY_MS} ms`)
+  reviveTimer = setTimeout(() => {
+    reviveTimer = null
+    if (supervisorStopping || child) return
+    serialize(() => (supervisorStopping || child ? snapshot() : startHub()))
+  }, REVIVE_DELAY_MS)
+  reviveTimer.unref?.()
 }
 
 app.get('/api/manager/status', (_req, res) => res.json(snapshot()))
@@ -165,6 +208,7 @@ const controlServer = app.listen(SUPERVISOR_PORT, '127.0.0.1', async () => {
 async function shutdown(signal) {
   if (supervisorStopping) return
   supervisorStopping = true
+  if (reviveTimer) { clearTimeout(reviveTimer); reviveTimer = null }
   generation++
   console.log(`[supervisor] shutting down (${signal})`)
   // Order the final stop behind any in-flight serialized operation; its
