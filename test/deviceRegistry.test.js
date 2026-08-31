@@ -20,6 +20,7 @@ import {
   COSMIC_RING_RUNTIME_KIND,
   isCosmicRingReceiverDevice
 } from '../shared/cosmicRingLink.js'
+import { planHostFollowHeals } from '../server/hostFollowHeal.js'
 
 const localAddresses = new Set(['127.0.0.1', '192.168.68.58'])
 
@@ -929,4 +930,151 @@ test('manifest migration never folds remote CosmicUnity or Android devices toget
   assert.equal(result.kept.length, 4)
   assert.equal(result.duplicates.length, 0)
   assert.deepEqual(result.kept.map((entry) => entry.manifest.id).sort((a, b) => a - b), [20, 21, 30, 31])
+})
+
+// ─── DHCP incident 2026-08-31: mDNS re-announcements must fold into the saved
+// record so host-follow heal can plan on its own ─────────────────────────────
+
+test('an identity-less same-fqdn announcement folds a fresh host into a saved record that knows its DEVICE_ID', () => {
+  let now = 1_000
+  const registry = new DeviceRegistry({ localAddresses, now: () => (now += 1_000) })
+  const fqdn = 'Android_Tablet02._oscjson._tcp.local'
+  registry.upsertManifest({
+    id: 21,
+    name: 'Android_Tablet02',
+    serviceName: 'Android_Tablet02',
+    host: '192.168.68.40',
+    oscQueryPort: 8000,
+    // Learned earlier from HOST_INFO DEVICE_ID — the tablet's own mDNS
+    // announcement stays identity-less (OSCQuery-Unity 1.2.2 has no TXT id).
+    persistentDeviceId: 'a'.repeat(32),
+    endpoints: [{
+      host: '192.168.68.40',
+      port: 8000,
+      source: 'discovery',
+      fqdn,
+      lastSeen: 500
+    }]
+  })
+
+  const updated = registry.upsertDiscovery({
+    name: 'Android_Tablet02',
+    serviceName: 'Android_Tablet02',
+    host: '192.168.68.61',
+    port: 8000,
+    fqdn
+  })
+
+  assert.equal(registry.snapshot().length, 1)
+  assert.equal(updated.manifestId, 21)
+  assert.equal(updated.saved, true)
+  assert.equal(updated.persistentDeviceId, 'a'.repeat(32))
+  assert.deepEqual(
+    updated.endpoints.map((endpoint) => endpoint.host).sort(),
+    ['192.168.68.40', '192.168.68.61']
+  )
+})
+
+test('a DHCP-reused address folds into the fqdn owner, never into the address\'s previous owner', () => {
+  let now = 1_000
+  const registry = new DeviceRegistry({ localAddresses, now: () => (now += 1_000) })
+  const fqdn1 = 'Android_Tablet01._oscjson._tcp.local'
+  const fqdn2 = 'SpectraTablet02._oscjson._tcp.local'
+  registry.upsertManifest({
+    id: 11,
+    name: 'Android_Tablet01',
+    serviceName: 'Android_Tablet01',
+    host: '192.168.68.54',
+    oscQueryPort: 8000,
+    endpoints: [{
+      host: '192.168.68.54',
+      port: 8000,
+      source: 'discovery',
+      fqdn: fqdn1,
+      lastSeen: 500
+    }]
+  })
+  registry.upsertManifest({
+    id: 12,
+    name: 'SpectraTablet02',
+    serviceName: 'SpectraTablet02',
+    host: '192.168.68.40',
+    oscQueryPort: 8000,
+    endpoints: [{
+      host: '192.168.68.40',
+      port: 8000,
+      source: 'discovery',
+      fqdn: fqdn2,
+      lastSeen: 500
+    }]
+  })
+
+  // The DHCP move: Tablet02 announces its own fqdn on Tablet01's old address.
+  const updated = registry.upsertDiscovery({
+    name: 'SpectraTablet02',
+    serviceName: 'SpectraTablet02',
+    host: '192.168.68.54',
+    port: 8000,
+    fqdn: fqdn2
+  })
+
+  assert.equal(registry.snapshot().length, 2)
+  assert.equal(updated.manifestId, 12)
+  assert.deepEqual(
+    updated.endpoints.map((endpoint) => endpoint.host).sort(),
+    ['192.168.68.40', '192.168.68.54']
+  )
+  const tablet01 = registry.findByManifestId(11)
+  assert.equal(tablet01.saved, true)
+  assert.deepEqual(tablet01.endpoints.map((endpoint) => endpoint.host), ['192.168.68.54'])
+})
+
+test('host-follow heal can plan from a folded same-fqdn announcement without manual UPDATE_DEVICE', () => {
+  let now = 1_000
+  const registry = new DeviceRegistry({ localAddresses, now: () => (now += 1_000) })
+  const fqdn = 'Android_Tablet02._oscjson._tcp.local'
+  registry.upsertManifest({
+    id: 21,
+    name: 'Android_Tablet02',
+    serviceName: 'Android_Tablet02',
+    host: '192.168.68.40',
+    oscQueryPort: 8000,
+    persistentDeviceId: 'a'.repeat(32),
+    endpoints: [{
+      host: '192.168.68.40',
+      port: 8000,
+      source: 'discovery',
+      fqdn,
+      lastSeen: 500
+    }]
+  })
+  registry.upsertDiscovery({
+    name: 'Android_Tablet02',
+    serviceName: 'Android_Tablet02',
+    host: '192.168.68.61',
+    port: 8000,
+    fqdn
+  })
+
+  const plans = planHostFollowHeals({
+    snapshot: registry.snapshot(),
+    getManagedDevice: (manifestId) => manifestId === 21
+      ? {
+          id: 21,
+          enabled: true,
+          status: 'error',
+          host: '192.168.68.40',
+          oscQueryPort: 8000,
+          lastMessageAt: 0,
+          consecutiveConnectFailures: 2
+        }
+      : null
+  })
+
+  assert.equal(plans.length, 1)
+  assert.equal(plans[0].manifestId, 21)
+  assert.equal(plans[0].fqdn, fqdn)
+  assert.equal(plans[0].fromHost, '192.168.68.40')
+  assert.equal(plans[0].host, '192.168.68.61')
+  assert.equal(plans[0].oscQueryPort, 8000)
 })

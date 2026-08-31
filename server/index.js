@@ -34,9 +34,12 @@ import osc from 'osc'
 import { OscQueryClient } from './oscqueryClient.js'
 import {
   CONNECTION_STATES,
+  DEVICE_TYPES,
   DeviceRegistry,
   deduplicateManifestEntries,
-  getLocalInterfaceAddresses
+  getLocalInterfaceAddresses,
+  hostInfoIdentityMismatch,
+  isVerifiedLocalHost
 } from './deviceRegistry.js'
 import {
   SNAPSHOT_FRESHNESS_MS,
@@ -56,6 +59,7 @@ import { planHostFollowHeals } from './hostFollowHeal.js'
 import { createAutoLinkEngine } from './autoLink.js'
 import { hubBackpressureAction } from './hubBackpressure.js'
 import {
+  isMaxRingIdentity,
   isMaxRingReceiverDevice,
   isRingInstrumentIdentity
 } from '../shared/maxRingLink.js'
@@ -255,6 +259,17 @@ function registryManifest(dev) {
     port: dev.oscQueryPort,
     connectionState: connectionStateFor(dev)
   }
+}
+
+// Verified-local receivers own their identity through the bound local port: a
+// restored VST may legitimately report a fresh UUID or a renamed Ableton
+// track, and DHCP cannot move this machine's own addresses. Every other
+// device — remote tablets above all — must prove its identity in HOST_INFO.
+function hostInfoIdentityExempt(dev) {
+  if (!isVerifiedLocalHost(dev.host)) return false
+  return dev.deviceType === DEVICE_TYPES.COSMIC_UNITY ||
+    dev.deviceType === DEVICE_TYPES.COSMIC_RING ||
+    isMaxRingIdentity({ ...dev, port: dev.oscQueryPort })
 }
 
 function upsertServiceInRegistry(service) {
@@ -659,6 +674,21 @@ function connectToDevice(dev) {
       if (oscQueryClients.get(dev.id) !== client) return
       const currentDev = devices.get(dev.id)
       if (!currentDev) return
+      // 2026-08-31: DHCP handed Android_Tablet01's address to SpectraTablet02
+      // and the hub connected "green" to the wrong physical tablet. HOST_INFO
+      // is the first moment the far end declares who it is — verify before
+      // adopting anything from it (the impostor's DEVICE_ID above all). The
+      // rejection runs through the normal failure path, so the card gets the
+      // error and consecutiveConnectFailures keeps climbing for the heal.
+      if (!hostInfoIdentityExempt(currentDev)) {
+        const mismatch = hostInfoIdentityMismatch(currentDev, hostInfo)
+        if (mismatch) {
+          client.rejectCurrentAttempt(
+            `wrong-device: Kimlik uyuşmazlığı: beklenen ${mismatch.expected}, bulunan ${mismatch.found}`
+          )
+          return
+        }
+      }
       const previousPersistentId = currentDev.persistentDeviceId
       const previousCanonicalId = currentDev.canonicalId
       currentDev.hostInfo = hostInfo

@@ -248,6 +248,21 @@ export class OscQueryClient {
   }
 
   /**
+   * Drop the in-flight attempt — or the live connection — because the far end
+   * proved to be a different physical device (e.g. HOST_INFO declared another
+   * identity after a DHCP lease handed its address over). Routes through the
+   * normal failure path so onAttemptFailed bookkeeping (status, error,
+   * consecutive-failure counters) stays consistent and a retry is scheduled,
+   * then invalidates the attempt so a racing namespace fetch of the rejected
+   * attempt cannot resurrect the connection.
+   */
+  rejectCurrentAttempt(reason) {
+    const attempt = this.connectAttempt
+    this._failAttempt(attempt, reason, false)
+    if (this.shouldReconnect && this.connectAttempt === attempt) this.connectAttempt++
+  }
+
+  /**
    * Reconnect delay for the current failure streak. Before the first
    * successful connection the slower `reconnectDelayMs` applies unchanged.
    * After `everConnected`, retries start at `disconnectReconnectDelayMs`

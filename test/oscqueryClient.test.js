@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
+import { WebSocketServer } from 'ws'
 import osc from 'osc'
 
 import { OscQueryClient } from '../server/oscqueryClient.js'
@@ -149,4 +150,56 @@ test('OSC bundles propagate metadata for every contained message', () => {
     ['/a', 'f', 'f'],
     ['/b', 's', 's']
   ])
+})
+
+test('rejectCurrentAttempt drops a live connection through the normal failure path', async (t) => {
+  const namespace = {
+    FULL_PATH: '/',
+    CONTENTS: { v: { FULL_PATH: '/v', TYPE: 'f', VALUE: [0], ACCESS: 3 } }
+  }
+  const server = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/json')
+    if (req.url.includes('HOST_INFO')) {
+      res.end(JSON.stringify({ NAME: 'WrongDevice', OSC_TRANSPORT: 'UDP' }))
+      return
+    }
+    res.end(JSON.stringify(namespace))
+  })
+  const wss = new WebSocketServer({ server })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  t.after(async () => {
+    for (const ws of wss.clients) ws.terminate()
+    await new Promise((resolve) => wss.close(resolve))
+    await new Promise((resolve) => {
+      server.close(resolve)
+      server.closeAllConnections?.()
+    })
+  })
+
+  const failures = []
+  let onConnected
+  const connected = new Promise((resolve) => { onConnected = resolve })
+  const client = new OscQueryClient('127.0.0.1', server.address().port, {
+    onConnect: () => onConnected(),
+    onDisconnect() {},
+    onAttemptFailed: (reason, details) => failures.push({ reason, details }),
+    onValue() {},
+    onLog() {}
+  }, { reconnectDelayMs: 60_000, disconnectReconnectDelayMs: 60_000 })
+  t.after(() => client.disconnect())
+  client.connect()
+  await connected
+
+  client.rejectCurrentAttempt('wrong-device: Kimlik uyuşmazlığı: beklenen X, bulunan Y')
+
+  assert.equal(failures.length, 1)
+  assert.match(failures[0].reason, /wrong-device/)
+  assert.equal(failures[0].details.timeout, false)
+  assert.equal(client.isConnected(), false)
+  assert.equal(client.ws, null)
+  assert.ok(client.reconnectTimer, 'a retry must stay scheduled so failures can accumulate for the heal')
+  client.disconnect()
 })

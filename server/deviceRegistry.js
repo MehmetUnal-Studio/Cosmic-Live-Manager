@@ -104,6 +104,75 @@ export function extractPersistentDeviceId(...sources) {
   return ''
 }
 
+// Name comparison for identity verification collapses every separator:
+// manifest labels, mDNS instance names and HOST_INFO NAMEs write the same
+// device as "HealthyDevice", "Healthy Device" or "healthy-device". The
+// discriminator that matters — Tablet01 vs Tablet02 — survives collapsing.
+function collapseNameForComparison(value) {
+  return cleanText(displayNameWithoutIdentityToken(value))
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '')
+}
+
+function fqdnInstanceLabel(fqdn) {
+  return cleanText(fqdn).replace(/\._[a-z0-9-]+\._(tcp|udp)\.local\.?$/i, '')
+}
+
+/**
+ * Compare a managed device's known identity with the identity a freshly
+ * fetched HOST_INFO declares. DHCP can hand a saved device's address to a
+ * different physical device; HOST_INFO is the first moment the far end says
+ * who it actually is.
+ *
+ * DEVICE_ID is authoritative when both sides declare one — a renamed device
+ * with the same installation id still verifies. Without ids on both sides the
+ * name fallback needs mDNS-grade evidence on the record side: only when the
+ * dialed endpoint carries an observed fqdn does the record hold a service
+ * identity worth enforcing (manifest migration synthesizes `serviceName` from
+ * the display label, so a hand-typed card must stay lenient). HOST_INFO NAME
+ * is then accepted against any of the fqdn instance label, the serviceName
+ * and the display name. A side that declares no identity can never mismatch.
+ *
+ * @returns {null | { basis: 'device-id' | 'name', expected: string, found: string }}
+ */
+export function hostInfoIdentityMismatch(expected, hostInfo) {
+  if (!expected || typeof expected !== 'object') return null
+  if (!hostInfo || typeof hostInfo !== 'object') return null
+
+  const expectedId = extractPersistentDeviceId(expected)
+  const foundId = extractPersistentDeviceId(hostInfo)
+  if (expectedId && foundId) {
+    return expectedId === foundId
+      ? null
+      : { basis: 'device-id', expected: expectedId, found: foundId }
+  }
+
+  const endpoints = Array.from(expected.endpoints?.values?.() || expected.endpoints || [])
+  const dialedKey = endpointKey(expected.host, expected.oscQueryPort ?? expected.port)
+  const dialed = endpoints.find(
+    (endpoint) => endpoint && endpointKey(endpoint.host, endpoint.port) === dialedKey
+  )
+  const fqdnLabel = fqdnInstanceLabel(dialed?.fqdn)
+  if (!fqdnLabel) return null
+
+  const foundName = collapseNameForComparison(hostInfo.NAME)
+  if (!foundName) return null
+  const acceptedNames = new Set([
+    collapseNameForComparison(fqdnLabel),
+    collapseNameForComparison(expected.serviceName),
+    collapseNameForComparison(expected.name)
+  ])
+  acceptedNames.delete('')
+  if (acceptedNames.has(foundName)) return null
+  return {
+    basis: 'name',
+    expected: cleanText(expected.serviceName) || fqdnLabel,
+    found: cleanText(hostInfo.NAME)
+  }
+}
+
 export function displayNameWithoutIdentityToken(value) {
   return cleanText(value)
     .replace(/--id-[a-f0-9]{32}(?=-|$)/ig, '')
@@ -560,9 +629,26 @@ export class DeviceRegistry {
     if (!identity.persistentDeviceId && endpoint.fqdn) {
       const byFqdnId = this.fqdnIndex.get(endpoint.fqdn)
       const fqdnRecord = byFqdnId ? this.records.get(byFqdnId) : null
-      if (fqdnRecord && !fqdnRecord.persistentDeviceId) {
-        if (!record) record = fqdnRecord
-        else if (fqdnRecord !== record) record = this._mergeRecords(record, fqdnRecord)
+      if (fqdnRecord && fqdnRecord !== record) {
+        // DHCP can hand this address to a different device than the one the
+        // endpointIndex last saw there. When the claimant's endpoint carries a
+        // different fqdn than the announcement, that claim is a stale lease —
+        // the announced fqdn's owner wins, and the two records must never be
+        // merged into one card.
+        const claimed = record?.endpoints.get(endpointKey(endpoint.host, endpoint.port))
+        if (record && claimed?.fqdn && claimed.fqdn !== endpoint.fqdn) {
+          record = fqdnRecord
+        } else if (!fqdnRecord.persistentDeviceId) {
+          if (!record) record = fqdnRecord
+          else record = this._mergeRecords(record, fqdnRecord)
+        } else if (!record) {
+          // A saved record can know its DEVICE_ID from HOST_INFO while the
+          // device's own mDNS announcement stays identity-less (OSCQuery-Unity
+          // 1.2.2 has no TXT identity field). The same fqdn on a fresh host is
+          // still the same service — fold the endpoint in so host-follow heal
+          // sees the move.
+          record = fqdnRecord
+        }
       }
     }
 
