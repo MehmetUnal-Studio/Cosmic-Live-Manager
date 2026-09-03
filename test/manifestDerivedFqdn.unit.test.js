@@ -20,7 +20,7 @@ import assert from 'node:assert/strict'
 import {
   DeviceRegistry,
   hostInfoIdentityMismatch,
-  serviceFqdn
+  derivedServiceFqdn
 } from '../server/deviceRegistry.js'
 import { planHostFollowHeals } from '../server/hostFollowHeal.js'
 import { resolveGenericTargetFromRegistry } from '../server/linkRouting.js'
@@ -86,11 +86,11 @@ function freshRegistry() {
   return new DeviceRegistry({ localAddresses, now: () => (now += 1_000) })
 }
 
-test('serviceFqdn derives the deterministic _oscjson fqdn from a service name', () => {
-  assert.equal(serviceFqdn(TV_SERVICE), TV_FQDN)
-  assert.equal(serviceFqdn('  Ring-Instrument  '), RING_FQDN)
-  assert.equal(serviceFqdn(''), '')
-  assert.equal(serviceFqdn(undefined), '')
+test('derivedServiceFqdn derives the deterministic _oscjson fqdn from a service name', () => {
+  assert.equal(derivedServiceFqdn(TV_SERVICE), TV_FQDN)
+  assert.equal(derivedServiceFqdn('  Ring-Instrument  '), RING_FQDN)
+  assert.equal(derivedServiceFqdn(''), '')
+  assert.equal(derivedServiceFqdn(undefined), '')
 })
 
 test('a manifest endpoint without fqdn gets the fqdn derived from serviceName, marked as derived', () => {

@@ -523,6 +523,18 @@ Consequences:
   A derived fqdn is not mDNS-grade evidence: the HOST_INFO wrong-device name
   guard and persisted LINK target identity only honour observed fqdns, and a
   display label without `serviceName` derives nothing.
+- A card that connects successfully persists the fqdn mDNS announces at the
+  address it reached as the manifest's `serviceFqdn` — its service identity,
+  observed rather than guessed, so a card an operator named "TV" is still
+  identified as `Windows_TVNEVA40902._oscjson._tcp.local`. It outranks the
+  derived fqdn everywhere, survives hub restarts, and is what host-follow heal
+  follows once a hand-edited HOST has replaced the endpoints with a single
+  identity-less `manual-update` entry. The first proof wins: a card that
+  already holds a `serviceFqdn` never adopts a different one from a later
+  connection, so an address handed to another device by DHCP cannot rewrite
+  who the card is. A hand-edited HOST/PORT now also copies the fqdn mDNS
+  announces at the typed address onto the new endpoint, unless it contradicts
+  the card's `serviceFqdn`.
 - If an Ableton track/set duplication makes two simultaneously live local
   ports claim the same CosmicUnity UUID, the registry creates a port-scoped
   collision identity. Repair the clone explicitly with the VST's **Yeni ID**
@@ -569,6 +581,7 @@ gitignored. A normal record contains at least:
   "canonicalId": "cosmicunity:uuid:<persistent-id>",
   "persistentDeviceId": "<persistent-id>",
   "serviceName": "LiveTablet-1",
+  "serviceFqdn": "LiveTablet-1._oscjson._tcp.local",
   "host": "127.0.0.1",
   "oscQueryPort": 5001,
   "enabled": true,
@@ -1162,7 +1175,8 @@ git diff --check
 Handoff verification on 2026-08-29 (macOS, Node `22.14.0`): `124/124`
 Node tests passed, Vite production build completed, and `git diff --check`
 reported no whitespace errors. Re-verified on 2026-09-03 after the derived-fqdn
-host-follow fix: `214/214`. These are timestamped results, not a substitute
+host-follow fix: `214/214`, and again after the observed `serviceFqdn`
+identity work: `233/233`. These are timestamped results, not a substitute
 for rerunning the commands after later edits.
 
 The Node suite covers canonical identity and simultaneous discovery races,

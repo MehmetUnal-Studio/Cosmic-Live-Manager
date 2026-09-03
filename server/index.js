@@ -39,7 +39,8 @@ import {
   deduplicateManifestEntries,
   getLocalInterfaceAddresses,
   hostInfoIdentityMismatch,
-  isVerifiedLocalHost
+  isVerifiedLocalHost,
+  learnedServiceFqdn
 } from './deviceRegistry.js'
 import {
   SNAPSHOT_FRESHNESS_MS,
@@ -251,6 +252,35 @@ function applyRegistryIdentity(dev, record) {
   dev.discoveryState = record.discoveryState
   dev.connectionState = record.connectionState
   return dev
+}
+
+// A saved card's service identity: the mDNS fqdn the hub OBSERVED at the
+// address it actually talked to. Learning it needs both facts at once — a
+// connection the card answered and an announcement at that exact address —
+// and either can arrive first, so both moments run through here: a client
+// that just connected, and an announcement reaching an already connected
+// card. Persisting it is what lets host-follow heal survive a hand-edited
+// HOST, a hub restart, and an old address that never announces again
+// (incident 2026-09-03).
+function captureServiceIdentity(dev) {
+  if (!dev || dev.status !== 'connected') return false
+  const announced = deviceRegistry.observedFqdnAt(dev.host, dev.oscQueryPort)
+  const learned = learnedServiceFqdn(dev.serviceFqdn, announced)
+  if (!learned) {
+    if (announced && announced !== dev.serviceFqdn) {
+      // The first proof wins (see learnedServiceFqdn). Say so out loud: this
+      // is either a renamed service or a device answering at an address that
+      // is not its own.
+      console.log(
+        `  [client] ${dev.name}: keeping service identity ${dev.serviceFqdn} — ` +
+        `${dev.host}:${dev.oscQueryPort} announces ${announced}`
+      )
+    }
+    return false
+  }
+  dev.serviceFqdn = learned
+  console.log(`  [client] ${dev.name}: service identity ${learned}`)
+  return true
 }
 
 function registryManifest(dev) {
@@ -641,6 +671,10 @@ function connectToDevice(dev) {
       // A (re)connected client forgot its peers: drop the applied-link
       // signature so the auto-link engine announces again.
       autoLinkEngine.noteDeviceConnected(currentDev.id)
+      // The address just proved itself: if mDNS announces a service there,
+      // that fqdn is who this card is. saveManifest replaces the managed
+      // device object, so nothing may touch `currentDev` after this.
+      if (captureServiceIdentity(currentDev)) saveManifest(currentDev.id, {})
     },
     onDisconnect: (reason) => {
       if (oscQueryClients.get(dev.id) !== client) return
@@ -959,19 +993,25 @@ function saveManifest(deviceId, updates) {
       : dev.canonicalId,
     persistentDeviceId: dev.persistentDeviceId || null,
     serviceName: dev.serviceName || dev.name,
+    // The mDNS fqdn observed on a successful connection (captureServiceIdentity).
+    // It is the card's service identity: host-follow heal follows it after a
+    // hand repair has stripped the endpoint's own fqdn.
+    serviceFqdn: dev.serviceFqdn || undefined,
     host: updates.host ?? dev.host,
     oscQueryPort: updates.oscQueryPort ?? dev.oscQueryPort,
     enabled: updates.enabled ?? dev.enabled,
     description: updates.description ?? dev.description,
     // `link: undefined` (explicit null update) drops the key on serialization.
     link: updates.link !== undefined ? validatedLink : dev.link,
+    // A changed HOST/PORT replaces the endpoint list with the single address
+    // now in force. That write used to be identity-less; the registry attaches
+    // the fqdn mDNS announces there when it does not contradict the card.
     endpoints: (updates.host !== undefined || updates.oscQueryPort !== undefined)
-      ? [{
+      ? [deviceRegistry.manualUpdateEndpoint({
           host: updates.host ?? dev.host,
           port: updates.oscQueryPort ?? dev.oscQueryPort,
-          source: 'manual-update',
-          lastSeen: Date.now()
-        }]
+          serviceFqdn: dev.serviceFqdn
+        })]
       : (dev.endpoints || []),
     legacyIds: dev.legacyIds || [],
     legacyCanonicalIds: dev.legacyCanonicalIds || []
@@ -1382,6 +1422,9 @@ function attachBrowserHandlers(b) {
       if (dev) {
         const previousPersistentId = dev.persistentDeviceId
         applyRegistryIdentity(dev, record)
+        // A card can connect before its announcement reaches the hub; this
+        // announcement may be the missing half of its service identity.
+        const learnedIdentity = captureServiceIdentity(dev)
         const endpointChanged = record.persistentDeviceId && record.activeEndpoint && (
           dev.host !== record.activeEndpoint.host ||
           Number(dev.oscQueryPort) !== Number(record.activeEndpoint.port)
@@ -1391,7 +1434,10 @@ function attachBrowserHandlers(b) {
             host: record.activeEndpoint.host,
             oscQueryPort: record.activeEndpoint.port
           })
-        } else if (record.persistentDeviceId && previousPersistentId !== record.persistentDeviceId) {
+        } else if (
+          learnedIdentity ||
+          (record.persistentDeviceId && previousPersistentId !== record.persistentDeviceId)
+        ) {
           saveManifest(dev.id, {})
         }
       }

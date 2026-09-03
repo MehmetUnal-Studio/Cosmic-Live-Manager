@@ -126,17 +126,36 @@ function fqdnInstanceLabel(fqdn) {
  * manifest stores that instance name as `serviceName`, so a card whose old
  * address the hub never observed can still be given its service identity.
  */
-export function serviceFqdn(serviceName) {
+export function derivedServiceFqdn(serviceName) {
   const name = cleanText(serviceName)
   return name ? `${name}._oscjson._tcp.local` : ''
 }
 
-// An endpoint's fqdn is normally an mDNS observation. When it was derived from
-// the manifest's serviceName instead, the endpoint says so: exact-fqdn folding
+// An endpoint's fqdn is normally an mDNS observation at that exact address.
+// When it came from the manifest instead — the persisted `serviceFqdn`, or a
+// fqdn derived from `serviceName` — the endpoint says so: exact-fqdn folding
 // and host-follow heal trust it, the HOST_INFO name guard does not (a migrated
 // or hand-typed card must stay lenient — see hostInfoIdentityMismatch).
 export function observedFqdn(endpoint) {
   return endpoint?.fqdnSource === 'derived' ? '' : endpoint?.fqdn
+}
+
+/**
+ * The service identity a successful connection may write to the manifest.
+ *
+ * The first proof wins. A card that already proved an fqdn keeps it: DHCP can
+ * hand a saved card's address to a different device that answers, announces
+ * and passes the HOST_INFO name check under its own name (2026-08-31, the
+ * tablets), and adopting that fqdn would make the impostor the card's durable
+ * identity. A card with nothing to lose adopts what mDNS announces at the
+ * address it just talked to.
+ *
+ * @returns {string} the fqdn to persist, or '' to leave the manifest alone
+ */
+export function learnedServiceFqdn(currentFqdn, announcedFqdn) {
+  const announced = cleanText(announcedFqdn)
+  if (!announced || cleanText(currentFqdn)) return ''
+  return announced
 }
 
 /**
@@ -372,8 +391,9 @@ function endpointFrom(input, now, source) {
     source,
     serviceName: cleanText(input.serviceName || input.name),
     fqdn: cleanText(input.fqdn),
-    // A derived fqdn (see upsertManifest) must stay marked when a registry
-    // endpoint round-trips through a managed device back into upsertManifest.
+    // A manifest-sourced fqdn (see upsertManifest) must stay marked when a
+    // registry endpoint round-trips through a managed device back into
+    // upsertManifest, or it would launder itself into an observation.
     ...(input.fqdnSource === 'derived' && cleanText(input.fqdn) ? { fqdnSource: 'derived' } : {}),
     lastSeen: now,
     available: true
@@ -888,17 +908,20 @@ export class DeviceRegistry {
     // endpoint was a hand-edited `manual-update` entry without fqdn, and the
     // old address never announced again. Without a service identity on the
     // saved record the new address became a separate unsaved card and heal
-    // had nothing to follow. Derive the fqdn from the manifest's serviceName
-    // (never from the display label) so exact-fqdn folding and host-follow
-    // work even when the hub has never observed the old address.
-    const derivedFqdn = serviceFqdn(manifest.serviceName)
-    const adoptDerivedFqdn = (endpoint) => {
-      if (!derivedFqdn || !endpoint || endpoint.fqdn) return
-      endpoint.fqdn = derivedFqdn
+    // had nothing to follow. Give such an endpoint the card's own service
+    // identity: `serviceFqdn` first — the fqdn the hub actually observed on
+    // an earlier successful connection — and otherwise the fqdn derived from
+    // `serviceName` (never from the display label), which is only a guess
+    // about a card an operator may have named anything. Either way the
+    // address itself is unobserved, so the endpoint stays marked.
+    const cardFqdn = cleanText(manifest.serviceFqdn) || derivedServiceFqdn(manifest.serviceName)
+    const adoptCardFqdn = (endpoint) => {
+      if (!cardFqdn || !endpoint || endpoint.fqdn) return
+      endpoint.fqdn = cardFqdn
       endpoint.fqdnSource = 'derived'
-      this.fqdnIndex.set(derivedFqdn, record.canonicalId)
+      this.fqdnIndex.set(cardFqdn, record.canonicalId)
     }
-    adoptDerivedFqdn(record.endpoints.get(endpointKey(input.host, input.port)))
+    adoptCardFqdn(record.endpoints.get(endpointKey(input.host, input.port)))
     record.saved = true
     record.manifestId = Number(manifest.id)
     record.name = displayNameWithoutIdentityToken(manifest.name) || record.name
@@ -928,7 +951,7 @@ export class DeviceRegistry {
       record.endpoints.set(endpointKey(endpoint.host, endpoint.port), endpoint)
       this.endpointIndex.set(endpointKey(endpoint.host, endpoint.port), record.canonicalId)
       if (endpoint.fqdn) this.fqdnIndex.set(endpoint.fqdn, record.canonicalId)
-      else adoptDerivedFqdn(endpoint)
+      else adoptCardFqdn(endpoint)
     }
     record.activeEndpoint = preferEndpoint(
       Array.from(record.endpoints.values()),
@@ -936,6 +959,38 @@ export class DeviceRegistry {
       this.localAddresses
     )
     return publicRecord(record, this.localAddresses)
+  }
+
+  /**
+   * The fqdn mDNS was observed announcing at an exact address, or '' when the
+   * hub has never heard a service there. A fqdn the hub only attached from a
+   * manifest is not an observation and never answers here.
+   */
+  observedFqdnAt(host, port) {
+    const key = endpointKey(host, port)
+    const record = this.records.get(this.endpointIndex.get(key))
+    return cleanText(observedFqdn(record?.endpoints.get(key)))
+  }
+
+  /**
+   * The endpoint a hand-edited HOST writes to the manifest. Incident
+   * 2026-09-03: that endpoint carried no fqdn, so every hand repair stripped
+   * the card of the service identity host-follow heal needs and the next DHCP
+   * move had to be repaired by hand too. mDNS knows who answers at the
+   * address the operator just typed — adopt that identity, unless it
+   * contradicts the one the card proved on an earlier connection.
+   */
+  manualUpdateEndpoint({ host, port, serviceFqdn }) {
+    const endpoint = {
+      host,
+      port: Number(port),
+      source: 'manual-update',
+      lastSeen: this.now()
+    }
+    const observed = this.observedFqdnAt(host, port)
+    const known = cleanText(serviceFqdn)
+    if (observed && (!known || observed === known)) endpoint.fqdn = observed
+    return endpoint
   }
 
   updateConnection(canonicalId, updates) {

@@ -8,14 +8,22 @@
 //
 // The tie-breaker mirrors collisionHeal.js: once the manifest endpoint has
 // failed repeatedly, follow the fqdn — and only the fqdn, never a name
-// lookalike — to the freshest discovered endpoint on another host. Freshness
-// is required on both axes (newer than the manifest endpoint's own
-// observation and newer than the device's last successful contact) so a stale
-// announcement can never bounce a healthy manifest around.
+// lookalike — to the freshest discovered endpoint on another host. The fqdn
+// comes from the dialed endpoint when mDNS was observed there, otherwise from
+// the manifest's own `serviceFqdn`, so a card an operator repaired by hand
+// (which leaves an identity-less `manual-update` endpoint) still has an
+// identity to follow on the next move. Freshness is required on both axes
+// (newer than the manifest endpoint's own observation and newer than the
+// device's last successful contact) so a stale announcement can never bounce
+// a healthy manifest around.
 
 import { normalizeHost } from './deviceRegistry.js'
 
 export const HOST_FOLLOW_MIN_FAILURES = 2
+
+function cleanFqdn(value) {
+  return typeof value === 'string' ? value.trim() : ''
+}
 
 /**
  * Compute the manifest migrations that would heal fqdn-stable host moves.
@@ -55,9 +63,15 @@ export function planHostFollowHeals({
     const manifestEndpoint = endpoints.find((endpoint) =>
       normalizeHost(endpoint?.host) === devHost && Number(endpoint?.port) === devPort
     )
-    // Without an fqdn on the manifest endpoint there is no service identity to
-    // follow — name similarity is deliberately not enough.
-    const fqdn = manifestEndpoint?.fqdn
+    // Service identity, strongest evidence first: an fqdn mDNS was observed
+    // announcing at the dialed address, then the identity the manifest
+    // persisted from an earlier successful connection (`serviceFqdn`), then
+    // whatever was merely derived from the saved serviceName. Without any of
+    // them there is nothing to follow — name similarity is deliberately not
+    // enough.
+    const endpointFqdn = cleanFqdn(manifestEndpoint?.fqdn)
+    const observedOnEndpoint = manifestEndpoint?.fqdnSource === 'derived' ? '' : endpointFqdn
+    const fqdn = observedOnEndpoint || cleanFqdn(dev.serviceFqdn) || endpointFqdn
     if (!fqdn) continue
 
     const candidate = endpoints
@@ -67,7 +81,7 @@ export function planHostFollowHeals({
         endpoint.available === true &&
         normalizeHost(endpoint.host) !== devHost &&
         Number(endpoint.port) > 0 &&
-        Number(endpoint.lastSeen) > Number(manifestEndpoint.lastSeen || 0) &&
+        Number(endpoint.lastSeen) > Number(manifestEndpoint?.lastSeen || 0) &&
         Number(endpoint.lastSeen) >= Number(dev.lastMessageAt || 0)
       )
       .sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0))[0]
