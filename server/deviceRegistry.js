@@ -121,6 +121,25 @@ function fqdnInstanceLabel(fqdn) {
 }
 
 /**
+ * The Bonjour fqdn of an `_oscjson._tcp` service is a deterministic function
+ * of its instance name (bonjour-service: `${name}.${type}.local`). A saved
+ * manifest stores that instance name as `serviceName`, so a card whose old
+ * address the hub never observed can still be given its service identity.
+ */
+export function serviceFqdn(serviceName) {
+  const name = cleanText(serviceName)
+  return name ? `${name}._oscjson._tcp.local` : ''
+}
+
+// An endpoint's fqdn is normally an mDNS observation. When it was derived from
+// the manifest's serviceName instead, the endpoint says so: exact-fqdn folding
+// and host-follow heal trust it, the HOST_INFO name guard does not (a migrated
+// or hand-typed card must stay lenient — see hostInfoIdentityMismatch).
+export function observedFqdn(endpoint) {
+  return endpoint?.fqdnSource === 'derived' ? '' : endpoint?.fqdn
+}
+
+/**
  * Compare a managed device's known identity with the identity a freshly
  * fetched HOST_INFO declares. DHCP can hand a saved device's address to a
  * different physical device; HOST_INFO is the first moment the far end says
@@ -154,7 +173,7 @@ export function hostInfoIdentityMismatch(expected, hostInfo) {
   const dialed = endpoints.find(
     (endpoint) => endpoint && endpointKey(endpoint.host, endpoint.port) === dialedKey
   )
-  const fqdnLabel = fqdnInstanceLabel(dialed?.fqdn)
+  const fqdnLabel = fqdnInstanceLabel(observedFqdn(dialed))
   if (!fqdnLabel) return null
 
   const foundName = collapseNameForComparison(hostInfo.NAME)
@@ -353,6 +372,9 @@ function endpointFrom(input, now, source) {
     source,
     serviceName: cleanText(input.serviceName || input.name),
     fqdn: cleanText(input.fqdn),
+    // A derived fqdn (see upsertManifest) must stay marked when a registry
+    // endpoint round-trips through a managed device back into upsertManifest.
+    ...(input.fqdnSource === 'derived' && cleanText(input.fqdn) ? { fqdnSource: 'derived' } : {}),
     lastSeen: now,
     available: true
   }
@@ -862,6 +884,21 @@ export class DeviceRegistry {
       serviceName: manifest.serviceName || manifest.name
     }
     const record = this._findOrCreate(input, 'manifest')
+    // DHCP incident 2026-09-03: a fresh hub loaded saved cards whose only
+    // endpoint was a hand-edited `manual-update` entry without fqdn, and the
+    // old address never announced again. Without a service identity on the
+    // saved record the new address became a separate unsaved card and heal
+    // had nothing to follow. Derive the fqdn from the manifest's serviceName
+    // (never from the display label) so exact-fqdn folding and host-follow
+    // work even when the hub has never observed the old address.
+    const derivedFqdn = serviceFqdn(manifest.serviceName)
+    const adoptDerivedFqdn = (endpoint) => {
+      if (!derivedFqdn || !endpoint || endpoint.fqdn) return
+      endpoint.fqdn = derivedFqdn
+      endpoint.fqdnSource = 'derived'
+      this.fqdnIndex.set(derivedFqdn, record.canonicalId)
+    }
+    adoptDerivedFqdn(record.endpoints.get(endpointKey(input.host, input.port)))
     record.saved = true
     record.manifestId = Number(manifest.id)
     record.name = displayNameWithoutIdentityToken(manifest.name) || record.name
@@ -891,6 +928,7 @@ export class DeviceRegistry {
       record.endpoints.set(endpointKey(endpoint.host, endpoint.port), endpoint)
       this.endpointIndex.set(endpointKey(endpoint.host, endpoint.port), record.canonicalId)
       if (endpoint.fqdn) this.fqdnIndex.set(endpoint.fqdn, record.canonicalId)
+      else adoptDerivedFqdn(endpoint)
     }
     record.activeEndpoint = preferEndpoint(
       Array.from(record.endpoints.values()),

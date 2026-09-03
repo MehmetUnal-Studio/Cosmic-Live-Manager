@@ -134,9 +134,10 @@ async function createFqdnOnlyOscQueryDevice(name) {
   }
 }
 
-test('a saved device follows its fqdn to a fresh discovery endpoint after the manifest host dies', {
-  timeout: 40_000
-}, async (t) => {
+// Plays one DHCP move against a real hub process. `manifestEndpoints` builds
+// the saved manifest's endpoint list from the dead loopback endpoint, so each
+// scenario controls how much service identity the manifest carries on disk.
+async function runHostFollowScenario(t, { manifestEndpoints }) {
   if (!externalIPv4Address()) {
     t.skip('needs an external IPv4 interface for a non-loopback mDNS announce')
     return
@@ -160,13 +161,7 @@ test('a saved device follows its fqdn to a fresh discovery endpoint after the ma
     oscQueryPort: deadPort,
     enabled: true,
     description: 'Moves hosts on DHCP lease changes',
-    endpoints: [{
-      host: LOOPBACK,
-      port: deadPort,
-      source: 'discovery',
-      fqdn,
-      lastSeen: Date.now() - 3_600_000
-    }]
+    endpoints: manifestEndpoints({ host: LOOPBACK, port: deadPort, fqdn })
   }, null, 2)}\n`)
 
   let logs = ''
@@ -259,4 +254,38 @@ test('a saved device follows its fqdn to a fresh discovery endpoint after the ma
     ),
     'DEVICE_UPDATED must broadcast the followed host'
   )
+}
+
+test('a saved device follows its fqdn to a fresh discovery endpoint after the manifest host dies', {
+  timeout: 40_000
+}, async (t) => {
+  await runHostFollowScenario(t, {
+    manifestEndpoints: ({ host, port, fqdn }) => [{
+      host,
+      port,
+      source: 'discovery',
+      fqdn,
+      lastSeen: Date.now() - 3_600_000
+    }]
+  })
+})
+
+// Real incident (2026-09-03): Mac and the TouchDesigner machine rebooted
+// together and DHCP moved the Windows box. The hub started fresh from
+// manifests whose only endpoint was a hand-edited `manual-update` entry with
+// no fqdn; the old address never announced again, so nothing ever attached
+// the service identity to the saved card and heal had nothing to follow. The
+// manifest's serviceName is that identity — the hub must derive the fqdn from
+// it and follow the move exactly as if it had observed the old address.
+test('a fresh hub follows a saved manifest whose endpoint never carried an fqdn (serviceName only)', {
+  timeout: 40_000
+}, async (t) => {
+  await runHostFollowScenario(t, {
+    manifestEndpoints: ({ host, port }) => [{
+      host,
+      port,
+      source: 'manual-update',
+      lastSeen: Date.now() - 3_600_000
+    }]
+  })
 })

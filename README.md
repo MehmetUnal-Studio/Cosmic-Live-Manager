@@ -514,6 +514,15 @@ Consequences:
   host/port/service fallback.
 - A persistent UUID surviving DHCP change keeps one card. Historical endpoint
   and canonical aliases are retained for migration.
+- A saved manifest endpoint without an observed fqdn gets one derived from the
+  manifest `serviceName` (`<serviceName>._oscjson._tcp.local`, marked
+  `fqdnSource: "derived"`). Exact-fqdn folding and the host-follow heal use it,
+  so a hub that starts fresh after a DHCP move still folds the new address into
+  the saved card and migrates the manifest (incident 2026-09-03: hub and
+  TouchDesigner machine rebooted together, cards stuck on the dead address).
+  A derived fqdn is not mDNS-grade evidence: the HOST_INFO wrong-device name
+  guard and persisted LINK target identity only honour observed fqdns, and a
+  display label without `serviceName` derives nothing.
 - If an Ableton track/set duplication makes two simultaneously live local
   ports claim the same CosmicUnity UUID, the registry creates a port-scoped
   collision identity. Repair the clone explicitly with the VST's **Yeni ID**
@@ -1152,7 +1161,8 @@ git diff --check
 
 Handoff verification on 2026-08-29 (macOS, Node `22.14.0`): `124/124`
 Node tests passed, Vite production build completed, and `git diff --check`
-reported no whitespace errors. This is a timestamped result, not a substitute
+reported no whitespace errors. Re-verified on 2026-09-03 after the derived-fqdn
+host-follow fix: `214/214`. These are timestamped results, not a substitute
 for rerunning the commands after later edits.
 
 The Node suite covers canonical identity and simultaneous discovery races,

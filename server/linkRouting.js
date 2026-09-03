@@ -1,4 +1,4 @@
-import { DEVICE_TYPES } from './deviceRegistry.js'
+import { DEVICE_TYPES, observedFqdn } from './deviceRegistry.js'
 import {
   isMaxRingIdentity,
   isMaxRingReceiverDevice,
@@ -191,7 +191,7 @@ export function resolveGenericTargetFromRegistry(records, submittedTarget) {
     target: {
       address: endpoint.host,
       port: validPort(endpoint.port),
-      fqdn: endpoint.fqdn || submittedTarget?.fqdn || '',
+      fqdn: observedFqdn(endpoint) || submittedTarget?.fqdn || '',
       name: record.name || record.serviceName || endpoint.serviceName || submittedTarget?.name,
       serviceName: record.serviceName || endpoint.serviceName || record.name,
       deviceType: record.deviceType,
@@ -226,7 +226,7 @@ export function resolveMaxRingTargetFromRegistry(records, submittedTarget) {
   const trustedTarget = {
     address: endpoint.host,
     port: validPort(endpoint.port),
-    fqdn: endpoint.fqdn || submittedTarget?.fqdn || '',
+    fqdn: observedFqdn(endpoint) || submittedTarget?.fqdn || '',
     name: record.serviceName || record.name || endpoint.serviceName || submittedTarget?.name,
     serviceName: record.serviceName || endpoint.serviceName || record.name,
     deviceType: record.deviceType,
@@ -271,7 +271,7 @@ export function resolveMaxRingReceiverFromRegistry(records, submittedTarget) {
   const trustedTarget = {
     address: endpoint.host,
     port: validPort(endpoint.port),
-    fqdn: endpoint.fqdn || submittedTarget?.fqdn || '',
+    fqdn: observedFqdn(endpoint) || submittedTarget?.fqdn || '',
     name: record.name || record.serviceName || endpoint.serviceName || submittedTarget?.name,
     serviceName: record.serviceName || endpoint.serviceName || record.name,
     deviceType: record.deviceType,
@@ -310,7 +310,7 @@ export function resolveRingReceiverFromRegistry(records, submittedTarget) {
   const trustedTarget = {
     address: endpoint.host,
     port: validPort(endpoint.port),
-    fqdn: endpoint.fqdn || submittedTarget?.fqdn || '',
+    fqdn: observedFqdn(endpoint) || submittedTarget?.fqdn || '',
     name: record.name || record.serviceName || endpoint.serviceName || submittedTarget?.name,
     serviceName: record.serviceName || endpoint.serviceName || record.name,
     deviceType: record.deviceType,
