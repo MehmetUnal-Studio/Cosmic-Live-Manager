@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import {
   findRegistryDeviceForTarget,
+  resolveGenericTargetFromRegistry,
   resolveLinkAnnouncement,
   resolveMaxRingReceiverFromRegistry,
   resolveMaxRingTargetFromRegistry,
@@ -762,5 +763,136 @@ test('OSC UDP resolution fails closed when HOST_INFO does not provide a port', a
       })
     }),
     /OSC UDP port is unavailable.*did not advertise OSC_PORT/
+  )
+})
+
+// ─── Incident 2026-09-11: stale fqdn alias shadowed the live TV card ──────
+// Android_Tablet02's manifest still carried a DHCP-era endpoint announcing
+// the Windows TV's fqdn. That saved-but-offline card sorted before the real
+// TV record, and the resolvers took the FIRST fqdn match — so the online,
+// connected TV counted as 'LINK target is unavailable' and the auto-link
+// engine parked on "Waiting for TV" after every VST restart.
+const tvFqdn = 'Windows_TVNEVA40902._oscjson._tcp.local'
+
+function staleAliasHolder() {
+  return {
+    manifestId: 2,
+    name: 'Android_Tablet02',
+    serviceName: 'Android_TabletSpectraTablet02',
+    deviceType: 'Android',
+    saved: true,
+    discoveryState: 'Absent',
+    connectionState: 'Disabled',
+    activeEndpoint: {
+      host: '192.168.68.71', port: 9010, available: true, lastSeen: 1_788_868_023_810,
+      fqdn: 'Android_TabletSpectraTablet02._oscjson._tcp.local'
+    },
+    endpoints: [
+      { host: '169.254.83.107', port: 9010, fqdn: tvFqdn, available: true, lastSeen: 1_788_868_023_810 },
+      {
+        host: '192.168.68.71', port: 9010, available: true, lastSeen: 1_788_868_023_810,
+        fqdn: 'Android_TabletSpectraTablet02._oscjson._tcp.local'
+      }
+    ]
+  }
+}
+
+function liveTvOwner() {
+  const endpoint = {
+    host: '192.168.68.75', port: 9010, fqdn: tvFqdn, source: 'discovery',
+    available: true, lastSeen: 1_789_130_865_279
+  }
+  return {
+    manifestId: 10,
+    name: 'TV',
+    serviceName: 'Windows_TVNEVA40902',
+    deviceType: 'OSCQuery',
+    saved: true,
+    discoveryState: 'Discovered',
+    connectionState: 'Connected',
+    activeEndpoint: endpoint,
+    endpoints: [endpoint]
+  }
+}
+
+test('an offline record holding a stale fqdn alias never shadows the online owner of that fqdn', () => {
+  const alias = staleAliasHolder()
+  const owner = liveTvOwner()
+  const selection = { fqdn: tvFqdn, name: 'TV', address: '192.168.68.75', port: 9010 }
+
+  assert.equal(findRegistryDeviceForTarget([alias, owner], selection), owner,
+    'snapshot order must not decide which record owns a fqdn')
+  assert.equal(findRegistryDeviceForTarget([owner, alias], selection), owner)
+
+  const resolved = resolveGenericTargetFromRegistry([alias, owner], selection)
+  assert.equal(resolved.record, owner, 'a Discovered+Connected registry record is available for LINK')
+  assert.equal(resolved.target.address, '192.168.68.75')
+  assert.equal(resolved.target.port, 9010)
+  assert.equal(resolved.target.deviceType, 'OSCQuery')
+})
+
+test('fqdn ownership prefers the online record, then the available endpoint, then the freshest sighting', () => {
+  const offlineOwner = { ...liveTvOwner(), discoveryState: 'Stale', connectionState: 'Unavailable' }
+  const alias = staleAliasHolder()
+  const selection = { fqdn: tvFqdn, name: 'TV', address: '192.168.68.75', port: 9010 }
+
+  // Both offline: the record whose ACTIVE endpoint carries the fqdn and was
+  // seen last still owns it; a genuine tie keeps snapshot order.
+  assert.equal(findRegistryDeviceForTarget([alias, offlineOwner], selection), offlineOwner)
+  const twin = { ...offlineOwner, manifestId: 11, name: 'TV twin' }
+  assert.equal(findRegistryDeviceForTarget([offlineOwner, twin], selection), offlineOwner)
+  assert.equal(findRegistryDeviceForTarget([twin, offlineOwner], selection), twin)
+
+  // DHCP move before host-follow heal ran: the saved card is offline with a
+  // derived fqdn while an unsaved discovery record answers at the new host.
+  const savedOffline = {
+    ...offlineOwner,
+    activeEndpoint: { ...offlineOwner.activeEndpoint, fqdnSource: 'derived', available: false },
+    endpoints: [{ ...offlineOwner.activeEndpoint, fqdnSource: 'derived', available: false }]
+  }
+  const discoveredElsewhere = {
+    ...liveTvOwner(),
+    manifestId: null,
+    saved: false,
+    connectionState: 'Discovered',
+    activeEndpoint: { ...liveTvOwner().activeEndpoint, host: '192.168.68.90' },
+    endpoints: [{ ...liveTvOwner().activeEndpoint, host: '192.168.68.90' }]
+  }
+  assert.equal(
+    findRegistryDeviceForTarget([savedOffline, discoveredElsewhere], selection),
+    discoveredElsewhere
+  )
+  assert.throws(
+    () => resolveGenericTargetFromRegistry([alias, offlineOwner], selection),
+    /LINK target is unavailable/,
+    'when nobody owning the fqdn is online the LINK still fails closed'
+  )
+})
+
+// ─── Announce must never trust a cached OSC UDP port blindly ─────────────
+test('refresh re-reads HOST_INFO and prefers the live OSC UDP port over the cache', async () => {
+  const requested = []
+  const port = await resolveOscUdpPort(
+    { address: '127.0.0.1', port: 5004, oscPort: 61389 },
+    {
+      refresh: true,
+      fetchImpl: async (url) => {
+        requested.push(url)
+        return { ok: true, status: 200, json: async () => ({ NAME: 'Live_TV', OSC_PORT: 61317 }) }
+      }
+    }
+  )
+  assert.equal(port, 61317, 'the port HOST_INFO advertises now wins over yesterday\'s cache')
+  assert.deepEqual(requested, ['http://127.0.0.1:5004/?HOST_INFO'])
+})
+
+test('refresh fails closed when HOST_INFO is unreachable, even with a cached port', async () => {
+  await assert.rejects(
+    resolveOscUdpPort(
+      { address: '127.0.0.1', port: 5004, oscPort: 61389 },
+      { refresh: true, fetchImpl: async () => { throw new Error('ECONNREFUSED') } }
+    ),
+    /OSC UDP port is unavailable.*ECONNREFUSED/,
+    'a port the device no longer confirms is not a port to announce to'
   )
 })

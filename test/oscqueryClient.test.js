@@ -203,3 +203,53 @@ test('rejectCurrentAttempt drops a live connection through the normal failure pa
   assert.ok(client.reconnectTimer, 'a retry must stay scheduled so failures can accumulate for the heal')
   client.disconnect()
 })
+
+// A VST that is still booting answers ?HOST_INFO before its namespace is
+// ready. The OSC port learned during that failed attempt belongs to no live
+// session; the next attempt must start clean or the hub can adopt a port the
+// restarted process never bound (incident 2026-09-11 hardening).
+test('a failed attempt discards the HOST_INFO it learned so the next attempt cannot inherit a stale OSC port', async (t) => {
+  const server = http.createServer((req, res) => {
+    if (req.url.includes('HOST_INFO')) {
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ NAME: 'Booting_VST', OSC_PORT: 61389, OSC_TRANSPORT: 'UDP' }))
+      return
+    }
+    // The namespace fails AFTER HOST_INFO has been delivered.
+    setTimeout(() => {
+      res.statusCode = 503
+      res.end('namespace not ready')
+    }, 80)
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  t.after(() => new Promise((resolve) => {
+    server.close(resolve)
+    server.closeAllConnections?.()
+  }))
+
+  const hostInfos = []
+  const client = new OscQueryClient('127.0.0.1', server.address().port, {
+    onConnect() {},
+    onDisconnect() {},
+    onHostInfo: (info) => hostInfos.push(info),
+    onValue() {},
+    onLog() {}
+  }, { attemptTimeoutMs: 2000, reconnectDelayMs: 60_000 })
+  t.after(() => client.disconnect())
+
+  const failed = waitForAttemptFailure(client, 3000)
+  client.connect()
+  const result = await failed
+  assert.match(result.reason, /HTTP 503/)
+  assert.equal(hostInfos.length, 1, 'HOST_INFO was delivered during the attempt that then failed')
+  assert.equal(hostInfos[0].OSC_PORT, 61389)
+
+  // Nothing learned by the dead attempt may survive it.
+  assert.equal(client.hostInfo, null, 'a failed attempt keeps no HOST_INFO')
+  assert.equal(client.hostInfoRetryTimer, null, 'a failed attempt schedules no HOST_INFO retry')
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  assert.equal(client.hostInfo, null, 'no late HOST_INFO of the dead attempt resurrects the cache')
+})

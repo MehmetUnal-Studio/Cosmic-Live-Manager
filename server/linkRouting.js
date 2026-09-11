@@ -22,12 +22,22 @@ function validOscPort(value) {
   return Number.isInteger(port) && port >= 1024 && port <= 65535 ? port : 0
 }
 
+/**
+ * The OSC UDP control port of a CosmicUnity-style target. `target.oscPort` is
+ * the port the hub last learned from HOST_INFO; `refresh: true` re-reads
+ * HOST_INFO regardless and fails closed when the device does not confirm a
+ * port now. Announce paths must use `refresh` — incident 2026-09-11: the VST
+ * rebinds an ephemeral OSC port on every Ableton restart (61752 → 54525 →
+ * 61389 → 61317), so a cached port is only as good as the connection that
+ * learned it, and a write to yesterday's port silently vanishes.
+ */
 export async function resolveOscUdpPort(target, {
   fetchImpl = globalThis.fetch,
-  timeoutMs = 2000
+  timeoutMs = 2000,
+  refresh = false
 } = {}) {
   const cached = validOscPort(target?.oscPort)
-  if (cached) return cached
+  if (cached && !refresh) return cached
 
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
@@ -49,7 +59,8 @@ export async function resolveOscUdpPort(target, {
   }
 
   const detail = resolutionError?.message ? `: ${resolutionError.message}` : ''
-  throw new Error(`CosmicUnity OSC UDP port is unavailable${detail}`)
+  const cachedNote = cached ? ` (cached port ${cached} is not trusted without a live HOST_INFO)` : ''
+  throw new Error(`CosmicUnity OSC UDP port is unavailable${detail}${cachedNote}`)
 }
 
 function endpointFromManagedDevice(device) {
@@ -111,6 +122,53 @@ function inferredType(value) {
   return DEVICE_TYPES.OSCQUERY
 }
 
+function recordIsOnline(record) {
+  return record?.discoveryState === 'Discovered' || record?.connectionState === 'Connected'
+}
+
+/**
+ * The registry record that OWNS a Bonjour fqdn right now.
+ *
+ * More than one record can carry the same fqdn on an endpoint: a saved card
+ * keeps a DHCP-era alias in its manifest, a derived fqdn marks an address the
+ * hub never observed, or a service moved hosts before host-follow heal ran.
+ * Incident 2026-09-11: Android_Tablet02's manifest still held an endpoint
+ * announcing the Windows TV's fqdn; that offline card sorted first, so the
+ * TV — Discovered + Connected — resolved as 'LINK target is unavailable' and
+ * the auto-link engine parked on "Waiting for TV" after every VST restart.
+ *
+ * Ranking, highest first: a record that is online (Discovered or Connected);
+ * one whose matching endpoint is still available; one whose ACTIVE endpoint
+ * carries the fqdn; the freshest sighting. Ties keep snapshot order, so a
+ * registry with a single owner behaves exactly as before.
+ */
+export function selectRegistryRecordByFqdn(records, fqdn) {
+  const wanted = normalized(fqdn)
+  if (!wanted) return null
+  let best = null
+  for (const record of Array.isArray(records) ? records : []) {
+    const matches = [record?.activeEndpoint, ...(record?.endpoints || [])]
+      .filter((candidate) => candidate && normalized(candidate.fqdn) === wanted)
+    if (matches.length === 0) continue
+    const score = [
+      recordIsOnline(record) ? 1 : 0,
+      matches.some((candidate) => candidate.available !== false) ? 1 : 0,
+      normalized(record?.activeEndpoint?.fqdn) === wanted ? 1 : 0,
+      Math.max(...matches.map((candidate) => Number(candidate.lastSeen) || 0))
+    ]
+    // Strictly better only: equal scores keep the earlier record.
+    if (!best || compareScores(score, best.score) > 0) best = { record, score }
+  }
+  return best?.record || null
+}
+
+function compareScores(a, b) {
+  for (let index = 0; index < a.length; index++) {
+    if (a[index] !== b[index]) return a[index] > b[index] ? 1 : -1
+  }
+  return 0
+}
+
 export function findRegistryDeviceForTarget(records, target) {
   const targetFqdn = normalized(target?.fqdn)
   const endpoint = endpointFromDiscovery(target)
@@ -120,11 +178,11 @@ export function findRegistryDeviceForTarget(records, target) {
 
   // Identity beats topology globally, not just within each record. Otherwise
   // an earlier stale record without an FQDN can win via host:port before the
-  // later record carrying the exact Bonjour identity is inspected.
+  // later record carrying the exact Bonjour identity is inspected. Among the
+  // records carrying the identity, the one that owns it now wins (see
+  // selectRegistryRecordByFqdn) — never merely the first in snapshot order.
   if (targetFqdn) {
-    const exact = availableRecords.find((record) =>
-      candidatesFor(record).some((candidate) => normalized(candidate?.fqdn) === targetFqdn)
-    )
+    const exact = selectRegistryRecordByFqdn(availableRecords, targetFqdn)
     if (exact) return exact
   }
 

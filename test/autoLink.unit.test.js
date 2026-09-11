@@ -428,3 +428,43 @@ test('a target restart invalidates the applied signature of sources linked to it
   await settle()
   assert.equal(fx.announces.length, 2, 'unrelated reconnects leave the applied signature intact')
 })
+
+// Incident 2026-09-11: a saved, disabled Android card still carried a DHCP-era
+// endpoint announcing the Windows TV's fqdn. It sorted before the live TV
+// record and the engine took the first fqdn match, so device 18 parked on
+// "Waiting for TV" while the TV was Discovered + Connected.
+test('resolveLinkTargetRecord prefers the online owner of a fqdn over an offline record holding a stale alias', () => {
+  const tvFqdn = 'Windows_TVNEVA40902._oscjson._tcp.local'
+  const staleAlias = {
+    manifestId: 2,
+    name: 'Android_Tablet02',
+    discoveryState: 'Absent',
+    connectionState: 'Disabled',
+    activeEndpoint: { host: '192.168.68.71', port: 9010, fqdn: 'Android_TabletSpectraTablet02._oscjson._tcp.local', available: true },
+    endpoints: [
+      { host: '169.254.83.107', port: 9010, fqdn: tvFqdn, available: true, lastSeen: 1 },
+      { host: '192.168.68.71', port: 9010, fqdn: 'Android_TabletSpectraTablet02._oscjson._tcp.local', available: true, lastSeen: 1 }
+    ]
+  }
+  const owner = {
+    manifestId: 10,
+    name: 'TV',
+    serviceName: 'Windows_TVNEVA40902',
+    discoveryState: 'Discovered',
+    connectionState: 'Connected',
+    activeEndpoint: { host: '192.168.68.75', port: 9010, fqdn: tvFqdn, available: true, lastSeen: 2 },
+    endpoints: [{ host: '192.168.68.75', port: 9010, fqdn: tvFqdn, available: true, lastSeen: 2 }]
+  }
+  const link = { targetFqdn: tvFqdn, targetName: 'TV', peerId: 'windows_tvneva40902', udpPortOverride: 0 }
+
+  assert.equal(resolveLinkTargetRecord([staleAlias, owner], link), owner)
+  assert.equal(resolveLinkTargetRecord([owner, staleAlias], link), owner)
+  // Nobody online: the record whose ACTIVE endpoint carries the fqdn and was
+  // seen last still owns it — the engine parks as pending on the right card.
+  const offlineOwner = { ...owner, discoveryState: 'Stale', connectionState: 'Unavailable' }
+  assert.equal(resolveLinkTargetRecord([staleAlias, offlineOwner], link), offlineOwner)
+  // A genuine tie keeps snapshot order (the historical behaviour).
+  const twin = { ...offlineOwner, manifestId: 11, name: 'TV twin' }
+  assert.equal(resolveLinkTargetRecord([offlineOwner, twin], link), offlineOwner)
+  assert.equal(resolveLinkTargetRecord([twin, offlineOwner], link), twin)
+})

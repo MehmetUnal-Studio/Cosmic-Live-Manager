@@ -350,9 +350,13 @@ function clientRegistrySnapshot() {
   return deviceRegistry.snapshot().map((record) => {
     if (record.manifestId == null) return record
     const managed = devices.get(record.manifestId)
-    if (!managed || (!managed.link && !managed.autoLink)) return record
+    if (!managed) return record
     return {
       ...record,
+      // The OSC UDP port HOST_INFO advertised on the CURRENT connection, or
+      // null while unknown — what SET_DEVICE_PARAM and announce write to.
+      // Visible on /_status and /_devices so a stale port is diagnosable.
+      oscPort: isValidOscPort(Number(managed.oscPort)) ? Number(managed.oscPort) : null,
       ...(managed.link ? { link: managed.link } : {}),
       ...(managed.autoLink ? { autoLink: managed.autoLink } : {})
     }
@@ -696,6 +700,10 @@ function connectToDevice(dev) {
       if (!currentDev) return
       currentDev.consecutiveConnectFailures =
         (Number(currentDev.consecutiveConnectFailures) || 0) + 1
+      // An OSC UDP port learned by the attempt that just failed (a booting
+      // VST answers ?HOST_INFO before its namespace) describes no live
+      // session — fail closed until the next attempt re-learns it.
+      currentDev.oscPort = null
       currentDev.status = details.timeout ? 'unavailable' : 'error'
       currentDev.connectionState = details.timeout
         ? CONNECTION_STATES.UNAVAILABLE
@@ -1714,10 +1722,20 @@ wssDiscovery.on('connection', (ws) => {
  * @param {{ target: any, peerId: string, host: string, oscQueryPort: number, udpPort: number }} args
  */
 async function announceToTarget({ target, peerId, host, oscQueryPort, udpPort }) {
-  // CosmicUnity's OSCQuery HTTP port and OSC UDP control port are independent.
-  // The resolver uses cached HOST_INFO first, then performs one bounded refresh
-  // and fails closed rather than guessing the HTTP endpoint.
-  const targetOscPort = await resolveOscUdpPort(target)
+  // CosmicUnity's OSCQuery HTTP port and OSC UDP control port are independent,
+  // and the UDP port is ephemeral: every Ableton restart rebinds it (incident
+  // 2026-09-11: 61752 → 54525 → 61389 → 61317). An announce therefore asks
+  // HOST_INFO for the port NOW — the cached one is only a hint to log against —
+  // and fails closed (no send, logged by the caller) when the device does not
+  // confirm a port, rather than writing into a port nobody listens on.
+  const cachedOscPort = isValidOscPort(Number(target.oscPort)) ? Number(target.oscPort) : 0
+  const targetOscPort = await resolveOscUdpPort(target, { refresh: true })
+  if (cachedOscPort && cachedOscPort !== targetOscPort) {
+    console.log(
+      `  [announce] ${target.name || target.address}: cached OSC port ${cachedOscPort} is stale — ` +
+      `HOST_INFO now advertises ${targetOscPort}`
+    )
+  }
   // Fire the five canonical announce messages. We use the shared UDP sender.
   sendOscViaSender(target.address, targetOscPort, '/system/peer/peer_id', [peerId])
   sendOscViaSender(target.address, targetOscPort, '/system/peer/host', [host])
@@ -1725,6 +1743,22 @@ async function announceToTarget({ target, peerId, host, oscQueryPort, udpPort })
   sendOscViaSender(target.address, targetOscPort, '/system/peer/udp_port', [udpPort])
   sendOscViaSender(target.address, targetOscPort, '/system/peer/connect', [true])
   console.log(`  [announce] ${peerId} → ${target.address}:${targetOscPort}  (oscq=${oscQueryPort} udp=${udpPort})`)
+  return targetOscPort
+}
+
+// The OSC UDP port a live HOST_INFO just confirmed for a managed device is the
+// port SET_DEVICE_PARAM must write to as well — adopt it on the card so the
+// dashboard and the auto-link signature see the same truth as the announce.
+function adoptLiveOscPort(target, oscPort) {
+  if (!isValidOscPort(Number(oscPort))) return
+  for (const dev of devices.values()) {
+    if (dev.host !== target.address || Number(dev.oscQueryPort) !== Number(target.port)) continue
+    if (Number(dev.oscPort) === Number(oscPort)) return
+    console.log(`  [announce] ${dev.name}: OSC port ${dev.oscPort ?? 'unknown'} → ${oscPort} (live HOST_INFO)`)
+    dev.oscPort = Number(oscPort)
+    broadcastDeviceUpdate(dev)
+    return
+  }
 }
 
 function sendOscViaSender(host, port, address, args) {
@@ -1811,7 +1845,8 @@ async function performAnnounce({ dev, target, peerId, udpPortOverride }) {
     peerId,
     udpPortOverride
   })
-  await announceToTarget(announcement)
+  const targetOscPort = await announceToTarget(announcement)
+  adoptLiveOscPort(announcement.target, targetOscPort)
   return { announcement, selectedRegistryDevice, selectedTarget, selectedManagedDevice }
 }
 

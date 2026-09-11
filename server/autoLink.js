@@ -11,6 +11,8 @@
 // so this engine can never drift from the WS ANNOUNCE_DEVICE path, and so
 // unit tests can drive it with fakes and fake timers.
 
+import { selectRegistryRecordByFqdn } from './linkRouting.js'
+
 const DEFAULT_DEBOUNCE_MS = 1000
 const DEFAULT_RETRY_DELAYS_MS = [2000, 5000, 15000]
 
@@ -65,13 +67,11 @@ export function resolveLinkTargetRecord(records, link) {
   const targetFqdn = normalized(link?.targetFqdn)
   const targetName = normalized(link?.targetName)
   const availableRecords = Array.isArray(records) ? records : []
-  const candidatesFor = (record) =>
-    [record?.activeEndpoint, ...(record?.endpoints || [])].filter(Boolean)
 
+  // The record that owns the fqdn NOW — an offline card still carrying the
+  // fqdn as a stale alias must not shadow the live service (2026-09-11).
   if (targetFqdn) {
-    const exact = availableRecords.find((record) =>
-      candidatesFor(record).some((candidate) => normalized(candidate?.fqdn) === targetFqdn)
-    )
+    const exact = selectRegistryRecordByFqdn(availableRecords, targetFqdn)
     if (exact) return exact
   }
   if (targetName) {

@@ -668,10 +668,20 @@ Therefore:
   Ring receivers, and wrong-port special Ring identities are filtered in the
   UI and rejected by backend topology checks.
 
-On Push, the backend resolves the receiving device's OSC UDP control port from
-cached `HOST_INFO` or one bounded refresh. LINK fails closed if the receiver
-does not provide a valid `OSC_PORT`; the HTTP port is not guessed. It then
-dispatches these five OSC/UDP messages in order:
+On Push, the backend re-reads the receiving device's `?HOST_INFO` and uses the
+`OSC_PORT` it advertises *now*; the port cached from the connection is only
+logged against (`cached OSC port … is stale`) and adopted onto the card when it
+differs. The VST rebinds an ephemeral OSC port on every Ableton restart
+(incident 2026-09-11: 61752 → 54525 → 61389 → 61317), so a cached port is never
+trusted for an announce. LINK fails closed — no UDP is sent and the auto-link
+engine retries — if the receiver does not confirm a valid `OSC_PORT`; the HTTP
+port is not guessed. `GET /_status` and `GET /_devices` expose the cached
+`oscPort` per saved card for diagnosis. When several registry records carry the
+selected target's fqdn (a saved card can keep a DHCP-era alias in its
+manifest), the record that owns the fqdn now wins — online first, then an
+available endpoint, then the active endpoint, then the freshest sighting —
+never merely the first in snapshot order. It then dispatches these five
+OSC/UDP messages in order:
 
 ```text
 /system/peer/peer_id        <sanitized external peer id>

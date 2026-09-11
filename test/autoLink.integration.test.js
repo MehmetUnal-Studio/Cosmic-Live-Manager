@@ -130,16 +130,27 @@ async function openHub(managerPort) {
  * control socket (the port HOST_INFO advertises — like the real VST).
  */
 async function startFakeOscDevice({ name, deviceId, deviceType, httpPort = 0 }) {
-  const udp = dgram.createSocket('udp4')
-  await new Promise((resolve, reject) => {
-    udp.once('error', reject)
-    udp.bind(0, LOOPBACK, resolve)
-  })
-  const udpPort = udp.address().port
   const packets = []
-  udp.on('message', (buffer) => {
-    try { packets.push(osc.readPacket(buffer, { metadata: true, unpackSingleArgs: false })) } catch {}
-  })
+  // Packets that land on a UDP socket this device has already RETIRED via
+  // rebindUdp(): the hub wrote to a port HOST_INFO no longer advertises.
+  const stalePackets = []
+  const retired = []
+  let udp = null
+  let udpPort = 0
+  async function bindUdp() {
+    const socket = dgram.createSocket('udp4')
+    await new Promise((resolve, reject) => {
+      socket.once('error', reject)
+      socket.bind(0, LOOPBACK, resolve)
+    })
+    socket.on('message', (buffer) => {
+      const sink = socket === udp ? packets : stalePackets
+      try { sink.push(osc.readPacket(buffer, { metadata: true, unpackSingleArgs: false })) } catch {}
+    })
+    udp = socket
+    udpPort = socket.address().port
+  }
+  await bindUdp()
 
   const namespace = {
     FULL_PATH: '/',
@@ -168,15 +179,29 @@ async function startFakeOscDevice({ name, deviceId, deviceType, httpPort = 0 }) 
   })
 
   let closed = false
+  const peerMessagesOf = (list) => list.filter((packet) =>
+    typeof packet.address === 'string' && packet.address.startsWith('/system/peer/')
+  )
   return {
     name,
-    udpPort,
+    get udpPort() { return udpPort },
     httpPort: server.address().port,
     packets,
+    stalePackets,
     peerMessages() {
-      return packets.filter((packet) =>
-        typeof packet.address === 'string' && packet.address.startsWith('/system/peer/')
-      )
+      return peerMessagesOf(packets)
+    },
+    stalePeerMessages() {
+      return peerMessagesOf(stalePackets)
+    },
+    // The VST's OSC control socket moved (a new process bound a fresh
+    // ephemeral port) while its HTTP/WS side stayed up. HOST_INFO advertises
+    // the new port immediately; the old socket stays open so a write to the
+    // retired port is observable instead of silently vanishing.
+    async rebindUdp() {
+      retired.push(udp)
+      await bindUdp()
+      return udpPort
     },
     async close() {
       if (closed) return
@@ -187,9 +212,11 @@ async function startFakeOscDevice({ name, deviceId, deviceType, httpPort = 0 }) 
         server.close(resolve)
         server.closeAllConnections?.()
       })
-      await new Promise((resolve) => {
-        try { udp.close(resolve) } catch { resolve() }
-      })
+      for (const socket of [udp, ...retired]) {
+        await new Promise((resolve) => {
+          try { socket.close(resolve) } catch { resolve() }
+        })
+      }
     }
   }
 }
@@ -198,6 +225,14 @@ function peerArgsByAddress(peerMessages) {
   const map = new Map()
   for (const packet of peerMessages) map.set(packet.address, packet.args)
   return map
+}
+
+async function deviceOscPort(managerPort, manifestId) {
+  const response = await fetch(`http://${LOOPBACK}:${managerPort}/_devices`)
+  if (!response.ok) return null
+  const body = await response.json()
+  const device = body.devices?.find((item) => item.manifestId === manifestId)
+  return device ? (device.oscPort ?? null) : null
 }
 
 async function deviceConnected(managerPort, manifestId) {
@@ -574,4 +609,103 @@ test('saveManifest validates persisted link shapes defensively over UPDATE_DEVIC
     const parsed = JSON.parse(await readFile(manifestPath, 'utf-8'))
     return !('link' in parsed)
   }, 'link:null removes the persisted field')
+})
+
+// Incident 2026-09-11: Live_TV's OSC UDP port changed with every Ableton
+// restart (61752 → 54525 → 61389 → 61317). An announce must be addressed to
+// the port HOST_INFO advertises NOW — never to a port the hub cached from an
+// earlier session — and the managed card must adopt the live port.
+test('ANNOUNCE_DEVICE writes to the VST\'s current UDP port after HOST_INFO changed under a live WebSocket', {
+  timeout: 60_000
+}, async (t) => {
+  const vst = await startFakeOscDevice({
+    name: 'RebindVst',
+    deviceId: 'rebind-vst-sim',
+    deviceType: 'CosmicUnity'
+  })
+  const tablet = await startFakeOscDevice({
+    name: 'RebindTablet',
+    deviceId: 'rebind-tablet-sim',
+    deviceType: 'OSCQuery'
+  })
+  const managerPort = await freeTcpPort()
+  const managerOscPort = await freeUdpPort()
+  const manifestsDir = await mkdtemp(join(os.tmpdir(), 'cosmic-autolink-rebind-'))
+  await writeFile(join(manifestsDir, 'rebind_vst_51.json'), JSON.stringify({
+    id: 51,
+    name: 'RebindVst',
+    type: 'oscquery-device',
+    deviceType: 'CosmicUnity',
+    host: LOOPBACK,
+    oscQueryPort: vst.httpPort,
+    enabled: true
+  }, null, 2) + '\n')
+  await writeFile(join(manifestsDir, 'rebind_tablet_52.json'), JSON.stringify({
+    id: 52,
+    name: 'RebindTablet',
+    type: 'oscquery-device',
+    deviceType: 'OSCQuery',
+    host: LOOPBACK,
+    oscQueryPort: tablet.httpPort,
+    enabled: true
+  }, null, 2) + '\n')
+
+  let logs = ''
+  const child = spawnHub({
+    managerPort,
+    managerOscPort,
+    manifestsDir,
+    onLog: (chunk) => { logs = `${logs}${chunk.toString()}`.slice(-100_000) }
+  })
+  let hub
+  t.after(async () => {
+    try { hub?.ws.terminate() } catch {}
+    await stopChild(child)
+    await vst.close()
+    await tablet.close()
+    await rm(manifestsDir, { recursive: true, force: true })
+  })
+
+  await waitFor(async () => {
+    if (child.exitCode !== null) throw new Error(`Manager exited early\n${logs}`)
+    return (await deviceConnected(managerPort, 51)) && (await deviceConnected(managerPort, 52))
+  }, 'both fake devices to connect', 20_000)
+  const firstUdpPort = vst.udpPort
+  await waitFor(
+    async () => (await deviceOscPort(managerPort, 51)) === firstUdpPort,
+    'the hub to cache the OSC port HOST_INFO advertised on connect',
+    10_000
+  )
+
+  // Same HTTP/WS port, same DEVICE_ID, but the OSC control socket moved and
+  // HOST_INFO already says so. The hub has NOT seen a disconnect.
+  const secondUdpPort = await vst.rebindUdp()
+  assert.notEqual(secondUdpPort, firstUdpPort)
+
+  hub = await openHub(managerPort)
+  hub.ws.send(JSON.stringify({
+    type: 'ANNOUNCE_DEVICE',
+    deviceId: 51,
+    target: { name: 'RebindTablet', address: LOOPBACK, port: tablet.httpPort },
+    peerId: 'rebind-tablet',
+    remember: false
+  }))
+  const result = await waitFor(
+    () => hub.messages.find((message) => message.type === 'ANNOUNCE_RESULT' && message.deviceId === 51),
+    'ANNOUNCE_RESULT'
+  )
+  assert.equal(result.ok, true, `announce must succeed: ${result.error}\n${logs}`)
+
+  const announced = await waitFor(() => {
+    const messages = vst.peerMessages()
+    return messages.length >= 5 ? messages : false
+  }, 'the announce to land on the CURRENT UDP socket', 10_000)
+  const args = peerArgsByAddress(announced)
+  assert.equal(args.get('/system/peer/peer_id')[0].value, 'rebind-tablet')
+  assert.equal(Number(args.get('/system/peer/oscquery_port')[0].value), tablet.httpPort)
+  assert.equal(vst.stalePeerMessages().length, 0,
+    `nothing may be written to the retired UDP port ${firstUdpPort}\n${logs}`)
+  assert.equal(await deviceOscPort(managerPort, 51), secondUdpPort,
+    'the managed card adopts the port the live HOST_INFO advertised')
+  assert.equal(child.exitCode, null, `hub must stay alive\n${logs}`)
 })

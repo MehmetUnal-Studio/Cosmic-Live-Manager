@@ -117,6 +117,10 @@ export class OscQueryClient {
   async connect() {
     if (!this.shouldReconnect) return
     const attempt = ++this.connectAttempt
+    // Every attempt learns its own HOST_INFO. A restarted device rebinds a new
+    // ephemeral OSC UDP port, so anything learned by an earlier attempt or
+    // session describes a process that may no longer exist.
+    this.hostInfo = null
     const controller = new AbortController()
     this.fetchControllers.add(controller)
     this._clearAttemptTimer()
@@ -218,7 +222,9 @@ export class OscQueryClient {
   }
 
   _isCurrentAttempt(attempt) {
-    return this.shouldReconnect && attempt === this.connectAttempt
+    // A failed attempt is dead even before the next one starts: its late
+    // HOST_INFO response or retry must not repopulate the cache.
+    return this.shouldReconnect && attempt === this.connectAttempt && attempt !== this.failedAttempt
   }
 
   _clearAttemptTimer() {
@@ -235,6 +241,9 @@ export class OscQueryClient {
     this._stopKeepalive()
     for (const controller of this.fetchControllers) controller.abort()
     this.fetchControllers.clear()
+    // HOST_INFO delivered by a dead attempt (a VST still booting answers
+    // ?HOST_INFO before its namespace) belongs to no live session.
+    this.hostInfo = null
     const ws = this.ws
     this.ws = null
     if (ws) {
