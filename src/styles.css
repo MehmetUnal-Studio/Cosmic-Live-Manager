@@ -1349,10 +1349,15 @@ details.row-section summary {
 .device-status-text.unavailable,
 .device-status-text.error { color: var(--hub-red); font-weight: 600; }
 .device-msgs {
-  display: inline-flex; align-items: center; gap: 0.4rem;
+  display: inline-flex; align-items: center; justify-content: flex-end; gap: 0.4rem;
   font-family: var(--hub-mono); font-size: 12px; color: var(--hub-accent);
   background: rgba(91,184,255,0.12); padding: 0.1rem 0.4rem;
   border-radius: 4px;
+  /* The label is abbreviated to at most 5 glyphs (see shared/counters.js), so
+     a fixed slot keeps the row from twitching as the count rolls over. */
+  min-width: 4.4rem; max-width: 4.4rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap; cursor: default;
 }
 
 /* Hub buttons — different naming so they don't collide with global .button */

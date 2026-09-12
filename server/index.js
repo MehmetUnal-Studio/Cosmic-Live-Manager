@@ -68,6 +68,7 @@ import {
   isRingInstrumentIdentity
 } from '../shared/maxRingLink.js'
 import { isCosmicRingReceiverDevice } from '../shared/cosmicRingLink.js'
+import { bumpCounter, ratePerSecond } from '../shared/counters.js'
 
 function isAbletonRingReceiverDevice(device) {
   return isMaxRingReceiverDevice(device) || isCosmicRingReceiverDevice(device)
@@ -181,8 +182,12 @@ const manifestFilenames = new Map()
 const manifestFilesByDeviceId = new Map()
 /** @type {Map<number, OscQueryClient>} */
 const oscQueryClients = new Map()
-/** @type {Map<number, number>} */
+/** @type {Map<number, number>} lifetime message counter per device (saturating) */
 const deviceMsgCount = new Map()
+/** @type {Map<number, number>} messages/second per device, recomputed each broadcast tick */
+const deviceMsgRate = new Map()
+/** @type {Map<number, number>} counter value at the previous rate tick */
+const deviceMsgCountAtLastTick = new Map()
 /** @type {Map<string, any>} bonjour-service ServiceInfo by fqdn */
 const services = new Map()
 let nextDeviceRuntimeGeneration = 1
@@ -388,6 +393,8 @@ function clearManagedDeviceRuntimeState(deviceId) {
   cosmicNoiseForwarder.clearDeviceSnapshots(deviceId)
   autoLinkEngine.forgetDevice(deviceId)
   deviceMsgCount.delete(deviceId)
+  deviceMsgRate.delete(deviceId)
+  deviceMsgCountAtLastTick.delete(deviceId)
   for (const [path, param] of namespace.entries()) {
     if (param.deviceId === deviceId) namespace.delete(path)
   }
@@ -809,7 +816,7 @@ function handleClientValue(dev, path, value, metadata = {}) {
   dev.connectionState = CONNECTION_STATES.CONNECTED
   dev.error = null
 
-  deviceMsgCount.set(dev.id, (deviceMsgCount.get(dev.id) || 0) + 1)
+  deviceMsgCount.set(dev.id, bumpCounter(deviceMsgCount.get(dev.id) || 0))
 
   // Store in the hub namespace, prefixed with the device name so paths from
   // different devices never collide. e.g. /Tablet2/HandR0/palm/Tx
@@ -1185,7 +1192,7 @@ function forwardToAbleton(deviceId, paramPath, value, type) {
   const isInt = type === 'i' && Number.isInteger(v) && v >= -2147483648 && v <= 2147483647
   const packet = buildAbletonPacket(address, paramPath, typeof v === 'number' ? v : 0, isInt)
   abletonSocket.send(packet, ABLETON_PORT, ABLETON_HOST)
-  abletonMsgsSent++
+  abletonMsgsSent = bumpCounter(abletonMsgsSent)
 }
 
 // ─── Outgoing OSC relay (to /subscribe destinations) ──────────────────────
@@ -2376,6 +2383,8 @@ function handleHubMessage(ws, ip, msg) {
           clearManagedDeviceRuntimeState(id)
         }
         deviceMsgCount.clear()
+        deviceMsgRate.clear()
+        deviceMsgCountAtLastTick.clear()
         for (const [path, param] of namespace.entries()) {
           if (param.deviceId !== undefined) namespace.delete(path)
         }
@@ -2559,13 +2568,40 @@ function handleHubMessage(ws, ip, msg) {
     }
 }
 
-// ─── Periodic broadcast: per-device message counters ──────────────────────
+// ─── Periodic broadcast: per-device message counters and rates ────────────
+// The lifetime counter answers "has this ever spoken"; the rate answers "is it
+// speaking NOW", which is the one an operator reads mid-show. Both travel in
+// the same tick so a card never shows a count and a rate from different moments.
+const DEVICE_COUNTER_TICK_MS = 500
+let deviceCounterTickAt = Date.now()
 const deviceMessageCounterTimer = setInterval(() => {
-  if (deviceMsgCount.size === 0) return
+  const now = Date.now()
+  const elapsedMs = now - deviceCounterTickAt
+  deviceCounterTickAt = now
+  if (deviceMsgCount.size === 0) {
+    deviceMsgRate.clear()
+    deviceMsgCountAtLastTick.clear()
+    return
+  }
   const counts = {}
-  for (const [id, c] of deviceMsgCount.entries()) counts[id] = c
-  broadcastHub({ type: 'DEVICE_MSG_COUNTS', counts, abletonTotal: abletonMsgsSent })
-}, 500)
+  const rates = {}
+  for (const [id, count] of deviceMsgCount.entries()) {
+    counts[id] = count
+    const delta = count - (deviceMsgCountAtLastTick.get(id) || 0)
+    deviceMsgCountAtLastTick.set(id, count)
+    const rate = ratePerSecond(delta, elapsedMs)
+    deviceMsgRate.set(id, rate)
+    rates[id] = rate
+  }
+  // A device that was removed between ticks must not keep a stale baseline.
+  for (const id of Array.from(deviceMsgCountAtLastTick.keys())) {
+    if (!deviceMsgCount.has(id)) {
+      deviceMsgCountAtLastTick.delete(id)
+      deviceMsgRate.delete(id)
+    }
+  }
+  broadcastHub({ type: 'DEVICE_MSG_COUNTS', counts, rates, abletonTotal: abletonMsgsSent })
+}, DEVICE_COUNTER_TICK_MS)
 deviceMessageCounterTimer.unref()
 
 // ─── Server startup ───────────────────────────────────────────────────────

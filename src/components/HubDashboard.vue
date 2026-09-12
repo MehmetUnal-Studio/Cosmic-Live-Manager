@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useHub } from '../composables/useHub.js'
+import { formatCount } from '../../shared/counters.js'
 import { useDiscovery } from '../composables/useDiscovery.js'
 import { useScenes } from '../composables/useScenes.js'
 import { usePerformancePresets } from '../composables/usePerformancePresets.js'
@@ -21,6 +22,7 @@ const {
   msgsThisSecond,
   deviceParams,
   deviceMsgCounts,
+  deviceMsgRates,
   saveHints,
   announceResults,
   updateDevice,
@@ -291,6 +293,8 @@ const statParams = computed(() => {
   for (const m of deviceParams.value.values()) n += m.size
   return n
 })
+// Abbreviated so a busy moment cannot stretch the status strip.
+const msgsPerSecondLabel = computed(() => formatCount(msgsThisSecond.value))
 
 // ─── Drag-and-drop with long-press ──────────────────────────────────────
 // UX:
@@ -543,7 +547,7 @@ watch(devices, (list) => {
         <span class="ss-sep">·</span>
         <span class="ss-item"><b>{{ statParams }}</b> parametre</span>
         <span class="ss-sep">·</span>
-        <span class="ss-item"><b>{{ msgsThisSecond }}</b> msg/s</span>
+        <span class="ss-item"><b>{{ msgsPerSecondLabel }}</b> msg/s</span>
       </div>
 
       <!-- Scenes (global snapshot recall) — label lives inside the slim bar -->
@@ -620,6 +624,7 @@ watch(devices, (list) => {
             <DeviceCard
               :device="dev"
               :msg-count="deviceMsgCounts.get(dev.id) || 0"
+              :msg-rate="deviceMsgRates.get(dev.id) || 0"
               :params="deviceParams.get(dev.id) || EMPTY_MAP"
               :hint="saveHints.get(dev.id) || null"
               :services="linkTargetServices(dev)"

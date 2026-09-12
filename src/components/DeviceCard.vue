@@ -17,6 +17,7 @@ import {
   isRingInstrumentIdentity
 } from '../utils/linkTargets.js'
 import { MAX_RING_DEFAULT_UDP_PORT } from '../../shared/maxRingLink.js'
+import { formatCount, formatExact, formatRate } from '../../shared/counters.js'
 import {
   planScopedStorageMigration,
   scopedStorageMigrationKeys,
@@ -26,6 +27,7 @@ import {
 const props = defineProps({
   device: { type: Object, required: true },
   msgCount: { type: Number, default: 0 },
+  msgRate: { type: Number, default: 0 },
   // Map<relPath, node> — full OSCQuery nodes (TYPE, VALUE, RANGE, ACCESS, …),
   // FULL_PATH is the device-relative path (no /deviceName prefix).
   params: { type: Object, default: () => new Map() },
@@ -328,6 +330,13 @@ const recording = useRecording(
 // timer that gets renewed on every event — a steady stream keeps it glowing.
 const msgActive = ref(false)
 let msgActiveTimer = null
+// The badge shows an abbreviated total so a counter that has been running for
+// days can never widen this row; the exact figure and the live rate live in
+// the tooltip, where length costs nothing.
+const msgLabel = computed(() => formatCount(props.msgCount))
+const msgTitle = computed(
+  () => `${formatExact(props.msgCount)} mesaj · ${formatRate(props.msgRate)}`
+)
 let stopMsgListener = null
 // Injected from App.vue — false while the operator is on the Performance
 // page. Both pages stay mounted (v-show), so cosmetic per-message work
@@ -755,13 +764,12 @@ const paramCount = computed(() => {
             :class="linkGlyph.cls"
             :title="linkGlyph.title"
           >{{ linkGlyph.icon }}</span>
-          <span v-if="msgCount > 0" class="device-msgs">
+          <span v-if="msgCount > 0" class="device-msgs" :title="msgTitle">
             <span
               class="msg-activity-dot"
               :class="{ active: msgActive }"
-              title="Lights up on each incoming OSC message"
             ></span>
-            {{ msgCount }}
+            {{ msgLabel }}
           </span>
           <button
             class="device-expand-btn"

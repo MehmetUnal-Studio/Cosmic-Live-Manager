@@ -92,6 +92,8 @@ function createHub() {
   }
 
   const deviceMsgCounts = ref(new Map())
+  // Messages/second per device, from the same hub tick as the counts above.
+  const deviceMsgRates = ref(new Map())
   const saveHints = ref(new Map())
 
   // Announce results — keyed by deviceId, cleared after a short delay.
@@ -384,6 +386,7 @@ function createHub() {
       Array.from(source.entries()).filter(([deviceId]) => validIds.has(deviceId))
     )
     deviceMsgCounts.value = prune(deviceMsgCounts.value)
+    deviceMsgRates.value = prune(deviceMsgRates.value)
     saveHints.value = prune(saveHints.value)
     announceResults.value = prune(announceResults.value)
   }
@@ -570,6 +573,7 @@ function createHub() {
         paramBatcher.clear()
         deviceParams.value = new Map()
         deviceMsgCounts.value = new Map()
+        deviceMsgRates.value = new Map()
         saveHints.value = new Map()
         announceResults.value = new Map()
         clearAllPendingToggles()
@@ -652,12 +656,20 @@ function createHub() {
         if (!msg.ok) clearPendingToggle(msg.deviceId)
       } else if (msg.type === 'DEVICE_MSG_COUNTS') {
         const m = new Map()
+        const rates = new Map()
         const validIds = new Set(devices.value.map((device) => device.id))
         for (const [id, c] of Object.entries(msg.counts)) {
           const deviceId = parseInt(id, 10)
           if (validIds.has(deviceId)) m.set(deviceId, c)
         }
+        // Rates ride along with the counts; an older hub sends none, and the
+        // cards then simply show a total with no rate.
+        for (const [id, r] of Object.entries(msg.rates || {})) {
+          const deviceId = parseInt(id, 10)
+          if (validIds.has(deviceId) && typeof r === 'number') rates.set(deviceId, r)
+        }
         deviceMsgCounts.value = m
+        deviceMsgRates.value = rates
         if (typeof msg.abletonTotal === 'number') abletonTotal.value = msg.abletonTotal
       } else if (msg.type === 'DISCOVERED_DEVICES') {
         discovered.value = msg.devices || []
@@ -742,6 +754,7 @@ function createHub() {
     deviceParamsVersion,
     paramsVersionFor,
     deviceMsgCounts,
+    deviceMsgRates,
     saveHints,
     announceResults,
     pendingToggles,
