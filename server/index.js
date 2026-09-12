@@ -7,7 +7,9 @@
 //   - Publishes itself as a Bonjour _oscjson._tcp + _osc._udp service and
 //     also browses the LAN for other _oscjson._tcp services (shown in the
 //     dashboard's "Discovered" section, plus surfaced to the dashboard via
-//     /ws/discovery for the Announce target picker).
+//     /ws/discovery for the Announce target picker). Owns the mDNS socket so
+//     it can follow interface changes: rejoin the multicast group on an
+//     interface that (re)appears and query on every interface.
 //   - Listens for UDP/OSC on OSC_PORT, supports /subscribe & /unsubscribe
 //     for OSC relay style, and a central /ws/hub WebSocket pushes
 //     PATH_CHANGED, DEVICE_UPDATED, DEVICE_NAMESPACE, … to the dashboard.
@@ -57,6 +59,7 @@ import {
 } from './linkRouting.js'
 import { planCollisionHeals } from './collisionHeal.js'
 import { planHostFollowHeals } from './hostFollowHeal.js'
+import { createInterfaceWatcher } from './discoveryInterfaces.js'
 import { createAutoLinkEngine } from './autoLink.js'
 import { hubBackpressureAction } from './hubBackpressure.js'
 import {
@@ -91,6 +94,12 @@ const REACHABILITY_PROBE_TIMEOUT_MS = Number(process.env.REACHABILITY_PROBE_TIME
 const COLLISION_HEAL_INTERVAL_MS = Number(process.env.COLLISION_HEAL_INTERVAL_MS || 5000)
 // Saved-device fqdn host-follow auto-heal scan interval (DHCP moves).
 const HOST_FOLLOW_HEAL_INTERVAL_MS = Number(process.env.HOST_FOLLOW_HEAL_INTERVAL_MS || 5000)
+// Discovery interface watch: re-read the interface table, repair 224.0.0.251
+// memberships and query every interface when one (re)appears.
+const DISCOVERY_INTERFACE_WATCH_MS = Number(process.env.DISCOVERY_INTERFACE_WATCH_MS || 5000)
+// A device connection failure can be the first sign of an interface change;
+// that trigger syncs at most this often.
+const DISCOVERY_FAILURE_SYNC_MIN_MS = Number(process.env.DISCOVERY_FAILURE_SYNC_MIN_MS || 1000)
 
 // Make sure `MANIFESTS_DIR` actually exists on disk. Fresh clones, Windows
 // machines, or a user who manually deleted the folder would otherwise hit
@@ -711,6 +720,7 @@ function connectToDevice(dev) {
       currentDev.error = reason
       console.log(`  [client] ${details.timeout ? 'timeout' : 'failed'} ${currentDev.name}: ${reason}`)
       broadcastDeviceUpdate(currentDev)
+      syncDiscoveryInterfacesAfterFailure()
     },
     onHostInfo: (hostInfo) => {
       if (oscQueryClients.get(dev.id) !== client) return
@@ -1376,7 +1386,17 @@ if (process.env.OSC_LISTEN_DISABLED === '1') {
 }
 
 // ─── Bonjour: discovery (existing CLM behaviour) + publish (new hub) ─────
-const bonjour = new Bonjour()
+// The hub owns the mDNS socket: multicast-dns takes a pre-built socket through
+// its `socket` option (present since 6.x, not in its README) and binds it
+// itself, which lets the interface watcher below repair 224.0.0.251
+// memberships and steer per-interface queries on the very socket the
+// browser and the publisher use. See discoveryInterfaces.js for the incident.
+const mdnsSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true })
+const bonjour = new Bonjour({ socket: mdnsSocket })
+const discoveryInterfaces = createInterfaceWatcher({
+  socket: mdnsSocket,
+  mdns: bonjour.server.mdns
+})
 function serializeService(s) {
   const ipv4 = (s.addresses || []).find((a) => /^\d+\.\d+\.\d+\.\d+$/.test(a))
   return {
@@ -1472,6 +1492,74 @@ function startBrowser() {
   attachBrowserHandlers(browser)
 }
 
+// A fresh Browser re-emits 'up' for every service it hears — that is how a
+// known service on a repaired interface gets a fresh endpoint observation
+// (host-follow heal needs it). `services` and the registry are kept: a
+// re-observation folds into the existing record, it never makes a new card.
+function restartBrowser() {
+  try {
+    if (browser && typeof browser.stop === 'function') browser.stop()
+  } catch (err) {
+    console.log('[discovery] browser.stop() error:', err.message)
+  }
+  startBrowser()
+}
+
+// ─── Discovery interface watch ───────────────────────────────────────────
+// Memberships and multicast steering can only touch the socket once
+// multicast-dns has bound it (touching an unbound dgram socket would bind it
+// to a random port first), so everything waits for the 'ready' event.
+let discoveryReady = false
+let discoveryInterfaceTimer = null
+let lastDiscoveryFailureSyncAt = 0
+
+function queryDiscoveryInterfaces() {
+  if (!discoveryReady) return
+  discoveryInterfaces.queryAll().catch((err) => {
+    console.log(`[discovery] interface query error: ${err.message}`)
+  })
+}
+
+function syncDiscoveryInterfaces(reason) {
+  if (!discoveryReady) return null
+  let result
+  try {
+    result = discoveryInterfaces.sync(reason)
+  } catch (err) {
+    console.log(`[discovery] interface sync error: ${err.message}`)
+    return null
+  }
+  if (result.added.length > 0 || result.removed.length > 0) {
+    // Local-alias folding must know this machine's current addresses.
+    deviceRegistry.setLocalAddresses(getLocalInterfaceAddresses())
+  }
+  // startup: the initial sweep follows right after; rediscover: the caller
+  // rebuilds the browser and sweeps itself.
+  if (result.joined.length > 0 && reason !== 'startup' && reason !== 'rediscover') {
+    restartBrowser()
+    queryDiscoveryInterfaces()
+  }
+  return result
+}
+
+function syncDiscoveryInterfacesAfterFailure() {
+  const now = Date.now()
+  if (now - lastDiscoveryFailureSyncAt < DISCOVERY_FAILURE_SYNC_MIN_MS) return
+  lastDiscoveryFailureSyncAt = now
+  syncDiscoveryInterfaces('connect-failure')
+}
+
+bonjour.server.mdns.once('ready', () => {
+  discoveryReady = true
+  syncDiscoveryInterfaces('startup')
+  queryDiscoveryInterfaces()
+  discoveryInterfaceTimer = setInterval(
+    () => syncDiscoveryInterfaces('poll'),
+    DISCOVERY_INTERFACE_WATCH_MS
+  )
+  discoveryInterfaceTimer.unref()
+})
+
 /**
  * Tear down the Bonjour browser, wipe the helper's in-memory caches of
  * discovered services, and start a fresh browser. This is the equivalent
@@ -1491,7 +1579,9 @@ function rediscoverNetwork() {
   broadcastDiscovery()
   broadcastDiscovered()
   console.log('[discovery] rediscover requested — caches cleared, restarting browser')
+  syncDiscoveryInterfaces('rediscover')
   startBrowser()
+  queryDiscoveryInterfaces()
 }
 
 const discoveryStaleTimer = setInterval(() => {
@@ -2472,6 +2562,7 @@ function shutdown(signal = 'SIGTERM') {
   clearInterval(reachabilityTimer)
   clearInterval(collisionHealTimer)
   clearInterval(hostFollowHealTimer)
+  if (discoveryInterfaceTimer) clearInterval(discoveryInterfaceTimer)
   if (oscRebindTimer) clearTimeout(oscRebindTimer)
   if (manifestReloadTimer) clearTimeout(manifestReloadTimer)
   autoLinkEngine.close()

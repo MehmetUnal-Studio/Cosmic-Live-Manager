@@ -473,7 +473,17 @@ the order is persisted in `localStorage`.
 5. Once per second the registry removes only stale **unsaved** records older
    than the configured TTL. Saved records keep retrying their existing entity.
 6. **Rediscover** stops/recreates the Bonjour browser and clears the raw cache;
-   it is not a manifest reset and does not restart Ableton/APKs.
+   it is not a manifest reset and does not restart Ableton/APKs. It also
+   re-reads the interface table (step 7) and queries every interface.
+7. **Interface tracking.** The hub owns its mDNS socket and, every
+   `DISCOVERY_INTERFACE_WATCH_MS`, re-reads the IPv4 interface table, rejoins
+   `224.0.0.251` on any interface that appeared or silently lost its
+   membership (a re-plugged USB adapter keeps its address, so the library's
+   own cache never rejoins), rebuilds the browser and sends a `_oscjson._tcp`
+   query on every interface it is a member of — the library alone only ever
+   queries via one interface, so a second LAN (stage network on USB Ethernet)
+   was otherwise discovered only when another machine happened to ask. Logged
+   as `[discovery] interface added <name> <ip> — rejoining multicast`.
 
 ### Identity and reconnect state
 
@@ -623,6 +633,8 @@ All variables are optional:
 | `OSC_LISTEN_DISABLED` | unset | Set to `1` to skip the direct UDP bind and boot manifests immediately. The current code still publishes `_osc._udp` at the configured port, so consumers can see an unusable advertisement. |
 | `OSC_VERBOSE` | unset | Set to `1` for per-message direct-UDP logs. Avoid during high-rate shows unless diagnosing. |
 | `DISCOVERY_STALE_TTL_MS` | `15000` | TTL for stale, unsaved registry observations only. |
+| `DISCOVERY_INTERFACE_WATCH_MS` | `5000` | Interface table re-read / multicast membership repair interval. |
+| `DISCOVERY_FAILURE_SYNC_MIN_MS` | `1000` | Minimum spacing of the interface sync triggered by a device connection failure. |
 | `HUB_NAME` | `Cosmic Live Manager` | Bonjour and OSCQuery host name. |
 | `MANIFESTS_DIR` | `./manifests` | Watched machine-local manifest directory. |
 | `HUB_START_TIMEOUT_MS` | `7000` | Supervisor child ready deadline. |
