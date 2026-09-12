@@ -58,7 +58,7 @@ import {
   resolveOscUdpPort
 } from './linkRouting.js'
 import { planCollisionHeals } from './collisionHeal.js'
-import { planHostFollowHeals } from './hostFollowHeal.js'
+import { HOST_FOLLOW_MIN_FAILURES, planHostFollowHeals } from './hostFollowHeal.js'
 import { createInterfaceWatcher } from './discoveryInterfaces.js'
 import { createAutoLinkEngine } from './autoLink.js'
 import { hubBackpressureAction } from './hubBackpressure.js'
@@ -97,9 +97,15 @@ const HOST_FOLLOW_HEAL_INTERVAL_MS = Number(process.env.HOST_FOLLOW_HEAL_INTERVA
 // Discovery interface watch: re-read the interface table, repair 224.0.0.251
 // memberships and query every interface when one (re)appears.
 const DISCOVERY_INTERFACE_WATCH_MS = Number(process.env.DISCOVERY_INTERFACE_WATCH_MS || 5000)
-// A device connection failure can be the first sign of an interface change;
-// that trigger syncs at most this often.
+// A card's first connection failures can be the first sign of an interface
+// change or a moved device; that trigger syncs at most this often, and sweeps
+// (browser rebuild + query on every interface) at most every
+// DISCOVERY_FAILURE_SWEEP_MIN_MS.
 const DISCOVERY_FAILURE_SYNC_MIN_MS = Number(process.env.DISCOVERY_FAILURE_SYNC_MIN_MS || 1000)
+const DISCOVERY_FAILURE_SWEEP_MIN_MS = Number(process.env.DISCOVERY_FAILURE_SWEEP_MIN_MS || 10_000)
+// Periodic sweep: a cable-only re-plug changes nothing in the interface table
+// and nothing on the far side, so the hub keeps asking on its own. 0 disables.
+const DISCOVERY_QUERY_INTERVAL_MS = Number(process.env.DISCOVERY_QUERY_INTERVAL_MS ?? 60_000)
 
 // Make sure `MANIFESTS_DIR` actually exists on disk. Fresh clones, Windows
 // machines, or a user who manually deleted the folder would otherwise hit
@@ -720,7 +726,11 @@ function connectToDevice(dev) {
       currentDev.error = reason
       console.log(`  [client] ${details.timeout ? 'timeout' : 'failed'} ${currentDev.name}: ${reason}`)
       broadcastDeviceUpdate(currentDev)
-      syncDiscoveryInterfacesAfterFailure()
+      // The first failures are the moment host-follow heal needs a fresh
+      // observation; a card that stays dead must not keep the sweeps going.
+      if (currentDev.consecutiveConnectFailures <= HOST_FOLLOW_MIN_FAILURES) {
+        syncDiscoveryInterfacesAfterFailure()
+      }
     },
     onHostInfo: (hostInfo) => {
       if (oscQueryClients.get(dev.id) !== client) return
@@ -1434,11 +1444,28 @@ function broadcastDiscovered() {
 // browser forces a fresh round of network queries and rebuilds the cache.
 let browser = null
 
+// Announcements and query answers list the same addresses in different
+// orders (and repeat link-local ones); only the IPv4 set and the port decide
+// whether a re-observation is news.
+function serviceIpv4Key(service) {
+  const ipv4 = (service.addresses || []).filter((address) => /^\d+\.\d+\.\d+\.\d+$/.test(address))
+  return [...new Set(ipv4)].sort().join(',')
+}
+
 function attachBrowserHandlers(b) {
   b.on('up', (service) => {
+    // Sweeps re-observe every known service; only news gets the up line and
+    // the raw-services broadcast. The registry upsert below still refreshes
+    // the endpoint observation either way.
+    const known = services.get(service.fqdn)
+    const changed = !known ||
+      Number(known.port) !== Number(service.port) ||
+      serviceIpv4Key(known) !== serviceIpv4Key(service)
     services.set(service.fqdn, service)
-    console.log('[discovery] up   ', service.name, service.addresses)
-    broadcastDiscovery()
+    if (changed) {
+      console.log('[discovery] up   ', service.name, service.addresses)
+      broadcastDiscovery()
+    }
 
     // Every address is an observation of the same service, never a new card.
     // DeviceRegistry validates local interfaces before folding LAN aliases into
@@ -1511,13 +1538,26 @@ function restartBrowser() {
 // to a random port first), so everything waits for the 'ready' event.
 let discoveryReady = false
 let discoveryInterfaceTimer = null
+let discoverySweepTimer = null
 let lastDiscoveryFailureSyncAt = 0
+let lastDiscoverySweepAt = 0
 
 function queryDiscoveryInterfaces() {
   if (!discoveryReady) return
+  lastDiscoverySweepAt = Date.now()
   discoveryInterfaces.queryAll().catch((err) => {
     console.log(`[discovery] interface query error: ${err.message}`)
   })
+}
+
+// A sweep is how a known service gets re-observed: the fresh Browser emits
+// 'up' again for every answer, and the answers come because we asked on
+// every interface. Runs on an interface (re)join, periodically, and after
+// device connection failures.
+function sweepDiscovery() {
+  if (!discoveryReady) return
+  restartBrowser()
+  queryDiscoveryInterfaces()
 }
 
 function syncDiscoveryInterfaces(reason) {
@@ -1536,8 +1576,7 @@ function syncDiscoveryInterfaces(reason) {
   // startup: the initial sweep follows right after; rediscover: the caller
   // rebuilds the browser and sweeps itself.
   if (result.joined.length > 0 && reason !== 'startup' && reason !== 'rediscover') {
-    restartBrowser()
-    queryDiscoveryInterfaces()
+    sweepDiscovery()
   }
   return result
 }
@@ -1546,7 +1585,12 @@ function syncDiscoveryInterfacesAfterFailure() {
   const now = Date.now()
   if (now - lastDiscoveryFailureSyncAt < DISCOVERY_FAILURE_SYNC_MIN_MS) return
   lastDiscoveryFailureSyncAt = now
-  syncDiscoveryInterfaces('connect-failure')
+  const result = syncDiscoveryInterfaces('connect-failure')
+  // A join already swept; otherwise ask again anyway — the failing device
+  // may have moved or come back behind a link flap the table cannot show.
+  if (result && result.joined.length === 0 && now - lastDiscoverySweepAt >= DISCOVERY_FAILURE_SWEEP_MIN_MS) {
+    sweepDiscovery()
+  }
 }
 
 bonjour.server.mdns.once('ready', () => {
@@ -1558,6 +1602,10 @@ bonjour.server.mdns.once('ready', () => {
     DISCOVERY_INTERFACE_WATCH_MS
   )
   discoveryInterfaceTimer.unref()
+  if (DISCOVERY_QUERY_INTERVAL_MS > 0) {
+    discoverySweepTimer = setInterval(sweepDiscovery, DISCOVERY_QUERY_INTERVAL_MS)
+    discoverySweepTimer.unref()
+  }
 })
 
 /**
@@ -2563,6 +2611,7 @@ function shutdown(signal = 'SIGTERM') {
   clearInterval(collisionHealTimer)
   clearInterval(hostFollowHealTimer)
   if (discoveryInterfaceTimer) clearInterval(discoveryInterfaceTimer)
+  if (discoverySweepTimer) clearInterval(discoverySweepTimer)
   if (oscRebindTimer) clearTimeout(oscRebindTimer)
   if (manifestReloadTimer) clearTimeout(manifestReloadTimer)
   autoLinkEngine.close()

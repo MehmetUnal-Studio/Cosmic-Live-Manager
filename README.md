@@ -484,6 +484,13 @@ the order is persisted in `localStorage`.
    queries via one interface, so a second LAN (stage network on USB Ethernet)
    was otherwise discovered only when another machine happened to ask. Logged
    as `[discovery] interface added <name> <ip> — rejoining multicast`.
+8. **Periodic sweep.** A cable-only re-plug changes nothing in the interface
+   table and nothing on the far side, so every `DISCOVERY_QUERY_INTERVAL_MS`
+   (and, throttled, on a card's first connection failures — never on the
+   endless retries of a card that stays dead) the hub rebuilds the
+   browser and queries every interface again; known services are re-observed
+   into their existing record — never a second card, and not logged as `up`
+   again unless their address or port changed.
 
 ### Identity and reconnect state
 
@@ -634,7 +641,9 @@ All variables are optional:
 | `OSC_VERBOSE` | unset | Set to `1` for per-message direct-UDP logs. Avoid during high-rate shows unless diagnosing. |
 | `DISCOVERY_STALE_TTL_MS` | `15000` | TTL for stale, unsaved registry observations only. |
 | `DISCOVERY_INTERFACE_WATCH_MS` | `5000` | Interface table re-read / multicast membership repair interval. |
-| `DISCOVERY_FAILURE_SYNC_MIN_MS` | `1000` | Minimum spacing of the interface sync triggered by a device connection failure. |
+| `DISCOVERY_FAILURE_SYNC_MIN_MS` | `1000` | Minimum spacing of the interface sync triggered by a card's first connection failures. |
+| `DISCOVERY_FAILURE_SWEEP_MIN_MS` | `10000` | Minimum spacing of the browser-rebuild + all-interface query triggered by a card's first connection failures. |
+| `DISCOVERY_QUERY_INTERVAL_MS` | `60000` | Periodic browser rebuild + `_oscjson._tcp` query on every interface; `0` disables. |
 | `HUB_NAME` | `Cosmic Live Manager` | Bonjour and OSCQuery host name. |
 | `MANIFESTS_DIR` | `./manifests` | Watched machine-local manifest directory. |
 | `HUB_START_TIMEOUT_MS` | `7000` | Supervisor child ready deadline. |
