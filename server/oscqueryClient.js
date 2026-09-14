@@ -86,12 +86,45 @@ export class OscQueryClient {
     // the normal reconnect path takes over. Devices only need to answer
     // standard WS pings (the ws library and our VSTs do this automatically).
     this.keepaliveIntervalMs = options.keepaliveIntervalMs ?? 5000
-    this.keepaliveMaxMissed = options.keepaliveMaxMissed ?? 2
+    // Validated: a 0/NaN here would make the tick never ping (every device
+    // recycled every few ticks) or silently disable half-open detection.
+    const maxMissed = Number(options.keepaliveMaxMissed)
+    this.keepaliveMaxMissed = Number.isInteger(maxMissed) && maxMissed >= 1 ? maxMissed : 2
+    // Not every OSCQuery server answers WS control pings. TouchDesigner's Web
+    // Server DAT, for one, never sends a pong yet is fully alive — its HTTP
+    // answers instantly and it streams OSC as binary WS frames. So before we
+    // call a pong-silent socket dead, we (a) treat ANY inbound WS frame as
+    // proof of life and (b) probe HTTP ?HOST_INFO; only a socket that neither
+    // ponged, sent a frame, nor answers HTTP is a genuine half-open and torn
+    // down. This keeps the half-open detection honest without cycling TD.
+    this.keepaliveHttpFallback = options.keepaliveHttpFallback ?? true
+    // HTTP reachability is not WS liveness: a server whose HTTP answers while
+    // its WS push path is wedged (no pong AND no data) must still be recycled,
+    // or the instrument goes dark forever. So the HTTP rescue is bounded — after
+    // this many consecutive rescues with zero intervening inbound WS frames, the
+    // socket is treated as wedged and torn down for a fresh dial. A server that
+    // actually streams (or pongs) resets the count long before it is reached.
+    const maxRescues = Number(options.keepaliveHttpMaxRescues)
+    this.keepaliveHttpMaxRescues = Number.isInteger(maxRescues) && maxRescues >= 0 ? maxRescues : 3
     this.hostInfoRetryBaseMs = options.hostInfoRetryBaseMs ?? 1000
     this.hostInfoRetryMaxMs = options.hostInfoRetryMaxMs ?? 10_000
     this.random = options.random ?? Math.random
     this.keepaliveTimer = null
     this.missedPongs = 0
+    // Set by both the 'pong' and 'message' handlers: any inbound frame within a
+    // keepalive window proves the socket is live, so the missed-pong counter is
+    // cleared on the next tick instead of climbing toward termination.
+    this.sawInboundSinceTick = false
+    // Guards against overlapping HTTP liveness probes when a tick fires again
+    // before the previous probe resolved.
+    this.keepaliveProbing = false
+    // One-shot log so a pong-silent-but-alive server is noted once, not every
+    // probe cycle.
+    this.pongLessNoted = false
+    // Consecutive HTTP rescues with no intervening inbound WS frame. Bounds how
+    // long a pong-and-data-silent-but-HTTP-alive socket is tolerated before it
+    // is recycled as wedged. Reset by any real inbound frame.
+    this.httpRescuesWithoutInbound = 0
     this.hostInfoRetryTimer = null
     this.consecutiveRetryFailures = 0
     this.connectAttempt = 0
@@ -296,13 +329,81 @@ export class OscQueryClient {
   _startKeepalive(ws) {
     this._stopKeepalive()
     this.missedPongs = 0
+    this.sawInboundSinceTick = false
+    this.keepaliveProbing = false
+    this.httpRescuesWithoutInbound = 0
     if (!(this.keepaliveIntervalMs > 0)) return
     this.keepaliveTimer = setInterval(() => {
       if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) {
         this._stopKeepalive()
         return
       }
+      // Don't stack probes: if an HTTP liveness check from a previous tick is
+      // still outstanding, let it settle before doing anything else.
+      if (this.keepaliveProbing) return
+      // Any inbound frame (pong OR data) since the last tick means the socket
+      // is unambiguously alive — reset and keep going.
+      if (this.sawInboundSinceTick) {
+        this.missedPongs = 0
+        this.sawInboundSinceTick = false
+        this.httpRescuesWithoutInbound = 0
+      }
       if (this.missedPongs >= this.keepaliveMaxMissed) {
+        if (this.keepaliveHttpFallback) {
+          // A pong-silent socket might still be a live server that just doesn't
+          // implement WS ping/pong (TouchDesigner). Probe HTTP before killing
+          // it; only a device that also fails HTTP is truly gone.
+          this.keepaliveProbing = true
+          this._probeHttpAlive(ws)
+            .then((alive) => {
+              // Clear the probe guard only for the socket that owns it — a stale
+              // probe from a torn-down socket must not unlock a successor's tick.
+              if (this.ws === ws) this.keepaliveProbing = false
+              if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return
+              // A real inbound frame (data or pong) arrived while the probe was
+              // in flight: definitive proof of life that overrides the probe
+              // outcome (a transient HTTP hiccup must not kill a streaming WS).
+              if (this.sawInboundSinceTick) {
+                this.missedPongs = 0
+                this.sawInboundSinceTick = false
+                this.httpRescuesWithoutInbound = 0
+                return
+              }
+              if (alive) {
+                // HTTP answers but the WS delivered nothing this window. Tolerate
+                // a pong-silent server, but bound it: a WS that stays silent
+                // across several rescues while HTTP stays up is wedged, not idle
+                // — recycle it so the instrument can recover.
+                this.httpRescuesWithoutInbound++
+                if (this.httpRescuesWithoutInbound > this.keepaliveHttpMaxRescues) {
+                  const silentSec = Math.round(
+                    this.httpRescuesWithoutInbound * (this.keepaliveMaxMissed + 1) * this.keepaliveIntervalMs / 1000
+                  )
+                  this.events.onLog(
+                    `Keepalive: WS silent ~${silentSec}s while HTTP alive (idle or wedged) — recycling wedged socket`
+                  )
+                  this._stopKeepalive()
+                  try { ws.terminate() } catch {}
+                  return
+                }
+                this.missedPongs = 0
+                if (!this.pongLessNoted) {
+                  this.pongLessNoted = true
+                  this.events.onLog(
+                    'Keepalive: WS pings unanswered but HTTP alive — treating as live (server does not pong)'
+                  )
+                }
+              } else {
+                this.events.onLog(
+                  `Keepalive: ${this.missedPongs} pings unanswered and HTTP unreachable — terminating half-open WS`
+                )
+                this._stopKeepalive()
+                try { ws.terminate() } catch {}
+              }
+            })
+            .catch(() => { if (this.ws === ws) this.keepaliveProbing = false })
+          return
+        }
         this.events.onLog(
           `Keepalive: ${this.missedPongs} pings unanswered — terminating half-open WS`
         )
@@ -313,9 +414,41 @@ export class OscQueryClient {
         return
       }
       this.missedPongs++
+      this.sawInboundSinceTick = false
       try { ws.ping() } catch {}
     }, this.keepaliveIntervalMs)
     if (typeof this.keepaliveTimer.unref === 'function') this.keepaliveTimer.unref()
+  }
+
+  // Quick HTTP liveness probe used by the keepalive before it declares a
+  // pong-silent WebSocket dead. Returns true iff the device answers ?HOST_INFO
+  // (or at least completes an HTTP response) within a bounded window. Never
+  // throws — a failed probe resolves false.
+  async _probeHttpAlive(ws) {
+    const controller = new AbortController()
+    const budget = Math.max(500, Math.min(2000, this.keepaliveIntervalMs))
+    const timer = setTimeout(() => controller.abort(), budget)
+    this.fetchControllers.add(controller)
+    try {
+      const res = await fetch(`http://${this.host}:${this.port}/?HOST_INFO`, {
+        signal: controller.signal
+      })
+      // Any COMPLETED HTTP response proves the device's HTTP stack is alive —
+      // connect() already treats ?HOST_INFO as optional (a 404 there is still a
+      // healthy device), so status is deliberately ignored. The body is never
+      // read (the abort in finally cancels the unread stream), so a hostile or
+      // huge response can't balloon hub memory.
+      void res
+      return this.ws === ws
+    } catch {
+      return false
+    } finally {
+      clearTimeout(timer)
+      // Abort on every path (idempotent after success/timeout) so the unread
+      // body stream is torn down and the undici socket released promptly.
+      controller.abort()
+      this.fetchControllers.delete(controller)
+    }
   }
 
   _stopKeepalive() {
@@ -323,6 +456,9 @@ export class OscQueryClient {
     clearInterval(this.keepaliveTimer)
     this.keepaliveTimer = null
     this.missedPongs = 0
+    this.sawInboundSinceTick = false
+    this.keepaliveProbing = false
+    this.httpRescuesWithoutInbound = 0
   }
 
   _collectPaths(node) {
@@ -405,12 +541,16 @@ export class OscQueryClient {
       ws.on('pong', () => {
         if (this.ws !== ws) return
         this.missedPongs = 0
+        this.sawInboundSinceTick = true
       })
 
       // Critical: also catch binary frames. TouchDesigner-style servers send
       // raw OSC packets over the WS instead of JSON COMMAND/DATA envelopes.
       ws.on('message', (raw, isBinary) => {
         if (this.ws !== ws || !this._isCurrentAttempt(attempt)) return
+        // Inbound data is proof the socket is alive even from a server that
+        // never answers WS pings (e.g. TouchDesigner streaming OSC binary).
+        this.sawInboundSinceTick = true
         const buf = this._toBuffer(raw)
         if (isBinary || this._looksLikeOscPacket(buf)) {
           this._handleOscBinary(buf)

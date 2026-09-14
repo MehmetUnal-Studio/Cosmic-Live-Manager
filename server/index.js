@@ -86,6 +86,17 @@ const DISCOVERY_STALE_TTL_MS = Number(process.env.DISCOVERY_STALE_TTL_MS || 1500
 // WS keepalive toward managed OSCQuery devices (half-open detection).
 const OSCQUERY_KEEPALIVE_MS = Number(process.env.OSCQUERY_KEEPALIVE_MS || 5000)
 const OSCQUERY_KEEPALIVE_MAX_MISSED = Number(process.env.OSCQUERY_KEEPALIVE_MAX_MISSED || 2)
+// Before terminating a pong-silent WS, probe HTTP; only a device that also
+// fails HTTP is torn down. Keeps TouchDesigner (never pongs) from flapping.
+// Set OSCQUERY_KEEPALIVE_HTTP_FALLBACK=0 to restore strict pong-only behavior.
+const OSCQUERY_KEEPALIVE_HTTP_FALLBACK = process.env.OSCQUERY_KEEPALIVE_HTTP_FALLBACK !== '0'
+// How many consecutive HTTP rescues a pong-and-data-silent socket gets before
+// it is recycled as wedged. Explicit undefined check so a deliberate 0 is
+// honoured (unlike `|| default`). At 5000 ms / 2 missed / 3 rescues the
+// recycle period is (3+1)*(2+1) = 12 ticks = 60 s.
+const OSCQUERY_KEEPALIVE_HTTP_MAX_RESCUES = process.env.OSCQUERY_KEEPALIVE_HTTP_MAX_RESCUES === undefined
+  ? 3
+  : Number(process.env.OSCQUERY_KEEPALIVE_HTTP_MAX_RESCUES)
 const OSCQUERY_HOSTINFO_RETRY_MS = Number(process.env.OSCQUERY_HOSTINFO_RETRY_MS || 1000)
 // Discovered records with no goodbye: probe after this silence, prune if dead.
 const NO_GOODBYE_TTL_MS = Number(process.env.NO_GOODBYE_TTL_MS || 60_000)
@@ -800,6 +811,8 @@ function connectToDevice(dev) {
     attemptTimeoutMs: CONNECTION_TIMEOUT_MS,
     keepaliveIntervalMs: OSCQUERY_KEEPALIVE_MS,
     keepaliveMaxMissed: OSCQUERY_KEEPALIVE_MAX_MISSED,
+    keepaliveHttpFallback: OSCQUERY_KEEPALIVE_HTTP_FALLBACK,
+    keepaliveHttpMaxRescues: OSCQUERY_KEEPALIVE_HTTP_MAX_RESCUES,
     hostInfoRetryBaseMs: OSCQUERY_HOSTINFO_RETRY_MS
   })
 

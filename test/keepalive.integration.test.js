@@ -1,7 +1,21 @@
-// F0-3/F1-2 regression: the hub must ping every managed OSCQuery WS and
-// terminate + reconnect a half-open socket after missed pongs. A device that
-// answers pings normally (the ws library and our VSTs auto-pong) must stay
-// connected on a single socket.
+// The hub pings every managed OSCQuery WebSocket to catch half-open sockets.
+// But not every OSCQuery server answers WS control pings — TouchDesigner's Web
+// Server DAT only pongs if its callbacks DAT sends one, and a build that lost
+// that handler is fully alive yet pong-silent: its HTTP answers instantly and
+// it streams OSC as binary WS frames. So "no pong" alone must NOT be read as
+// "dead", or the hub tears the Ring instrument down every ~13 s mid-show.
+//
+// Equally, HTTP reachability is NOT WebSocket liveness: a server whose HTTP
+// answers while its WS push path is wedged must still be recycled, or the
+// instrument goes dark forever with no self-heal.
+//
+// Liveness policy exercised here:
+//   A. A device that answers pings rides one socket.                 (classic)
+//   B. A device that never pongs but STREAMS data rides one socket.  (TD played)
+//   C. A device that neither pongs nor answers HTTP is torn down.     (dead)
+//   D. A device that never pongs, sends nothing, but answers HTTP is
+//      tolerated for a bounded number of rescues, then recycled so a
+//      wedged WS cannot hide behind a live HTTP endpoint.            (wedged)
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -13,6 +27,7 @@ import os from 'node:os'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import osc from 'osc'
 import { WebSocketServer } from 'ws'
 
 const REPO_DIR = dirname(dirname(fileURLToPath(import.meta.url)))
@@ -73,7 +88,19 @@ async function stopChild(child) {
   }
 }
 
-async function createDevice({ name, deviceId, autoPong }) {
+const PULSE = Buffer.from(osc.writePacket(
+  { address: '/value', args: [{ type: 'f', value: 0.5 }] },
+  { metadata: true, unpackSingleArgs: false }
+))
+
+// A fake OSCQuery device.
+//   autoPong      — whether its WebSocket answers the hub's control pings.
+//   stream        — push a binary OSC frame every ~60 ms on every connection
+//                   (a pong-silent server that is nevertheless alive and busy).
+//   setHttpAlive  — false makes HTTP stop responding (requests hang until the
+//                   client aborts): a host that dropped off the network while
+//                   its TCP socket lingers half-open.
+async function createDevice({ name, deviceId, autoPong, stream = false }) {
   const namespace = {
     FULL_PATH: '/',
     CONTENTS: {
@@ -81,7 +108,15 @@ async function createDevice({ name, deviceId, autoPong }) {
     }
   }
   let connectionCount = 0
+  let httpAlive = true
+  const hungRequests = new Set()
+  const pumps = new Set()
   const server = http.createServer((req, res) => {
+    if (!httpAlive) {
+      hungRequests.add(res)
+      req.on('close', () => hungRequests.delete(res))
+      return
+    }
     res.setHeader('Content-Type', 'application/json')
     if (req.url.includes('HOST_INFO')) {
       res.end(JSON.stringify({
@@ -95,10 +130,16 @@ async function createDevice({ name, deviceId, autoPong }) {
     }
     res.end(JSON.stringify(namespace))
   })
-  // autoPong:false simulates a half-open peer: the TCP socket stays OPEN but
-  // nothing ever answers the hub's pings (battery pull / Wi-Fi drop).
   const wss = new WebSocketServer({ server, autoPong })
-  wss.on('connection', () => { connectionCount++ })
+  wss.on('connection', (ws) => {
+    connectionCount++
+    if (!stream) return
+    const pump = setInterval(() => {
+      if (ws.readyState === ws.OPEN) ws.send(PULSE)
+    }, 60)
+    pumps.add(pump)
+    ws.on('close', () => { clearInterval(pump); pumps.delete(pump) })
+  })
   await new Promise((resolve, reject) => {
     server.once('error', reject)
     server.listen(0, LOOPBACK, resolve)
@@ -106,7 +147,10 @@ async function createDevice({ name, deviceId, autoPong }) {
   return {
     port: server.address().port,
     get connectionCount() { return connectionCount },
+    setHttpAlive(v) { httpAlive = v },
     async stop() {
+      for (const pump of pumps) clearInterval(pump)
+      for (const res of hungRequests) { try { res.destroy() } catch {} }
       for (const ws of wss.clients) ws.terminate()
       await new Promise((resolve) => wss.close(resolve))
       if (server.listening) {
@@ -119,39 +163,38 @@ async function createDevice({ name, deviceId, autoPong }) {
   }
 }
 
-test('a device that never answers pings is terminated and reconnected; a ponging device stays connected', {
-  timeout: 30_000
+test('liveness: ponging and streaming stay up; wedged is bounded; dark is torn down', {
+  timeout: 45_000
 }, async (t) => {
-  const silentDevice = await createDevice({
-    name: 'Silent Device',
-    deviceId: 'keepalive-silent-device',
-    autoPong: false
+  const healthy = await createDevice({
+    name: 'Healthy', deviceId: 'ka-healthy', autoPong: true
   })
-  const healthyDevice = await createDevice({
-    name: 'Healthy Device',
-    deviceId: 'keepalive-healthy-device',
-    autoPong: true
+  // TouchDesigner being played: never pongs, but streams OSC over the WS.
+  const streaming = await createDevice({
+    name: 'Streaming', deviceId: 'ka-streaming', autoPong: false, stream: true
+  })
+  // HTTP alive, but the WS neither pongs nor delivers anything — a wedged push
+  // path (or an idle pong-less server; the hub cannot tell them apart, and must
+  // err toward recycling so a real wedge never hides forever).
+  const wedged = await createDevice({
+    name: 'Wedged', deviceId: 'ka-wedged', autoPong: false
+  })
+  // Genuine half-open: never pongs, and we cut its HTTP mid-test.
+  const dead = await createDevice({
+    name: 'Dead', deviceId: 'ka-dead', autoPong: false
   })
 
   const managerPort = await freeTcpPort()
   const managerOscPort = await freeUdpPort()
   const manifestsDir = await mkdtemp(join(os.tmpdir(), 'cosmic-manager-keepalive-'))
-  await writeFile(join(manifestsDir, 'silent.json'), JSON.stringify({
-    id: 71,
-    name: 'SilentDevice',
-    type: 'oscquery-device',
-    host: LOOPBACK,
-    oscQueryPort: silentDevice.port,
-    enabled: true
+  const write = (file, id, port) => writeFile(join(manifestsDir, file), JSON.stringify({
+    id, name: file.replace('.json', ''), type: 'oscquery-device',
+    host: LOOPBACK, oscQueryPort: port, enabled: true
   }, null, 2) + '\n')
-  await writeFile(join(manifestsDir, 'healthy.json'), JSON.stringify({
-    id: 72,
-    name: 'HealthyDevice',
-    type: 'oscquery-device',
-    host: LOOPBACK,
-    oscQueryPort: healthyDevice.port,
-    enabled: true
-  }, null, 2) + '\n')
+  await write('healthy.json', 72, healthy.port)
+  await write('streaming.json', 73, streaming.port)
+  await write('wedged.json', 74, wedged.port)
+  await write('dead.json', 75, dead.port)
 
   let logs = ''
   const child = spawn(process.execPath, ['server/index.js'], {
@@ -175,8 +218,10 @@ test('a device that never answers pings is terminated and reconnected; a ponging
 
   t.after(async () => {
     await stopChild(child)
-    await silentDevice.stop()
-    await healthyDevice.stop()
+    await healthy.stop()
+    await streaming.stop()
+    await wedged.stop()
+    await dead.stop()
     await rm(manifestsDir, { recursive: true, force: true })
   })
 
@@ -186,27 +231,54 @@ test('a device that never answers pings is terminated and reconnected; a ponging
     if (!response.ok) throw new Error(`devices HTTP ${response.status}`)
     return (await response.json()).devices
   }
+  const stateOf = (devices, id) => devices.find((d) => d.manifestId === id)?.connectionState
 
   await waitFor(async () => {
-    const devices = await getDevices()
-    return devices.filter((device) =>
-      [71, 72].includes(device.manifestId) && device.connectionState === 'Connected'
-    ).length === 2
-  }, 'both devices initially connected')
-  assert.equal(silentDevice.connectionCount, 1)
-  assert.equal(healthyDevice.connectionCount, 1)
+    const d = await getDevices()
+    return [72, 73, 74, 75].every((id) => stateOf(d, id) === 'Connected')
+  }, 'all four devices initially connected')
+  for (const d of [healthy, streaming, wedged, dead]) assert.equal(d.connectionCount, 1)
 
-  // Keepalive: ping every 150 ms, terminate after 2 missed pongs (~450 ms),
-  // then the standard reconnect path dials again.
-  await waitFor(
-    () => silentDevice.connectionCount >= 2,
-    'silent device terminated and re-dialed by keepalive',
-    12_000
+  // Many keepalive cycles at 150 ms. Ping every tick, terminate-threshold after
+  // 2 misses (~300 ms), bounded HTTP rescues after that.
+  await delay(3500)
+
+  // A + B: the ponging device and the pong-silent-but-streaming device must
+  // each ride their ORIGINAL socket — the whole point of the fix.
+  assert.equal(healthy.connectionCount, 1, 'a ponging device must never be cycled')
+  assert.equal(
+    streaming.connectionCount, 1,
+    'a pong-silent device that streams data must never be cycled (inbound frames are proof of life)'
   )
-  assert.match(logs, /Keepalive: \d+ pings unanswered/)
+  const mid = await getDevices()
+  assert.equal(stateOf(mid, 72), 'Connected')
+  assert.equal(stateOf(mid, 73), 'Connected')
 
-  // The healthy device must ride on its original socket the whole time.
-  assert.equal(healthyDevice.connectionCount, 1, 'a ponging device must never be cycled')
-  const healthy = (await getDevices()).find((device) => device.manifestId === 72)
-  assert.equal(healthy.connectionState, 'Connected')
+  // D: the wedged device (HTTP alive, WS silent) was rescued by HTTP a bounded
+  // number of times and then recycled — it must NOT hang on one dead socket
+  // forever. It reconnects (HTTP is up) and the cycle repeats.
+  assert.ok(
+    wedged.connectionCount >= 2,
+    `a wedged socket (HTTP alive, no pong, no data) must be recycled, got ${wedged.connectionCount} connection(s)`
+  )
+  assert.match(logs, /recycling wedged socket/)
+  // ...and the log shows it was first tolerated as pong-silent-but-alive.
+  assert.match(logs, /HTTP alive — treating as live/)
+
+  // C: cut the dead device's HTTP too. With neither pong, data, nor HTTP, the
+  // hub must terminate the half-open socket via the HTTP-unreachable path.
+  dead.setHttpAlive(false)
+  await waitFor(
+    async () => stateOf(await getDevices(), 75) !== 'Connected',
+    'a fully dark device (no pong, no data, no HTTP) is terminated',
+    15_000
+  )
+  assert.match(logs, /HTTP unreachable — terminating half-open WS/)
+
+  // The healthy and streaming devices are untouched by all of the above.
+  const end = await getDevices()
+  assert.equal(stateOf(end, 72), 'Connected', 'healthy device unaffected')
+  assert.equal(stateOf(end, 73), 'Connected', 'streaming device unaffected')
+  assert.equal(healthy.connectionCount, 1)
+  assert.equal(streaming.connectionCount, 1, 'streaming device never cycled across the whole test')
 })
