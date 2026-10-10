@@ -252,16 +252,41 @@ function linkTargetServices(device) {
 function disallowedLinkTargetFqdns(device) {
   return knownDisallowedLinkTargetFqdns(device, services.value, devices.value)
 }
+// ─── Online-only filter ─────────────────────────────────────────────────
+// Hides cards that are not currently connected (kept manifests the show does
+// not use right now). View-only: devices stay saved, enabled and reconnecting.
+const ONLINE_ONLY_KEY = 'clm:hub-online-only'
+function loadOnlineOnly() {
+  try { return localStorage.getItem(ONLINE_ONLY_KEY) === '1' } catch { return false }
+}
+const onlineOnly = ref(loadOnlineOnly())
+function toggleOnlineOnly() {
+  onlineOnly.value = !onlineOnly.value
+  try { localStorage.setItem(ONLINE_ONLY_KEY, onlineOnly.value ? '1' : '0') } catch { /* quota */ }
+}
+function isOnline(d) {
+  return d.connectionState === 'Connected' || d.status === 'connected'
+}
+const hiddenOfflineCount = computed(() =>
+  onlineOnly.value ? devices.value.filter((d) => !isOnline(d)).length : 0
+)
+
 const deviceGroups = computed(() => {
-  const cosmic = orderedDevices.value.filter(isCosmicUnity)
-  const android = orderedDevices.value.filter((device) => !isCosmicUnity(device) && isAndroid(device))
-  const other = orderedDevices.value.filter((device) => !isCosmicUnity(device) && !isAndroid(device))
+  const visible = onlineOnly.value ? orderedDevices.value.filter(isOnline) : orderedDevices.value
+  const hiddenIn = (pred) => onlineOnly.value
+    ? orderedDevices.value.filter((d) => pred(d) && !isOnline(d)).length : 0
+  const isOther = (d) => !isCosmicUnity(d) && !isAndroid(d)
+  const isTablet = (d) => !isCosmicUnity(d) && isAndroid(d)
+  const cosmic = visible.filter(isCosmicUnity)
+  const android = visible.filter(isTablet)
+  const other = visible.filter(isOther)
   const groups = [
     {
       key: 'cosmic',
       title: 'CosmicUnity / Ableton',
       hint: 'CosmicUnity VST3 instance’ları ve özel Ableton Max alıcıları.',
       devices: cosmic,
+      hidden: hiddenIn(isCosmicUnity),
       empty: 'CosmicUnity instance bulunamadı.'
     },
     {
@@ -269,15 +294,18 @@ const deviceGroups = computed(() => {
       title: 'Android Tablets',
       hint: 'Kalıcı cihaz kimliği varsa IP değişse bile aynı kart korunur.',
       devices: android,
+      hidden: hiddenIn(isTablet),
       empty: 'Android tablet bulunamadı.'
     }
   ]
-  if (other.length > 0) {
+  const otherHidden = hiddenIn(isOther)
+  if (other.length > 0 || otherHidden > 0) {
     groups.push({
       key: 'other',
       title: 'Other OSCQuery Devices',
       hint: 'Tür bilgisi yayınlamayan geriye dönük uyumlu cihazlar.',
       devices: other,
+      hidden: otherHidden,
       empty: ''
     })
   }
@@ -514,6 +542,20 @@ watch(devices, (list) => {
         <span class="hub-rediscover-icon">⟳</span>
       </button>
       <button
+        class="hub-online-filter-btn"
+        :class="{ active: onlineOnly }"
+        type="button"
+        :title="onlineOnly
+          ? 'Yalnız bağlı kartlar gösteriliyor — tümünü göstermek için tıkla'
+          : 'Yalnız bağlı (online) kartları göster; offline kartlar silinmez, sadece gizlenir'"
+        :aria-pressed="onlineOnly"
+        @click="toggleOnlineOnly"
+      >
+        <span class="dot"></span>
+        <span>{{ onlineOnly ? 'Online' : 'All' }}</span>
+        <span v-if="onlineOnly && hiddenOfflineCount > 0" class="hub-online-filter-hidden">+{{ hiddenOfflineCount }} gizli</span>
+      </button>
+      <button
         class="hub-rediscover-btn icon-only"
         :class="{ active: showManualAdd }"
         type="button"
@@ -601,9 +643,12 @@ watch(devices, (list) => {
       <section v-for="group in deviceGroups" :key="group.key" class="device-group">
         <div class="section-header">
           <div class="section-title" :title="group.hint">{{ group.title }}</div>
+          <span v-if="group.hidden > 0" class="section-hidden-count">{{ group.hidden }} offline gizli</span>
         </div>
         <div class="devices-grid">
-          <div v-if="group.devices.length === 0" class="empty">{{ group.empty }}</div>
+          <div v-if="group.devices.length === 0" class="empty">
+            {{ group.hidden > 0 ? 'Bu grupta bağlı kart yok.' : group.empty }}
+          </div>
           <!-- Key deliberately excludes runtimeGeneration (F2-4): a helper-side
                lifecycle bump used to remount the card, silently destroying an
                in-progress recording and all expand state mid-show. -->

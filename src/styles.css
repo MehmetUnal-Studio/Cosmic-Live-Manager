@@ -2482,3 +2482,18 @@ details.row-section summary {
 .device-card > .device-error-text { margin-top: 0.5rem; }
 .device-card > .device-actions { margin-top: 0.65rem; margin-bottom: 0; }
 .device-card .device-collision-banner { margin-top: 0.65rem; }
+
+/* Online-only filter toggle (header) */
+.hub-online-filter-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 999px; cursor: pointer;
+  font: inherit; font-size: 0.75rem; letter-spacing: 0.04em;
+  color: var(--hub-muted, #8a93a6); background: transparent;
+  border: 1px solid rgba(255,255,255,0.14);
+}
+.hub-online-filter-btn .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: 0.6; }
+.hub-online-filter-btn:hover { color: var(--hub-accent); border-color: rgba(91,184,255,0.45); }
+.hub-online-filter-btn.active { color: #3ddc84; border-color: rgba(61,220,132,0.5); background: rgba(61,220,132,0.08); }
+.hub-online-filter-btn.active .dot { opacity: 1; box-shadow: 0 0 6px #3ddc84; }
+.hub-online-filter-hidden { color: var(--hub-muted, #8a93a6); font-size: 0.7rem; }
+.hub-dash .section-hidden-count { margin-left: 10px; font-size: 0.7rem; color: var(--hub-muted, #8a93a6); letter-spacing: 0.04em; }
